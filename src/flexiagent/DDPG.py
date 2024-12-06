@@ -8,6 +8,7 @@ from Util import T
 from flexibuff import FlexiBatch
 import os
 
+
 class DDPG(Agent):
     def __init__(
         self,
@@ -23,10 +24,35 @@ class DDPG(Agent):
         target_update_percentage=0.01,
         name="Test_ddpg",
         device="cpu",
-        eval_mode = False,
+        eval_mode=False,
     ):
+        # documentation
+        """
+        obs_dim: int
+            The dimension of the observation space
+        continuous_action_dim: int
+        discrete_action_dims: list
+            The cardonality of each discrete action space
+        max_actions: list
+            The maximum value of the continuous action space
+        min_actions: list
+            The minimum value of the continuous action space
+        action_noise: float
+            The noise to add to the policy output into the value function
+        hidden_dims: list
+            The hidden dimensions of the actor and critic
+        gamma: float
+            The discount factor
+        policy_frequency: int
+            The frequency of policy updates
+        target_update_percentage: float
+            The percentage of the target network to update
+        name: str
+            The name of the agent
+        device: str
+        """
         assert not (
-            continuous_action_dim == None and discrete_action_dims == None
+            continuous_action_dim is None and discrete_action_dims is None
         ), "At least one action dim should be provided"
         assert len(max_actions) == len(discrete_action_dims) and len(
             min_actions
@@ -41,7 +67,7 @@ class DDPG(Agent):
         self.gamma = gamma
         self.policy_frequency = policy_frequency
         self.eval_mode = eval_mode
-        self.name=name
+        self.name = name
         self.actor = MixedActor(
             obs_dim,
             continuous_action_dim=continuous_action_dim,
@@ -51,7 +77,6 @@ class DDPG(Agent):
             device=device,
             hidden_dims=hidden_dims,
             encoder=None,
-            device=device,
             tau=0.3,
             hard=False,
         )
@@ -64,7 +89,6 @@ class DDPG(Agent):
             device=device,
             hidden_dims=hidden_dims,
             encoder=None,
-            device=device,
             tau=0.3,
             hard=False,
         )
@@ -72,7 +96,7 @@ class DDPG(Agent):
         self.continuous_action_dim = continuous_action_dim
         self.action_noise = action_noise
         self.step = 0
-        self.rl_step =0
+        self.rl_step = 0
         self.actor_target.load_state_dict(self.actor.state_dict())
         self.actor.to(device)
         self.actor_target.to(device)
@@ -139,13 +163,23 @@ class DDPG(Agent):
     ):
         self.rl_step += 1
         with torch.no_grad():
-            continuous_actions_, discrete_action_activations_ = self.actor_target(batch.obs_[agent_num],batch.action_mask[agent_num], gumbel=True)
-            actions_ = torch.cat(continuous_actions_, discrete_action_activations_,dim=-1)
+            continuous_actions_, discrete_action_activations_ = self.actor_target(
+                batch.obs_[agent_num], batch.action_mask[agent_num], gumbel=True
+            )
+            actions_ = torch.cat(
+                continuous_actions_, discrete_action_activations_, dim=-1
+            )
             qtarget = self.critic_target(batch.obs_[agent_num], actions_).squeeze(-1)
-            #TODO configure reward channel beyong just global_rewards
-            next_q_value = batch.global_rewards + (1 - batch.terminated) * self.gamma * qtarget
+            # TODO configure reward channel beyong just global_rewards
+            next_q_value = (
+                batch.global_rewards + (1 - batch.terminated) * self.gamma * qtarget
+            )
 
-        actions = torch.cat(batch.continuous_actions[agent_num], batch.discrete_actions[agent_num], dim=-1)
+        actions = torch.cat(
+            batch.continuous_actions[agent_num],
+            batch.discrete_actions[agent_num],
+            dim=-1,
+        )
         q_values = self.critic(batch.obs[agent_num], actions).squeeze(-1)
         qf1_loss = F.mse_loss(q_values, next_q_value)
 
@@ -154,19 +188,32 @@ class DDPG(Agent):
         qf1_loss.backward()
         self.critic_optimizer.step()
 
-
         if self.rl_step % self.policy_frequency == 0 and not critic_only:
-            c_act, d_act = self.actor(batch.obs[agent_num], batch.action_mask[agent_num])
-            actor_loss = -self.critic(batch.obs[agent_num], torch.cat(c_act, d_act, dim=-1)).mean()
+            c_act, d_act = self.actor(
+                batch.obs[agent_num], batch.action_mask[agent_num]
+            )
+            actor_loss = -self.critic(
+                batch.obs[agent_num], torch.cat(c_act, d_act, dim=-1)
+            ).mean()
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
             self.actor_optimizer.step()
 
             # update the target network
-            for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
-                target_param.data.copy_(self.target_update_percentage * param.data + (1 - self.target_update_percentage) * target_param.data)
-            for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
-                target_param.data.copy_(self.target_update_percentage * param.data + (1 - self.target_update_percentage) * target_param.data)
+            for param, target_param in zip(
+                self.actor.parameters(), self.actor_target.parameters()
+            ):
+                target_param.data.copy_(
+                    self.target_update_percentage * param.data
+                    + (1 - self.target_update_percentage) * target_param.data
+                )
+            for param, target_param in zip(
+                self.critic.parameters(), self.critic_target.parameters()
+            ):
+                target_param.data.copy_(
+                    self.target_update_percentage * param.data
+                    + (1 - self.target_update_percentage) * target_param.data
+                )
         return 0
 
     def ego_actions(self, observations, action_mask=None):
@@ -185,16 +232,28 @@ class DDPG(Agent):
 
     def imitation_learn(self, observations, continuous_actions, discrete_actions):
         con_a, disc_a = self.actor.forward(observations, gumbel=False)
-        loss = F.mse_loss(con_a, continuous_actions) + F.cross_entropy(disc_a, discrete_actions)
+        loss = F.mse_loss(con_a, continuous_actions) + F.cross_entropy(
+            disc_a, discrete_actions
+        )
         self.actor_optimizer.zero_grad()
         loss.backward()
         self.actor_optimizer.step()
 
         # update the target network
-        for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
-            target_param.data.copy_(self.target_update_percentage * param.data + (1 - self.target_update_percentage) * target_param.data)
-        for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
-            target_param.data.copy_(self.target_update_percentage * param.data + (1 - self.target_update_percentage) * target_param.data)
+        for param, target_param in zip(
+            self.actor.parameters(), self.actor_target.parameters()
+        ):
+            target_param.data.copy_(
+                self.target_update_percentage * param.data
+                + (1 - self.target_update_percentage) * target_param.data
+            )
+        for param, target_param in zip(
+            self.critic.parameters(), self.critic_target.parameters()
+        ):
+            target_param.data.copy_(
+                self.target_update_percentage * param.data
+                + (1 - self.target_update_percentage) * target_param.data
+            )
         return loss
 
     def utility_function(self, observations, actions=None):
@@ -210,7 +269,7 @@ class DDPG(Agent):
             print("Not saving because model in eval mode")
             return
         if checkpoint_path is None:
-            checkpoint_path = "./"+self.name+"/"
+            checkpoint_path = "./" + self.name + "/"
         if not os.path.exists(checkpoint_path):
             os.makedirs(checkpoint_path)
         torch.save(self.critic.state_dict(), checkpoint_path + "critic")
@@ -220,9 +279,10 @@ class DDPG(Agent):
 
     def load(self, checkpoint_path):
         if checkpoint_path is None:
-            checkpoint_path = "./"+self.name+"/"
+            checkpoint_path = "./" + self.name + "/"
         self.actor.load_state_dict(torch.load(checkpoint_path + "actor"))
         self.actor_target.load_state_dict(torch.load(checkpoint_path + "actor_target"))
         self.critic.load_state_dict(torch.load(checkpoint_path + "critic"))
-        self.critic_target.load_state_dict(torch.load(checkpoint_path + "critic_target"))
-        
+        self.critic_target.load_state_dict(
+            torch.load(checkpoint_path + "critic_target")
+        )
