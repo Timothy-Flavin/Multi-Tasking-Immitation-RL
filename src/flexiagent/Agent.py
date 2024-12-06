@@ -4,11 +4,11 @@ from abc import ABC, abstractmethod
 class Agent(ABC):
 
     @abstractmethod
-    def train_actions(self, observations, legal_actions=None, step=False):
+    def train_actions(self, observations, action_mask=None, step=False):
         return 0, 0, 0  # Action 0, log_prob 0, value
 
     @abstractmethod
-    def ego_actions(self, observations, legal_actions=None):
+    def ego_actions(self, observations, action_mask=None):
         return 0
 
     @abstractmethod
@@ -126,7 +126,7 @@ class MixedActor(nn.Module):
                 )
         self.max_actions = max_actions
 
-    def forward(self, x, legal_actions=None):
+    def forward(self, x, action_mask=None, gumbel=False):
         if self.encoder is not None:
             x = self.encoder(x)
         else:
@@ -145,13 +145,19 @@ class MixedActor(nn.Module):
             discrete_actions = []
             for i, head in enumerate(self.discrete_action_heads):
                 logits = head(x)
-                activations = F.gumbel_softmax(
-                    logits, dim=-1, tau=self.tau, hard=self.hard
-                )
-                if legal_actions is not None:
-                    activations = activations * legal_actions[i]
-                activations = activations / activations.sum(dim=-1, keepdim=True)
-                discrete_actions.append(activations)
+
+                if gumbel:
+                    if action_mask is not None:
+                        logits[action_mask == 0] = -1e8
+                    probs = F.gumbel_softmax(
+                        logits, dim=-1, tau=self.tau, hard=self.hard
+                    )
+                    #activations = activations / activations.sum(dim=-1, keepdim=True)
+                    discrete_actions.append(probs)
+                else:
+                    if action_mask is not None:
+                        logits[action_mask == 0] = -1e8
+                    discrete_actions.append(F.softmax(logits, dim=-1))
 
         return continuous_actions, discrete_actions
 

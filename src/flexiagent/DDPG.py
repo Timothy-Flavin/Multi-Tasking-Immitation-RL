@@ -5,8 +5,8 @@ import numpy as np
 import random
 from Agent import Agent, MixedActor, ValueSA
 from Util import T
-from flexibuff import Flexibatch
-
+from flexibuff import FlexiBatch
+import os
 
 class DDPG(Agent):
     def __init__(
@@ -17,7 +17,13 @@ class DDPG(Agent):
         max_actions=[],
         min_actions=[],
         action_noise=0.1,
+        hidden_dims=np.array([256, 256]),
+        gamma=0.99,
+        policy_frequency=2,
+        target_update_percentage=0.01,
+        name="Test_ddpg",
         device="cpu",
+        eval_mode = False,
     ):
         assert not (
             continuous_action_dim == None and discrete_action_dims == None
@@ -31,37 +37,42 @@ class DDPG(Agent):
         self.total_action_dim = continuous_action_dim + np.sum(
             np.array(discrete_action_dims)
         )
-
+        self.target_update_percentage = target_update_percentage
+        self.gamma = gamma
+        self.policy_frequency = policy_frequency
+        self.eval_mode = eval_mode
+        self.name=name
         self.actor = MixedActor(
             obs_dim,
             continuous_action_dim=continuous_action_dim,
             discrete_action_dims=discrete_action_dims,
-            max_actions=np.array([1, 1]),
-            min_actions=np.array([-1, -1]),
+            max_actions=max_actions,
+            min_actions=min_actions,
             device=device,
-            hidden_dims=np.array([256, 256]),
+            hidden_dims=hidden_dims,
             encoder=None,
             device=device,
-            tau=0.5,
+            tau=0.3,
             hard=False,
         )
         self.actor_target = MixedActor(
             obs_dim,
             continuous_action_dim=continuous_action_dim,
             discrete_action_dims=discrete_action_dims,
-            max_actions=np.array([1, 1]),
-            min_actions=np.array([-1, -1]),
+            max_actions=max_actions,
+            min_actions=min_actions,
             device=device,
-            hidden_dims=np.array([256, 256]),
+            hidden_dims=hidden_dims,
             encoder=None,
             device=device,
-            tau=0.5,
+            tau=0.3,
             hard=False,
         )
         self.discrete_action_dims = discrete_action_dims
         self.continuous_action_dim = continuous_action_dim
         self.action_noise = action_noise
         self.step = 0
+        self.rl_step =0
         self.actor_target.load_state_dict(self.actor.state_dict())
         self.actor.to(device)
         self.actor_target.to(device)
@@ -87,44 +98,131 @@ class DDPG(Agent):
             (continuous_actions.shape[0], self.continuous_action_dim),
         ).to(self.device)
 
-    def train_actions(self, observations, legal_actions=None, step=False):
+    def train_actions(self, observations, action_mask=None, step=False):
         observations = T(observations, self.device)
         if step:
             self.step += 1
+        with torch.no_grad():
+            continuous_actions, discrete_action_activations = self.actor(
+                observations, action_mask
+            )
 
-        continuous_actions, discrete_action_activations = self.actor(
-            observations, legal_actions
-        )
+            continuous_logprobs = None
+            discrete_logprobs = None
 
-        continuous_logprobs = None
-        discrete_logprobs = None
+            value = self.critic(
+                observations,
+                continuous_actions + self.__noise__(continuous_actions),
+                discrete_action_activations,
+            )
 
-        value = self.critic(
-            observations,
-            continuous_actions + self.__noise__(continuous_actions),
-            discrete_action_activations,
-        )
+            discrete_actions = torch.zeros(
+                (observations.shape[0], len(discrete_action_activations)),
+                device=self.device,
+                dtype=torch.long,
+            )
+            for i, activation in enumerate(discrete_action_activations):
+                discrete_actions[:, i] = torch.argmax(activation, dim=1)
 
-        discrete_actions = torch.zeros(
-            (observations.shape[0], len(discrete_action_activations)),
-            device=self.device,
-            dtype=torch.long,
-        )
-        for i, activation in enumerate(discrete_action_activations):
-            discrete_actions[:, i] = torch.argmax(activation, dim=1)
-
-        discrete_actions = discrete_actions.detach().cpu().numpy()
-        continuous_actions = continuous_actions.detach().cpu().numpy()
-        return (
-            discrete_actions,
-            continuous_actions,
-            discrete_logprobs,
-            continuous_logprobs,
-            value.detach().cpu().numpy(),
-        )
+            discrete_actions = discrete_actions.detach().cpu().numpy()
+            continuous_actions = continuous_actions.detach().cpu().numpy()
+            return (
+                discrete_actions,
+                continuous_actions,
+                discrete_logprobs,
+                continuous_logprobs,
+                value.detach().cpu().numpy(),
+            )
 
     def reinforcement_learn(
-        self, batch: Flexibatch, agent_num=0, critic_only=False, debug=False
+        self, batch: FlexiBatch, agent_num=0, critic_only=False, debug=False
     ):
+        self.rl_step += 1
+        with torch.no_grad():
+            continuous_actions_, discrete_action_activations_ = self.actor_target(batch.obs_[agent_num],batch.action_mask[agent_num], gumbel=True)
+            actions_ = torch.cat(continuous_actions_, discrete_action_activations_,dim=-1)
+            qtarget = self.critic_target(batch.obs_[agent_num], actions_).squeeze(-1)
+            #TODO configure reward channel beyong just global_rewards
+            next_q_value = batch.global_rewards + (1 - batch.terminated) * self.gamma * qtarget
 
+        actions = torch.cat(batch.continuous_actions[agent_num], batch.discrete_actions[agent_num], dim=-1)
+        q_values = self.critic(batch.obs[agent_num], actions).squeeze(-1)
+        qf1_loss = F.mse_loss(q_values, next_q_value)
+
+        # optimize the critic
+        self.critic_optimizer.zero_grad()
+        qf1_loss.backward()
+        self.critic_optimizer.step()
+
+
+        if self.rl_step % self.policy_frequency == 0 and not critic_only:
+            c_act, d_act = self.actor(batch.obs[agent_num], batch.action_mask[agent_num])
+            actor_loss = -self.critic(batch.obs[agent_num], torch.cat(c_act, d_act, dim=-1)).mean()
+            self.actor_optimizer.zero_grad()
+            actor_loss.backward()
+            self.actor_optimizer.step()
+
+            # update the target network
+            for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
+                target_param.data.copy_(self.target_update_percentage * param.data + (1 - self.target_update_percentage) * target_param.data)
+            for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
+                target_param.data.copy_(self.target_update_percentage * param.data + (1 - self.target_update_percentage) * target_param.data)
         return 0
+
+    def ego_actions(self, observations, action_mask=None):
+        with torch.no_grad():
+            continuous_actions, discrete_action_activations = self.actor(
+                observations, action_mask, gumbel=False
+            )
+            discrete_actions = torch.zeros(
+                (observations.shape[0], len(discrete_action_activations)),
+                device=self.device,
+                dtype=torch.float32,
+            )
+            for i, activation in enumerate(discrete_action_activations):
+                discrete_actions[:, i] = torch.argmax(activation, dim=1)
+            return discrete_actions, continuous_actions
+
+    def imitation_learn(self, observations, continuous_actions, discrete_actions):
+        con_a, disc_a = self.actor.forward(observations, gumbel=False)
+        loss = F.mse_loss(con_a, continuous_actions) + F.cross_entropy(disc_a, discrete_actions)
+        self.actor_optimizer.zero_grad()
+        loss.backward()
+        self.actor_optimizer.step()
+
+        # update the target network
+        for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
+            target_param.data.copy_(self.target_update_percentage * param.data + (1 - self.target_update_percentage) * target_param.data)
+        for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
+            target_param.data.copy_(self.target_update_percentage * param.data + (1 - self.target_update_percentage) * target_param.data)
+        return loss
+
+    def utility_function(self, observations, actions=None):
+        return 0  # Returns the single-agent critic for a single action.
+        # If actions are none then V(s)
+
+    def expected_V(self, obs, legal_action):
+        print("expected_V not implemeted")
+        return 0
+
+    def save(self, checkpoint_path):
+        if self.eval_mode:
+            print("Not saving because model in eval mode")
+            return
+        if checkpoint_path is None:
+            checkpoint_path = "./"+self.name+"/"
+        if not os.path.exists(checkpoint_path):
+            os.makedirs(checkpoint_path)
+        torch.save(self.critic.state_dict(), checkpoint_path + "critic")
+        torch.save(self.critic_target.state_dict(), checkpoint_path + "critic_target")
+        torch.save(self.actor.state_dict(), checkpoint_path + "actor")
+        torch.save(self.actor_target.state_dict(), checkpoint_path + "actor_target")
+
+    def load(self, checkpoint_path):
+        if checkpoint_path is None:
+            checkpoint_path = "./"+self.name+"/"
+        self.actor.load_state_dict(torch.load(checkpoint_path + "actor"))
+        self.actor_target.load_state_dict(torch.load(checkpoint_path + "actor_target"))
+        self.critic.load_state_dict(torch.load(checkpoint_path + "critic"))
+        self.critic_target.load_state_dict(torch.load(checkpoint_path + "critic_target"))
+        
