@@ -1,4 +1,9 @@
 from abc import ABC, abstractmethod
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from Util import T
 
 
 class Agent(ABC):
@@ -36,13 +41,6 @@ class Agent(ABC):
     @abstractmethod
     def load(self, checkpoint_path):
         print("Load not implemented")
-
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
-from Util import T
 
 
 class ffEncoder(nn.Module):
@@ -101,7 +99,7 @@ class MixedActor(nn.Module):
             self.encoder = ffEncoder(obs_dim, hidden_dims, device=device)
 
         assert not (
-            continuous_action_dim == None and discrete_action_dims == None
+            continuous_action_dim is None and discrete_action_dims is None
         ), "At least one action dim should be provided"
         assert len(max_actions) == len(discrete_action_dims) and len(
             min_actions

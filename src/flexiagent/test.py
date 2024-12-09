@@ -1,8 +1,7 @@
-from flexibuff import FlexiBatch, FlexibleBuffer
+from flexibuff import FlexibleBuffer
 from DDPG import DDPG
 import gymnasium as gym
 import numpy as np
-from Agent import Agent
 
 
 def test_single_env(
