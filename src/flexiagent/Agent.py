@@ -66,8 +66,12 @@ class ffEncoder(nn.Module):
         self.device = device
         self.optimizer = torch.optim.Adam(self.parameters())
 
-    def forward(self, x):
+    def forward(self, x, debug=False):
+        if debug:
+            print(f"ffEncoder: x {x}")
         x = T(x, self.device)
+        if debug:
+            print(f"ffEncoder after T: x {x}")
         for layer in self.encoder:
             x = self.activation(layer(x))
         return x
@@ -105,12 +109,16 @@ class MixedActor(nn.Module):
             discrete_action_dims
         ), "max_actions should be provided for each discrete action dim"
 
-        self.action_scales = (  # doesn't track grad by default in from_numpy
-            torch.from_numpy(max_actions - min_actions).float().to(device),
-        ) / 2
+        print(
+            f"Min actions: {min_actions}, max actions: {max_actions}, torch {torch.from_numpy(max_actions - min_actions)}"
+        )
+        self.action_scales = (
+            torch.from_numpy(max_actions - min_actions).float().to(device) / 2
+        )
+        # doesn't track grad by default in from_numpy
         self.action_biases = (
-            torch.from_numpy(max_actions + min_actions).float().to(device)
-        ) / 2
+            torch.from_numpy(max_actions + min_actions).float().to(device) / 2
+        )
 
         self.continuous_actions_head = None
         if continuous_action_dim is not None and continuous_action_dim > 0:
@@ -126,11 +134,13 @@ class MixedActor(nn.Module):
                 )
         self.max_actions = max_actions
 
-    def forward(self, x, action_mask=None, gumbel=False):
+    def forward(self, x, action_mask=None, gumbel=False, debug=False):
+        if debug:
+            print(f"MixedActor: x {x}, action_mask {action_mask}, gumbel {gumbel}")
         if self.encoder is not None:
-            x = self.encoder(x)
+            x = self.encoder(x=x, debug=debug)
         else:
-            x = T(x, self.device)
+            x = T(a=x, device=self.device, debug=debug)
 
         continuous_actions = None
         discrete_actions = None
@@ -152,7 +162,7 @@ class MixedActor(nn.Module):
                     probs = F.gumbel_softmax(
                         logits, dim=-1, tau=self.tau, hard=self.hard
                     )
-                    #activations = activations / activations.sum(dim=-1, keepdim=True)
+                    # activations = activations / activations.sum(dim=-1, keepdim=True)
                     discrete_actions.append(probs)
                 else:
                     if action_mask is not None:
@@ -171,8 +181,10 @@ class ValueSA(nn.Module):
         self.l3 = nn.Linear(hidden_dim, 1)
         self.to(device)
 
-    def forward(self, x, u):
-        x = F.relu(self.l1(torch.cat([x, u], 1)))
+    def forward(self, x, u, debug=False):
+        if debug:
+            print(f"ValueSA: x {x}, u {u}")
+        x = F.relu(self.l1(torch.cat([x, u], -1)))
         x = F.relu(self.l2(x))
         x = self.l3(x)
         return x

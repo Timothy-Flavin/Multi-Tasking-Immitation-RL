@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 import random
 from Agent import Agent, MixedActor, ValueSA
-from Util import T
+from Util import T, get_multi_discrete_one_hot
 from flexibuff import FlexiBatch
 import os
 
@@ -25,6 +25,7 @@ class DDPG(Agent):
         name="Test_ddpg",
         device="cpu",
         eval_mode=False,
+        gumbel_tau=0.5,
     ):
         # documentation
         """
@@ -77,7 +78,7 @@ class DDPG(Agent):
             device=device,
             hidden_dims=hidden_dims,
             encoder=None,
-            tau=0.3,
+            tau=gumbel_tau,
             hard=False,
         )
         self.actor_target = MixedActor(
@@ -116,37 +117,72 @@ class DDPG(Agent):
         self.device = device
 
     def __noise__(self, continuous_actions: torch.Tensor):
-        return torch.normal(
+        noise = torch.normal(
             0,
             self.action_noise,
             (continuous_actions.shape[0], self.continuous_action_dim),
         ).to(self.device)
+        if noise.shape[0] == 1:
+            noise = noise.squeeze(0)
+        return noise
 
-    def train_actions(self, observations, action_mask=None, step=False):
-        observations = T(observations, self.device)
+    def train_actions(self, observations, action_mask=None, step=False, debug=False):
+        observations = T(observations, self.device, debug=debug)
+        if debug:
+            print("DDPG train_actions Observations: ", observations)
         if step:
             self.step += 1
         with torch.no_grad():
             continuous_actions, discrete_action_activations = self.actor(
-                observations, action_mask
+                x=observations, action_mask=action_mask, gumbel=True, debug=debug
             )
 
             continuous_logprobs = None
             discrete_logprobs = None
 
-            value = self.critic(
-                observations,
-                continuous_actions + self.__noise__(continuous_actions),
-                discrete_action_activations,
-            )
+            if debug:
+                print("DDPG train_actions continuous_actions: ", continuous_actions)
+                print(
+                    "DDPG train_actions discrete_action_activations: ",
+                    discrete_action_activations,
+                )
+                print("DDPG noise: ", self.__noise__(continuous_actions))
 
-            discrete_actions = torch.zeros(
-                (observations.shape[0], len(discrete_action_activations)),
-                device=self.device,
-                dtype=torch.long,
+            value = self.critic(
+                x=observations,
+                u=torch.cat(
+                    (
+                        continuous_actions + self.__noise__(continuous_actions),
+                        discrete_action_activations[0],
+                    ),  # TODO: Cat all discrete actions
+                    dim=-1,
+                ),
+                debug=debug,
             )
+            if len(observations.shape) > 1:
+                discrete_actions = torch.zeros(
+                    (observations.shape[0], len(discrete_action_activations)),
+                    device=self.device,
+                    dtype=torch.long,
+                )
+            else:
+                discrete_actions = torch.zeros(
+                    (1, len(discrete_action_activations)),
+                    device=self.device,
+                    dtype=torch.long,
+                )
+            if debug:
+                print("DDPG discrete_action_activtions: ", discrete_action_activations)
             for i, activation in enumerate(discrete_action_activations):
-                discrete_actions[:, i] = torch.argmax(activation, dim=1)
+                if debug:
+                    print("DDPG train_actions activation: ", activation)
+                discrete_actions[:, i] = torch.argmax(activation, dim=-1)
+
+            if debug:
+                print(
+                    "DDPG train_actions discrete_actions after argmax: ",
+                    discrete_actions,
+                )
 
             discrete_actions = discrete_actions.detach().cpu().numpy()
             continuous_actions = continuous_actions.detach().cpu().numpy()
@@ -161,23 +197,53 @@ class DDPG(Agent):
     def reinforcement_learn(
         self, batch: FlexiBatch, agent_num=0, critic_only=False, debug=False
     ):
+        aloss_item = 0
+        closs_item = 0
         self.rl_step += 1
         with torch.no_grad():
+            if batch.action_mask is not None:
+                mask = batch.action_mask[agent_num]
+                mask_ = batch.action_mask_[agent_num]
+            else:
+                mask = 1.0
+                mask_ = 1.0
             continuous_actions_, discrete_action_activations_ = self.actor_target(
-                batch.obs_[agent_num], batch.action_mask[agent_num], gumbel=True
+                batch.obs_[agent_num], mask_, gumbel=True
             )
-            actions_ = torch.cat(
-                continuous_actions_, discrete_action_activations_, dim=-1
-            )
+
+            if len(discrete_action_activations_) == 1:
+                daa_ = discrete_action_activations_[0]
+            else:
+                daa_ = torch.cat(discrete_action_activations_, dim=-1)
+
+            if debug:
+                print(
+                    "DDPG reinforcement_learn continuous_actions_: ",
+                    continuous_actions_,
+                )
+                print(
+                    "DDPG reinforcement_learn discrete_action_activations_: ",
+                    discrete_action_activations_,
+                )
+                print("DDPG reinforcement_learn daa: ", daa_)
+                # input()
+            actions_ = torch.cat([continuous_actions_, daa_], dim=-1)
             qtarget = self.critic_target(batch.obs_[agent_num], actions_).squeeze(-1)
             # TODO configure reward channel beyong just global_rewards
             next_q_value = (
                 batch.global_rewards + (1 - batch.terminated) * self.gamma * qtarget
             )
+        # for each discrete action, get the one hot coding and concatinate them
 
         actions = torch.cat(
-            batch.continuous_actions[agent_num],
-            batch.discrete_actions[agent_num],
+            [
+                batch.continuous_actions[agent_num],
+                get_multi_discrete_one_hot(
+                    batch.discrete_actions[agent_num],
+                    discrete_action_dims=self.discrete_action_dims,
+                    debug=debug,
+                ),
+            ],
             dim=-1,
         )
         q_values = self.critic(batch.obs[agent_num], actions).squeeze(-1)
@@ -187,13 +253,18 @@ class DDPG(Agent):
         self.critic_optimizer.zero_grad()
         qf1_loss.backward()
         self.critic_optimizer.step()
+        closs_item = qf1_loss.item()
 
         if self.rl_step % self.policy_frequency == 0 and not critic_only:
-            c_act, d_act = self.actor(
-                batch.obs[agent_num], batch.action_mask[agent_num]
-            )
+            c_act, d_act = self.actor(batch.obs[agent_num], mask)
+
+            # TODO Check and make sure that the discrete actions are concatenated correctly
+            if len(d_act) == 1:
+                d_act = d_act[0]
+            else:
+                d_act = torch.cat(d_act, dim=-1)
             actor_loss = -self.critic(
-                batch.obs[agent_num], torch.cat(c_act, d_act, dim=-1)
+                batch.obs[agent_num], torch.cat([c_act, d_act], dim=-1)
             ).mean()
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
@@ -214,7 +285,8 @@ class DDPG(Agent):
                     self.target_update_percentage * param.data
                     + (1 - self.target_update_percentage) * target_param.data
                 )
-        return 0
+            aloss_item = actor_loss.item()
+        return aloss_item, closs_item
 
     def ego_actions(self, observations, action_mask=None):
         with torch.no_grad():
