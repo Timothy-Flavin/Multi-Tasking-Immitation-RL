@@ -24,6 +24,7 @@ class DDPG(Agent):
         device="cpu",
         eval_mode=False,
         gumbel_tau=0.5,
+        rand_steps=10000,
     ):
         # documentation
         """
@@ -63,6 +64,7 @@ class DDPG(Agent):
             np.array(discrete_action_dims)
         )
         self.target_update_percentage = target_update_percentage
+        self.rand_steps = rand_steps
         self.gamma = gamma
         self.policy_frequency = policy_frequency
         self.eval_mode = eval_mode
@@ -124,12 +126,35 @@ class DDPG(Agent):
             noise = noise.squeeze(0)
         return noise
 
+    def _get_random_actions(self, action_mask=None, debug=False):
+
+        continuous_actions = (
+            torch.rand(size=(self.continuous_action_dim,), device=self.device) * 2 - 1
+        ) * self.actor.action_scales - self.actor.action_biases
+        discrete_actions = torch.zeros(
+            (1, len(self.discrete_action_dims)), device=self.device, dtype=torch.long
+        )
+        for dim, dim_size in enumerate(self.discrete_action_dims):
+            discrete_actions[dim] = torch.randint(dim_size, (1,))
+        return discrete_actions, continuous_actions
+
     def train_actions(self, observations, action_mask=None, step=False, debug=False):
         observations = T(observations, self.device, debug=debug)
         if debug:
             print("DDPG train_actions Observations: ", observations)
         if step:
             self.step += 1
+        if self.step < self.rand_steps:
+            discrete_actions, continuous_actions = self._get_random_actions(
+                action_mask, debug=debug
+            )
+            return (
+                discrete_actions.detach().cpu().numpy(),
+                continuous_actions.detach().cpu().numpy(),
+                None,
+                None,
+                None,
+            )
         with torch.no_grad():
             continuous_actions, discrete_action_activations = self.actor(
                 x=observations, action_mask=action_mask, gumbel=True, debug=debug
