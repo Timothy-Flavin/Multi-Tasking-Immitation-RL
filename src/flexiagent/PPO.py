@@ -19,6 +19,7 @@ class PPO(Agent):
         n_epochs=10,
         device="cpu",
         entropy_loss=0.05,
+        encoder_dims=[256, 256],
     ):
         super().__init__()
         assert (
@@ -42,7 +43,7 @@ class PPO(Agent):
             discrete_action_dims=discrete_action_dims,
             max_actions=max_actions,
             min_actions=min_actions,
-            hidden_dims=[256, 256],
+            hidden_dims=encoder_dims,
             device=device,
         )
         self.actor_old = MixedActor(
@@ -51,7 +52,7 @@ class PPO(Agent):
             discrete_action_dims=discrete_action_dims,
             max_actions=max_actions,
             min_actions=min_actions,
-            hidden_dims=[256, 256],
+            hidden_dims=encoder_dims,
             device=device,
         )
         self.actor_old.load_state_dict(self.actor.state_dict())
@@ -60,40 +61,64 @@ class PPO(Agent):
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=lr_actor)
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=lr_critic)
 
-    def train_action(self, observations, legal_actions=None, step=False):
+    def _sample_multi_discrete(self, logits, debug=False): #logits of the form [action_dim, batch_size, action_dim_size]
+        actions = torch.zeros(size=(logits[0].shape[-1], len(self.discrete_action_dims)))
+        log_probs = torch.zeros(size=(logits[0].shape[-1], len(self.discrete_action_dims)))
+        for i in range(len(self.discrete_action_dims)):
+            dist = Categorical(logits=logits[i])
+            actions[:,i] = dist.sample()
+            log_probs[:,i] = dist.log_prob(actions[i])
+        return actions, log_probs
+
+    def train_action(self, observations, action_mask=None, step=False):
         if not torch.is_tensor(observations):
             observations = torch.tensor(observations, dtype=torch.float).to(self.device)
-        if not torch.is_tensor(legal_actions) and legal_actions is not None:
-            legal_actions = torch.tensor(legal_actions, dtype=torch.float).to(
+        if not torch.is_tensor(action_mask) and action_mask is not None:
+            action_mask = torch.tensor(action_mask, dtype=torch.float).to(
                 self.device
             )
         continuous_logits, descrete_logits = self.actor(
-            x=observations, action_mask=legal_actions, gumbel=False, debug=False
+            x=observations, action_mask=action_mask, gumbel=False, debug=False
         )
+        if len(continuous_logits.shape) == 1:
+            continuous_logits = continuous_logits.unsqueeze(0)
+
         continuous_dist = torch.distributions.Normal(
-            loc=continuous_logits[: self.continuous_action_dim],
-            scale=torch.exp(continuous_logits[self.continuous_action_dim :]),
+            loc=continuous_logits[:, :self.continuous_action_dim],
+            scale=torch.exp(continuous_logits[:,self.continuous_action_dim :]),
         )
-        descrete_dist = Multi(logits=descrete_logits)
+        discrete_actions, discrete_log_probs = self._sample_multi_discrete(descrete_logits)
+        continuous_actions = continuous_dist.sample()
+        continuous_log_probs = continuous_dist.log_prob(continuous_actions)
         vals = self.critic(observations).detach()
-        return act, log_probs[act].detach(), vals  # Action 0, log_prob 0
+        return discrete_actions,continuous_actions,discrete_log_probs,continuous_log_probs, vals  
 
     # takes the observations and returns the action with the highest probability
-    def deterministic_action(self, observations, legal_actions=None):
-        act, probs, log_probs = self.actor.evaluate(
-            observations, legal_actions=legal_actions
-        )
-        vals = self.critic(observations).detach()
-        return act.argmax().item(), log_probs[act].detach(), vals
+    def ego_action(self, observations, action_mask=None):
+        with torch.no_grad():
+            continuous_actions, discrete_action_activations = self.actor(
+                observations, action_mask, gumbel=False
+            )
+            if len(continuous_actions.shape) == 1:
+                continuous_actions = continuous_actions.unsqueeze(0)
+            # Ignore the continuous actions std for ego action
+            discrete_actions = torch.zeros(
+                (observations.shape[0], len(discrete_action_activations)),
+                device=self.device,
+                dtype=torch.float32,
+            )
+            for i, activation in enumerate(discrete_action_activations):
+                discrete_actions[:, i] = torch.argmax(activation, dim=1)
+            return discrete_actions, continuous_actions[:, : self.continuous_action_dim]
 
-    def imitation_learn(self, observations, actions, legal_actions=None):
+    def imitation_learn(self, observations, actions, action_mask=None):
         if not torch.is_tensor(actions):
             actions = torch.tensor(actions, dtype=torch.int).to(self.device)
         if not torch.is_tensor(observations):
             observations = torch.tensor(observations, dtype=torch.float).to(self.device)
 
         act, probs, log_probs = self.actor.evaluate(
-            observations, legal_actions=legal_actions
+            observations, action_mask=action_mask
         )
         # max_actions = act.argmax(dim=-1, keepdim=True)
         # loss is MSE loss beteen the actions and the predicted actions
@@ -145,9 +170,9 @@ class PPO(Agent):
 
         avg_actor_loss = 0
         # Update the actor
-        legal_actions = None
+        action_mask = None
         if batch.action_mask is not None:
-            legal_actions = batch.action_mask[agent_num]
+            action_mask = batch.action_mask[agent_num]
         for epoch in range(self.n_epochs):
 
             # with torch.no_grad():
@@ -173,7 +198,7 @@ class PPO(Agent):
             print(f"critic_loss: {critic_loss}")
 
             act, probs, log_probs = self.actor.evaluate(
-                batch.obs[agent_num], legal_actions=legal_actions
+                batch.obs[agent_num], action_mask=action_mask
             )
             dist = Categorical(probs)
             dist_entropy = dist.entropy()

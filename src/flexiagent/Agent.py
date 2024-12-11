@@ -110,13 +110,14 @@ class MixedActor(nn.Module):
         print(
             f"Min actions: {min_actions}, max actions: {max_actions}, torch {torch.from_numpy(max_actions - min_actions)}"
         )
-        self.action_scales = (
-            torch.from_numpy(max_actions - min_actions).float().to(device) / 2
-        )
-        # doesn't track grad by default in from_numpy
-        self.action_biases = (
-            torch.from_numpy(max_actions + min_actions).float().to(device) / 2
-        )
+        if max_actions is not None and min_actions is not None:
+            self.action_scales = (
+                torch.from_numpy(max_actions - min_actions).float().to(device) / 2
+            )
+            # doesn't track grad by default in from_numpy
+            self.action_biases = (
+                torch.from_numpy(max_actions + min_actions).float().to(device) / 2
+            )
 
         self.continuous_actions_head = None
         if continuous_action_dim is not None and continuous_action_dim > 0:
