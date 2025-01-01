@@ -193,18 +193,18 @@ class TD3(Agent):
                     discrete_action_activations,
                 )
                 print("TD3 noise: ", self.__noise__(continuous_actions))
-            u = torch.cat(
-                (
-                    continuous_actions_noisy,
-                    discrete_action_activations[0],
-                ),  # TODO: Cat all discrete actions
-                dim=-1,
-            )
-            value = self.critic1(
-                x=observations,
-                u=u,
-                debug=debug,
-            )
+            # u = torch.cat(
+            #     (
+            #         continuous_actions_noisy,
+            #         discrete_action_activations[0],
+            #     ),  # TODO: Cat all discrete actions
+            #     dim=-1,
+            # )
+            # value = self.critic1(
+            #     x=observations,
+            #     u=u,
+            #     debug=debug,
+            # )
             if len(observations.shape) > 1:
                 discrete_actions = torch.zeros(
                     (observations.shape[0], len(discrete_action_activations)),
@@ -237,8 +237,22 @@ class TD3(Agent):
                 continuous_actions,
                 discrete_logprobs,
                 continuous_logprobs,
-                value.detach().cpu().numpy(),
+                0,  # value.detach().cpu().numpy(),
             )
+
+    def polyak_update(self, tau=0.01):
+        for param, target_param in zip(
+            self.actor.parameters(), self.actor_target.parameters()
+        ):
+            target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
+        for param, target_param in zip(
+            self.critic1.parameters(), self.critic1_target.parameters()
+        ):
+            target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
+        for param, target_param in zip(
+            self.critic2.parameters(), self.critic2_target.parameters()
+        ):
+            target_param.data.copy_(tau * param.data + (1 - tau) * target_param.data)
 
     def reinforcement_learn(
         self, batch: FlexiBatch, agent_num=0, critic_only=False, debug=False
@@ -256,11 +270,11 @@ class TD3(Agent):
             continuous_actions_, discrete_action_activations_ = self.actor_target(
                 batch.obs_[agent_num], mask_, gumbel=True
             )
-
-            if len(discrete_action_activations_) == 1:
-                daa_ = discrete_action_activations_[0]
-            else:
-                daa_ = torch.cat(discrete_action_activations_, dim=-1)
+            daa_ = discrete_action_activations_
+            # if len(discrete_action_activations_) == 1:
+            #     daa_ = discrete_action_activations_[0]
+            # else:
+            #     daa_ = torch.cat(discrete_action_activations_, dim=-1)
 
             if debug:
                 print(
@@ -271,18 +285,20 @@ class TD3(Agent):
                     "TD3 reinforcement_learn discrete_action_activations_: ",
                     discrete_action_activations_,
                 )
-                print("TD3 reinforcement_learn daa: ", daa_)
+                print("TD3 reinforcement_learn daa_: ", daa_)
                 # input()
-            actions_ = torch.cat(list(continuous_actions_) + daa_, dim=-1)
-            u = self._add_noise(actions_)
+            u_ = torch.cat([self._add_noise(continuous_actions_)] + daa_, dim=-1)
             qtarget = torch.minimum(
-                self.critic1(x=batch.obs_[agent_num], u=u),
-                self.critic2(x=batch.obs_[agent_num], u=u),
-            ).squeeze(-1)
+                self.critic1_target(x=batch.obs_[agent_num], u=u_),
+                self.critic2_target(x=batch.obs_[agent_num], u=u_),
+            )
             # TODO configure reward channel beyong just global_rewards
             next_q_value = (
                 batch.global_rewards + (1 - batch.terminated) * self.gamma * qtarget
             )
+            if debug:
+                print("TD3 reinforcement_learn next_q_value: ", next_q_value)
+
         # for each discrete action, get the one hot coding and concatinate them
 
         actions = torch.cat(
@@ -296,14 +312,16 @@ class TD3(Agent):
             ],
             dim=-1,
         )
-        q_values = self.critic1(batch.obs[agent_num], actions).squeeze(-1)
-        qf1_loss = F.mse_loss(q_values, next_q_value)
+        q1_values = self.critic1(batch.obs[agent_num], actions)  # .squeeze(-1)
+        q2_values = self.critic2(batch.obs[agent_num], actions)  # .squeeze(-1)
+        qf1_loss = F.mse_loss(q1_values, next_q_value)
+        qf2_loss = F.mse_loss(q2_values, next_q_value)
+        L = qf1_loss + qf2_loss
 
         # optimize the critic
         self.critic_optimizer.zero_grad()
-        qf1_loss.backward()
+        L.backward()
         self.critic_optimizer.step()
-        closs_item = qf1_loss.item()
 
         if self.rl_step % self.policy_frequency == 0 and not critic_only:
             c_act, d_act = self.actor(batch.obs[agent_num], mask)
@@ -321,21 +339,10 @@ class TD3(Agent):
             self.actor_optimizer.step()
 
             # update the target network
-            for param, target_param in zip(
-                self.actor.parameters(), self.actor_target.parameters()
-            ):
-                target_param.data.copy_(
-                    self.target_update_percentage * param.data
-                    + (1 - self.target_update_percentage) * target_param.data
-                )
-            for param, target_param in zip(
-                self.critic1.parameters(), self.critic2.parameters()
-            ):
-                target_param.data.copy_(
-                    self.target_update_percentage * param.data
-                    + (1 - self.target_update_percentage) * target_param.data
-                )
+            self.polyak_update(self.target_update_percentage)
             aloss_item = actor_loss.item()
+
+        closs_item = L.item()
         return aloss_item, closs_item
 
     def ego_actions(self, observations, action_mask=None):
@@ -362,20 +369,7 @@ class TD3(Agent):
         self.actor_optimizer.step()
 
         # update the target network
-        for param, target_param in zip(
-            self.actor.parameters(), self.actor_target.parameters()
-        ):
-            target_param.data.copy_(
-                self.target_update_percentage * param.data
-                + (1 - self.target_update_percentage) * target_param.data
-            )
-        for param, target_param in zip(
-            self.critic1.parameters(), self.critic2.parameters()
-        ):
-            target_param.data.copy_(
-                self.target_update_percentage * param.data
-                + (1 - self.target_update_percentage) * target_param.data
-            )
+        self.polyak_update(self.target_update_percentage)
         return loss
 
     def utility_function(self, observations, actions=None):
@@ -394,8 +388,10 @@ class TD3(Agent):
             checkpoint_path = "./" + self.name + "/"
         if not os.path.exists(checkpoint_path):
             os.makedirs(checkpoint_path)
-        torch.save(self.critic1.state_dict(), checkpoint_path + "critic")
+        torch.save(self.critic1.state_dict(), checkpoint_path + "critic1")
         torch.save(self.critic2.state_dict(), checkpoint_path + "critic2")
+        torch.save(self.critic1_target.state_dict(), checkpoint_path + "critic1_target")
+        torch.save(self.critic2_target.state_dict(), checkpoint_path + "critic2_target")
         torch.save(self.actor.state_dict(), checkpoint_path + "actor")
         torch.save(self.actor_target.state_dict(), checkpoint_path + "actor_target")
 
@@ -404,9 +400,15 @@ class TD3(Agent):
             checkpoint_path = "./" + self.name + "/"
         self.actor.load_state_dict(torch.load(checkpoint_path + "actor"))
         self.actor_target.load_state_dict(torch.load(checkpoint_path + "actor_target"))
-        self.critic1.load_state_dict(torch.load(checkpoint_path + "critic"))
+        self.critic1.load_state_dict(torch.load(checkpoint_path + "critic1"))
         self.critic2.load_state_dict(torch.load(checkpoint_path + "critic2"))
+        self.critic1_target.load_state_dict(
+            torch.load(checkpoint_path + "critic1_target")
+        )
+        self.critic2_target.load_state_dict(
+            torch.load(checkpoint_path + "critic2_target")
+        )
 
 
 if __name__ == "__main__":
-    print("Testing TD3 functionality")
+
