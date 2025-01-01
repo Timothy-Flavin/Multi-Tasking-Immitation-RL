@@ -7,7 +7,7 @@ from flexibuff import FlexiBatch
 import os
 
 
-class DDPG(Agent):
+class TD3(Agent):
     def __init__(
         self,
         obs_dim,
@@ -20,7 +20,7 @@ class DDPG(Agent):
         gamma=0.99,
         policy_frequency=2,
         target_update_percentage=0.01,
-        name="Test_ddpg",
+        name="Test_TD3",
         device="cpu",
         eval_mode=False,
         gumbel_tau=0.5,
@@ -93,6 +93,10 @@ class DDPG(Agent):
             tau=0.3,
             hard=False,
         )
+        if continuous_action_dim > 0:
+            self.min_actions = torch.from_numpy(np.array(min_actions)).to(self.device)
+            self.max_actions = torch.from_numpy(np.array(max_actions)).to(self.device)
+
         self.discrete_action_dims = discrete_action_dims
         self.continuous_action_dim = continuous_action_dim
         self.action_noise = action_noise
@@ -103,16 +107,18 @@ class DDPG(Agent):
         self.actor_target.to(device)
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters())
 
-        self.critic = ValueSA(
+        self.critic1 = ValueSA(
             obs_dim, self.total_action_dim, hidden_dim=256, device=device
         )
-        self.critic_target = ValueSA(
+        self.critic2 = ValueSA(
             obs_dim, self.total_action_dim, hidden_dim=256, device=device
         )
-        self.critic_target.load_state_dict(self.critic.state_dict())
-        self.critic.to(device)
-        self.critic_target.to(device)
-        self.critic_optimizer = torch.optim.Adam(self.critic.parameters())
+        # self.critic2.load_state_dict(self.critic1.state_dict())
+        self.critic1.to(device)
+        self.critic2.to(device)
+        self.critic_optimizer = torch.optim.Adam(
+            list(self.critic1.parameters()) + list(self.critic2.parameters())
+        )
 
         self.device = device
 
@@ -126,8 +132,16 @@ class DDPG(Agent):
             noise = noise.squeeze(0)
         return noise
 
-    def _get_random_actions(self, action_mask=None, debug=False):
+    def _add_noise(self, continuous_actions):
+        if self.continuous_action_dim == 0:
+            return 0
+        return torch.clip(
+            continuous_actions + self.__noise__(continuous_actions),
+            self.min_actions,
+            self.max_actions,
+        )
 
+    def _get_random_actions(self, action_mask=None, debug=False):
         continuous_actions = (
             torch.rand(size=(self.continuous_action_dim,), device=self.device) * 2 - 1
         ) * self.actor.action_scales - self.actor.action_biases
@@ -141,7 +155,7 @@ class DDPG(Agent):
     def train_actions(self, observations, action_mask=None, step=False, debug=False):
         observations = T(observations, self.device, debug=debug)
         if debug:
-            print("DDPG train_actions Observations: ", observations)
+            print("TD3 train_actions Observations: ", observations)
         if step:
             self.step += 1
         if self.step < self.rand_steps:
@@ -159,23 +173,24 @@ class DDPG(Agent):
             continuous_actions, discrete_action_activations = self.actor(
                 x=observations, action_mask=action_mask, gumbel=True, debug=debug
             )
+            continuous_actions_noisy = self._add_noise(continuous_actions)
 
             continuous_logprobs = None
             discrete_logprobs = None
 
             if debug:
-                print("DDPG train_actions continuous_actions: ", continuous_actions)
+                print("TD3 train_actions continuous_actions: ", continuous_actions)
                 print(
-                    "DDPG train_actions discrete_action_activations: ",
+                    "TD3 train_actions discrete_action_activations: ",
                     discrete_action_activations,
                 )
-                print("DDPG noise: ", self.__noise__(continuous_actions))
+                print("TD3 noise: ", self.__noise__(continuous_actions))
 
-            value = self.critic(
+            value = self.critic1(
                 x=observations,
                 u=torch.cat(
                     (
-                        continuous_actions + self.__noise__(continuous_actions),
+                        continuous_actions_noisy,
                         discrete_action_activations[0],
                     ),  # TODO: Cat all discrete actions
                     dim=-1,
@@ -195,15 +210,15 @@ class DDPG(Agent):
                     dtype=torch.long,
                 )
             if debug:
-                print("DDPG discrete_action_activtions: ", discrete_action_activations)
+                print("TD3 discrete_action_activtions: ", discrete_action_activations)
             for i, activation in enumerate(discrete_action_activations):
                 if debug:
-                    print("DDPG train_actions activation: ", activation)
+                    print("TD3 train_actions activation: ", activation)
                 discrete_actions[:, i] = torch.argmax(activation, dim=-1)
 
             if debug:
                 print(
-                    "DDPG train_actions discrete_actions after argmax: ",
+                    "TD3 train_actions discrete_actions after argmax: ",
                     discrete_actions,
                 )
 
@@ -241,17 +256,19 @@ class DDPG(Agent):
 
             if debug:
                 print(
-                    "DDPG reinforcement_learn continuous_actions_: ",
+                    "TD3 reinforcement_learn continuous_actions_: ",
                     continuous_actions_,
                 )
                 print(
-                    "DDPG reinforcement_learn discrete_action_activations_: ",
+                    "TD3 reinforcement_learn discrete_action_activations_: ",
                     discrete_action_activations_,
                 )
-                print("DDPG reinforcement_learn daa: ", daa_)
+                print("TD3 reinforcement_learn daa: ", daa_)
                 # input()
             actions_ = torch.cat([continuous_actions_, daa_], dim=-1)
-            qtarget = self.critic_target(batch.obs_[agent_num], actions_).squeeze(-1)
+            qtarget = self.critic2(
+                batch.obs_[agent_num], self._add_noise(actions_)
+            ).squeeze(-1)
             # TODO configure reward channel beyong just global_rewards
             next_q_value = (
                 batch.global_rewards + (1 - batch.terminated) * self.gamma * qtarget
@@ -269,7 +286,7 @@ class DDPG(Agent):
             ],
             dim=-1,
         )
-        q_values = self.critic(batch.obs[agent_num], actions).squeeze(-1)
+        q_values = self.critic1(batch.obs[agent_num], actions).squeeze(-1)
         qf1_loss = F.mse_loss(q_values, next_q_value)
 
         # optimize the critic
@@ -286,7 +303,7 @@ class DDPG(Agent):
                 d_act = d_act[0]
             else:
                 d_act = torch.cat(d_act, dim=-1)
-            actor_loss = -self.critic(
+            actor_loss = -self.critic1(
                 batch.obs[agent_num], torch.cat([c_act, d_act], dim=-1)
             ).mean()
             self.actor_optimizer.zero_grad()
@@ -302,7 +319,7 @@ class DDPG(Agent):
                     + (1 - self.target_update_percentage) * target_param.data
                 )
             for param, target_param in zip(
-                self.critic.parameters(), self.critic_target.parameters()
+                self.critic1.parameters(), self.critic2.parameters()
             ):
                 target_param.data.copy_(
                     self.target_update_percentage * param.data
@@ -343,7 +360,7 @@ class DDPG(Agent):
                 + (1 - self.target_update_percentage) * target_param.data
             )
         for param, target_param in zip(
-            self.critic.parameters(), self.critic_target.parameters()
+            self.critic1.parameters(), self.critic2.parameters()
         ):
             target_param.data.copy_(
                 self.target_update_percentage * param.data
@@ -367,17 +384,19 @@ class DDPG(Agent):
             checkpoint_path = "./" + self.name + "/"
         if not os.path.exists(checkpoint_path):
             os.makedirs(checkpoint_path)
-        torch.save(self.critic.state_dict(), checkpoint_path + "/critic")
-        torch.save(self.critic_target.state_dict(), checkpoint_path + "/critic_target")
-        torch.save(self.actor.state_dict(), checkpoint_path + "/actor")
-        torch.save(self.actor_target.state_dict(), checkpoint_path + "/actor_target")
+        torch.save(self.critic1.state_dict(), checkpoint_path + "critic")
+        torch.save(self.critic2.state_dict(), checkpoint_path + "critic2")
+        torch.save(self.actor.state_dict(), checkpoint_path + "actor")
+        torch.save(self.actor_target.state_dict(), checkpoint_path + "actor_target")
 
     def load(self, checkpoint_path):
         if checkpoint_path is None:
             checkpoint_path = "./" + self.name + "/"
-        self.actor.load_state_dict(torch.load(checkpoint_path + "/actor"))
-        self.actor_target.load_state_dict(torch.load(checkpoint_path + "/actor_target"))
-        self.critic.load_state_dict(torch.load(checkpoint_path + "/critic"))
-        self.critic_target.load_state_dict(
-            torch.load(checkpoint_path + "/critic_target")
-        )
+        self.actor.load_state_dict(torch.load(checkpoint_path + "actor"))
+        self.actor_target.load_state_dict(torch.load(checkpoint_path + "actor_target"))
+        self.critic1.load_state_dict(torch.load(checkpoint_path + "critic"))
+        self.critic2.load_state_dict(torch.load(checkpoint_path + "critic2"))
+
+
+if __name__ == "__main__":
+    print("Testing TD3 functionality")

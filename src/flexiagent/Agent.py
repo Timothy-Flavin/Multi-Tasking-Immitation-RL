@@ -107,9 +107,9 @@ class MixedActor(nn.Module):
             discrete_action_dims
         ), "max_actions should be provided for each discrete action dim"
 
-        print(
-            f"Min actions: {min_actions}, max actions: {max_actions}, torch {torch.from_numpy(max_actions - min_actions)}"
-        )
+        # print(
+        #    f"Min actions: {min_actions}, max actions: {max_actions}, torch {torch.from_numpy(max_actions - min_actions)}"
+        # )
         if max_actions is not None and min_actions is not None:
             self.action_scales = (
                 torch.from_numpy(max_actions - min_actions).float().to(device) / 2
@@ -128,10 +128,9 @@ class MixedActor(nn.Module):
         self.discrete_action_heads = nn.ModuleList()
         if discrete_action_dims is not None and len(discrete_action_dims) > 0:
             for dim in discrete_action_dims:
-                self.discrete_action_heads = nn.ModuleList().append(
-                    nn.Linear(hidden_dims[-1], dim)
-                )
+                self.discrete_action_heads.append(nn.Linear(hidden_dims[-1], dim))
         self.max_actions = max_actions
+        self.to(device)
 
     def forward(self, x, action_mask=None, gumbel=False, debug=False):
         if debug:
@@ -204,3 +203,192 @@ class ValueS(nn.Module):
         x = F.relu(self.l2(x))
         x = self.l3(x)
         return x
+
+
+class QSCA(nn.Module):
+    def __init__(
+        self,
+        obs_dim,
+        continuois_action_dim=0,
+        discrete_action_dims=[1],
+        hidden_dim=256,
+        device="cpu",
+    ):
+        super(QSCA, self).__init__()
+        self.device = device
+        self.l1 = nn.Linear(obs_dim + continuois_action_dim, hidden_dim)
+        self.l2 = nn.Linear(hidden_dim, hidden_dim)
+        self.discrete_Q_heads = nn.ModuleList()
+        if discrete_action_dims is not None and len(discrete_action_dims) > 0:
+            for dim in discrete_action_dims:
+                self.discrete_Q_heads.append(nn.Linear(hidden_dim, dim))
+        self.to(device)
+
+    def forward(self, x):
+        x = T(x, self.device)
+        x = F.relu(self.l1(x))
+        x = F.relu(self.l2(x))
+        Qs = []
+        for i, head in enumerate(self.discrete_Q_heads):
+            Qi = head(x)
+            Qs.append(Qi)
+        if len(Qs) == 1:
+            Qs = Qs[0]
+        return Qs
+
+
+class QSAA(nn.Module):
+    def __init__(
+        self,
+        obs_dim,
+        continuous_action_dim=0,
+        discrete_action_dims=[1],
+        hidden_dim=256,
+        device="cpu",
+    ):
+        super(QSAA, self).__init__()
+        self.device = device
+        total_discrete_dims = sum(discrete_action_dims)
+        input_dim = obs_dim + continuous_action_dim + total_discrete_dims
+        self.l1 = nn.Linear(input_dim, hidden_dim)
+        self.l2 = nn.Linear(hidden_dim, hidden_dim)
+        self.l3 = nn.Linear(hidden_dim, 1)
+        self.to(device)
+
+    def forward(self, s, a_c=None, a_d=None):
+        if a_c is None:
+            a_c = torch.tensor([]).to(self.device)
+        if a_d is None:
+            a_d = torch.tensor([]).to(self.device)
+        x = torch.cat([s, a_c, a_d], dim=-1)
+        x = T(x, self.device)
+        x = F.relu(self.l1(x))
+        x = F.relu(self.l2(x))
+        x = self.l3(x)
+        return x
+
+
+if __name__ == "__main__":
+    device = "cuda"
+    # Example instantiations
+    c_dim = 2
+    d_dims = [3, 4]
+    actor = MixedActor(
+        obs_dim=10,
+        continuous_action_dim=c_dim,
+        discrete_action_dims=d_dims,
+        max_actions=np.array([1.0, 1.0]),
+        min_actions=np.array([-1.0, -1.0]),
+        hidden_dims=np.array([256, 256]),
+        device=device,
+    )
+
+    value_sa = ValueSA(
+        obs_dim=10, action_dim=c_dim + np.sum(d_dims), hidden_dim=256, device=device
+    )
+
+    value_s = ValueS(obs_dim=10, hidden_dim=256, device=device)
+
+    q_net = QSCA(
+        obs_dim=10,
+        hidden_dim=256,
+        discrete_action_dims=d_dims,
+        continuois_action_dim=c_dim,
+        device=device,
+    )
+    qsaa_net = QSAA(
+        obs_dim=10,
+        continuous_action_dim=c_dim,
+        discrete_action_dims=d_dims,
+        hidden_dim=256,
+        device=device,
+    )
+    state = torch.rand(size=(10,)).to(device)
+    states = torch.rand(size=(5, 10)).to(device)
+
+    # Single state through actor
+    cont_acts, disc_acts = actor(state, gumbel=True)
+    print("\nSingle state through actor:")
+    print(
+        "Continuous actions:",
+        cont_acts,
+        "Shape:",
+        cont_acts.shape if cont_acts is not None else None,
+    )
+    for i, da in enumerate(disc_acts):
+        print(
+            f"Discrete action {i}:", da, "Shape:", da.shape if da is not None else None
+        )
+
+    # Batch of states through actor
+    cont_acts_batch, disc_acts_batch = actor(states)
+    print("\nBatch of states through actor:")
+    print(
+        "Continuous actions:",
+        cont_acts_batch,
+        "Shape:",
+        cont_acts_batch.shape if cont_acts_batch is not None else None,
+    )
+    for i, da in enumerate(disc_acts_batch):
+        print(
+            f"Discrete action {i}:", da, "Shape:", da.shape if da is not None else None
+        )
+
+    print(f"Discrete Actions Concatenated")
+    print(torch.cat(disc_acts, dim=0))
+
+    print(f"All actions concatenated")
+    print(torch.cat((cont_acts, torch.cat(disc_acts, dim=-1)), dim=-1))
+    # Test value functions
+    # Single state
+    val_sa_out = value_sa(
+        state, torch.cat((cont_acts, torch.cat(disc_acts, dim=-1)), dim=-1)
+    )
+    val_s_out = value_s(state)
+    q_out = q_net(torch.cat((state, cont_acts), dim=-1))
+    # Test single state through QSAA
+    qsaa_out = qsaa_net(state, cont_acts, torch.cat(disc_acts, dim=-1))
+
+    print("\nSingle state through value networks:")
+    print("ValueSA output:", val_sa_out, "Shape:", val_sa_out.shape)
+    print("ValueS output:", val_s_out, "Shape:", val_s_out.shape)
+    print(
+        "Q output:",
+        q_out,
+        "Shape:",
+        (
+            [q.shape if isinstance(q, torch.Tensor) else None for q in q_out]
+            if isinstance(q_out, list)
+            else q_out.shape
+        ),
+    )
+    print("QSAA batch: ", qsaa_out, "Shape: ", qsaa_out.shape)
+
+    print(f"Discrete Actions Batch Concatenated")
+    print(torch.cat(disc_acts_batch, dim=-1))
+
+    print(f"All actions Batch concatenated")
+    print(torch.cat((cont_acts_batch, torch.cat(disc_acts_batch, dim=-1)), dim=-1))
+    # Batch of states
+    val_sa_batch = value_sa(
+        states, torch.cat((cont_acts_batch, torch.cat(disc_acts_batch, dim=-1)), dim=-1)
+    )
+    val_s_batch = value_s(states)
+    q_batch = q_net(torch.cat((states, cont_acts_batch), dim=-1))
+    # Test batch of states through QSAA
+    qsaa_batch = qsaa_net(states, cont_acts_batch, torch.cat(disc_acts_batch, dim=-1))
+
+    print("\nBatch of states through value networks:")
+    print("ValueSA batch output:", val_sa_batch, "Shape:", val_sa_batch.shape)
+    print("ValueS batch output:", val_s_batch, "Shape:", val_s_batch.shape)
+    print(
+        "Q batch output:",
+        q_batch,
+        "Shape:",
+        (
+            [q.shape if isinstance(q, torch.Tensor) else None for q in q_batch]
+            if isinstance(q_batch, list)
+            else q_batch.shape
+        ),
+    )
+    print("QSAA batch: ", qsaa_batch, "Shape: ", qsaa_batch.shape)

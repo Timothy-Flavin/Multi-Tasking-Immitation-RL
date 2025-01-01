@@ -15,12 +15,14 @@ def test_single_env(
 ):
     agent: DDPG
     rewards = []
+    step = 0
     for episode in range(n_episodes):
         ep_reward = 0
         obs, info = env.reset()
         obs = np.pad(obs, (0, joint_obs_dim - len(obs)), "constant")
         terminated, truncated = False, False
         while not (terminated or truncated):
+            step += 1
             discrete_actions, continuous_actions, cont_lp, disc_lp, value = (
                 agent.train_actions(obs, step=True, debug=debug)
             )
@@ -54,7 +56,7 @@ def test_single_env(
                         ep, agent_num=0, debug=debug
                     )
         # print(aloss, closs)
-        print(f"n_ep: {episode} r: {ep_reward}")
+        print(f"n_ep: {episode} r: {ep_reward}, step: {step}")
         rewards.append(ep_reward)
     env.close()
     return rewards
@@ -144,23 +146,27 @@ if __name__ == "__main__":
         discrete_env.observation_space.shape[0]
         + continuous_env.observation_space.shape[0]
     )
-    print("Making DDPG Model")
-    models = [
-        DDPG(
-            obs_dim=joint_obs_dim,
-            discrete_action_dims=[discrete_env.action_space.n],
-            continuous_action_dim=continuous_env.action_space.shape[0],
-            min_actions=continuous_env.action_space.low,
-            max_actions=continuous_env.action_space.high,
-            hidden_dims=np.array([128, 128]),
-            gamma=0.99,
-            policy_frequency=4,
-            name="DDPG_cd_test",
-            device="cuda",
-            eval_mode=False,
-            rand_steps=1500,
-        )
-    ]
+
+    def make_models():
+        print("Making DDPG Model")
+        models = [
+            DDPG(
+                obs_dim=joint_obs_dim,
+                discrete_action_dims=[discrete_env.action_space.n],
+                continuous_action_dim=continuous_env.action_space.shape[0],
+                min_actions=continuous_env.action_space.low,
+                max_actions=continuous_env.action_space.high,
+                hidden_dims=np.array([128, 128]),
+                gamma=0.99,
+                policy_frequency=4,
+                name="DDPG_cd_test",
+                device="cuda",
+                eval_mode=False,
+                rand_steps=1500,
+            )
+        ]
+        return models
+
     print("Making Discrete Flexible Buffers")
 
     mem_buffer = FlexibleBuffer(
@@ -175,32 +181,56 @@ if __name__ == "__main__":
         state_size=None,
         global_reward=True,
     )
+
+    models = make_models()
+    mem_buffer.reset()
+    print("Testing Continuous Environment")
+    rewards = test_single_env(
+        continuous_env,
+        models[0],
+        mem_buffer,
+        n_episodes=200,
+        discrete=False,
+    )
+    print(rewards)
+    plt.plot(rewards)
+    plt.show()
+    models[0].save("../../TestModels/DDPG_Continuous")
+
+    models = make_models()
+    mem_buffer.reset()
+    print("Testing Discrete Environment")
+    rewards = test_single_env(
+        discrete_env,
+        models[0],
+        mem_buffer,
+        n_episodes=100,
+        discrete=True,
+    )
+    print(rewards)
+    plt.plot(rewards)
+    plt.show()
+    models[0].save("../../TestModels/DDPG_Discrete")
+
+    models = make_models()
+    mem_buffer.reset()
     print("Testing Dual Environment")
-    rewards = test_dual_env(
+    r1, r2 = test_dual_env(
         discrete_env=discrete_env,
         continuous_env=continuous_env,
         agent=models[0],
         buffer=mem_buffer,
-        n_steps=50000,
+        n_steps=25000,
         joint_obs_dim=joint_obs_dim,
         debug=False,
     )
-    print(rewards)
-    plt.plot(rewards)
-    plt.show()
+    models[0].save("../../TestModels/DDPG_Dual")
 
-    print("Testing Continuous Environment")
-    rewards = test_single_env(
-        continuous_env, models[0], mem_buffer, n_episodes=100, discrete=False
-    )
-    print(rewards)
-    plt.plot(rewards)
-    plt.show()
-
-    print("Testing Discrete Environment")
-    rewards = test_single_env(
-        discrete_env, models[0], mem_buffer, n_episodes=500, discrete=True
-    )
-    print(rewards)
-    plt.plot(rewards)
+    r1 = np.array(r1)
+    r2 = np.array(r2)
+    print(r1)
+    print(r2)
+    plt.plot(r1 / np.abs(r1).max())
+    plt.plot(r2 / np.abs(r2).max())
+    plt.title(f"m1: {r1.max()}, m2: {r2.max()}")
     plt.show()
