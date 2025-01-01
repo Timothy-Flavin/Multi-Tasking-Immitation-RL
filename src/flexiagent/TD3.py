@@ -113,6 +113,14 @@ class TD3(Agent):
         self.critic2 = ValueSA(
             obs_dim, self.total_action_dim, hidden_dim=256, device=device
         )
+        self.critic1_target = ValueSA(
+            obs_dim, self.total_action_dim, hidden_dim=256, device=device
+        )
+        self.critic2_target = ValueSA(
+            obs_dim, self.total_action_dim, hidden_dim=256, device=device
+        )
+        self.critic1_target.load_state_dict(self.critic1.state_dict())
+        self.critic2_target.load_state_dict(self.critic2.state_dict())
         # self.critic2.load_state_dict(self.critic1.state_dict())
         self.critic1.to(device)
         self.critic2.to(device)
