@@ -185,16 +185,16 @@ class TD3(Agent):
                     discrete_action_activations,
                 )
                 print("TD3 noise: ", self.__noise__(continuous_actions))
-
+            u = torch.cat(
+                (
+                    continuous_actions_noisy,
+                    discrete_action_activations[0],
+                ),  # TODO: Cat all discrete actions
+                dim=-1,
+            )
             value = self.critic1(
                 x=observations,
-                u=torch.cat(
-                    (
-                        continuous_actions_noisy,
-                        discrete_action_activations[0],
-                    ),  # TODO: Cat all discrete actions
-                    dim=-1,
-                ),
+                u=u,
                 debug=debug,
             )
             if len(observations.shape) > 1:
@@ -265,9 +265,11 @@ class TD3(Agent):
                 )
                 print("TD3 reinforcement_learn daa: ", daa_)
                 # input()
-            actions_ = torch.cat([continuous_actions_, daa_], dim=-1)
-            qtarget = self.critic2(
-                batch.obs_[agent_num], self._add_noise(actions_)
+            actions_ = torch.cat(list(continuous_actions_) + daa_, dim=-1)
+            u = self._add_noise(actions_)
+            qtarget = torch.minimum(
+                self.critic1(x=batch.obs_[agent_num], u=u),
+                self.critic2(x=batch.obs_[agent_num], u=u),
             ).squeeze(-1)
             # TODO configure reward channel beyong just global_rewards
             next_q_value = (
