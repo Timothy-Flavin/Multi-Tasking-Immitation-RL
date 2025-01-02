@@ -132,7 +132,9 @@ class DDPG(Agent):
             torch.rand(size=(self.continuous_action_dim,), device=self.device) * 2 - 1
         ) * self.actor.action_scales - self.actor.action_biases
         discrete_actions = torch.zeros(
-            (1, len(self.discrete_action_dims)), device=self.device, dtype=torch.long
+            (len(self.discrete_action_dims)),
+            device=self.device,
+            dtype=torch.long,  # used to be (1,len...) but I think this is not needed
         )
         for dim, dim_size in enumerate(self.discrete_action_dims):
             discrete_actions[dim] = torch.randint(dim_size, (1,))
@@ -190,7 +192,7 @@ class DDPG(Agent):
                 )
             else:
                 discrete_actions = torch.zeros(
-                    (1, len(discrete_action_activations)),
+                    (len(discrete_action_activations)),
                     device=self.device,
                     dtype=torch.long,
                 )
@@ -199,7 +201,7 @@ class DDPG(Agent):
             for i, activation in enumerate(discrete_action_activations):
                 if debug:
                     print("DDPG train_actions activation: ", activation)
-                discrete_actions[:, i] = torch.argmax(activation, dim=-1)
+                discrete_actions[i] = torch.argmax(activation, dim=-1)
 
             if debug:
                 print(

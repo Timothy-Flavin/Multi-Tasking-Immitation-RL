@@ -1,5 +1,6 @@
 from flexibuff import FlexibleBuffer
 from DDPG import DDPG
+from TD3 import TD3
 import gymnasium as gym
 import numpy as np
 
@@ -27,7 +28,7 @@ def test_single_env(
                 agent.train_actions(obs, step=True, debug=debug)
             )
             if discrete:
-                actions = discrete_actions[0, 0]
+                actions = discrete_actions[0]
             else:
                 actions = continuous_actions
             # print(actions)
@@ -85,7 +86,7 @@ def test_dual_env(
             agent.train_actions(obs, step=True, debug=debug)
         )
 
-        discrete_actions = discrete_actions[0, 0]
+        discrete_actions = discrete_actions[0]
         continuous_actions = continuous_actions
         # print(f"disc: {discrete_actions}, cont: {continuous_actions}")
         d_obs_, d_reward, d_terminated, d_truncated, _ = discrete_env.step(
@@ -148,9 +149,9 @@ if __name__ == "__main__":
     )
 
     def make_models():
-        print("Making DDPG Model")
+        print("Making TD3 Model")
         models = [
-            DDPG(
+            TD3(
                 obs_dim=joint_obs_dim,
                 discrete_action_dims=[discrete_env.action_space.n],
                 continuous_action_dim=continuous_env.action_space.shape[0],
@@ -159,7 +160,7 @@ if __name__ == "__main__":
                 hidden_dims=np.array([128, 128]),
                 gamma=0.99,
                 policy_frequency=4,
-                name="DDPG_cd_test",
+                name="TD3_cd_test",
                 device="cuda",
                 eval_mode=False,
                 rand_steps=1500,
@@ -189,13 +190,13 @@ if __name__ == "__main__":
         continuous_env,
         models[0],
         mem_buffer,
-        n_episodes=200,
+        n_episodes=50,
         discrete=False,
     )
     print(rewards)
     plt.plot(rewards)
     plt.show()
-    models[0].save("../../TestModels/DDPG_Continuous")
+    models[0].save("../../TestModels/TD3_Continuous")
 
     models = make_models()
     mem_buffer.reset()
@@ -210,7 +211,7 @@ if __name__ == "__main__":
     print(rewards)
     plt.plot(rewards)
     plt.show()
-    models[0].save("../../TestModels/DDPG_Discrete")
+    models[0].save("../../TestModels/TD3_Discrete")
 
     models = make_models()
     mem_buffer.reset()
@@ -224,7 +225,7 @@ if __name__ == "__main__":
         joint_obs_dim=joint_obs_dim,
         debug=False,
     )
-    models[0].save("../../TestModels/DDPG_Dual")
+    models[0].save("../../TestModels/TD3_Dual")
 
     r1 = np.array(r1)
     r2 = np.array(r2)

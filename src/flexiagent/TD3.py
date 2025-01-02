@@ -220,7 +220,7 @@ class TD3(Agent):
                 )
             else:
                 discrete_actions = torch.zeros(
-                    (1, len(discrete_action_activations)),
+                    (len(discrete_action_activations)),  # was (1,len...)
                     device=self.device,
                     dtype=torch.long,
                 )
@@ -231,7 +231,7 @@ class TD3(Agent):
             for i, activation in enumerate(discrete_action_activations):
                 if debug:
                     print("    TD3 train_actions activation: ", activation)
-                discrete_actions[:, i] = torch.argmax(activation, dim=-1)
+                discrete_actions[i] = torch.argmax(activation, dim=-1)
 
             if debug:
                 print(
@@ -338,7 +338,7 @@ class TD3(Agent):
         self.critic_optimizer.step()
 
         if self.rl_step % self.policy_frequency == 0 and not critic_only:
-            print("   TD3 reinforcement_learn actor update")
+            # print("   TD3 reinforcement_learn actor update")
             c_act, d_act = self.actor(batch.obs[agent_num], mask)
 
             # TODO Check and make sure that the discrete actions are concatenated correctly
@@ -403,25 +403,29 @@ class TD3(Agent):
             checkpoint_path = "./" + self.name + "/"
         if not os.path.exists(checkpoint_path):
             os.makedirs(checkpoint_path)
-        torch.save(self.critic1.state_dict(), checkpoint_path + "critic1")
-        torch.save(self.critic2.state_dict(), checkpoint_path + "critic2")
-        torch.save(self.critic1_target.state_dict(), checkpoint_path + "critic1_target")
-        torch.save(self.critic2_target.state_dict(), checkpoint_path + "critic2_target")
-        torch.save(self.actor.state_dict(), checkpoint_path + "actor")
-        torch.save(self.actor_target.state_dict(), checkpoint_path + "actor_target")
+        torch.save(self.critic1.state_dict(), checkpoint_path + "/critic1")
+        torch.save(self.critic2.state_dict(), checkpoint_path + "/critic2")
+        torch.save(
+            self.critic1_target.state_dict(), checkpoint_path + "/critic1_target"
+        )
+        torch.save(
+            self.critic2_target.state_dict(), checkpoint_path + "/critic2_target"
+        )
+        torch.save(self.actor.state_dict(), checkpoint_path + "/actor")
+        torch.save(self.actor_target.state_dict(), checkpoint_path + "/actor_target")
 
     def load(self, checkpoint_path):
         if checkpoint_path is None:
             checkpoint_path = "./" + self.name + "/"
-        self.actor.load_state_dict(torch.load(checkpoint_path + "actor"))
-        self.actor_target.load_state_dict(torch.load(checkpoint_path + "actor_target"))
-        self.critic1.load_state_dict(torch.load(checkpoint_path + "critic1"))
-        self.critic2.load_state_dict(torch.load(checkpoint_path + "critic2"))
+        self.actor.load_state_dict(torch.load(checkpoint_path + "/actor"))
+        self.actor_target.load_state_dict(torch.load(checkpoint_path + "/actor_target"))
+        self.critic1.load_state_dict(torch.load(checkpoint_path + "/critic1"))
+        self.critic2.load_state_dict(torch.load(checkpoint_path + "/critic2"))
         self.critic1_target.load_state_dict(
-            torch.load(checkpoint_path + "critic1_target")
+            torch.load(checkpoint_path + "/critic1_target")
         )
         self.critic2_target.load_state_dict(
-            torch.load(checkpoint_path + "critic2_target")
+            torch.load(checkpoint_path + "/critic2_target")
         )
 
 
