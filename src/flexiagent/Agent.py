@@ -60,6 +60,7 @@ class ffEncoder(nn.Module):
                 self.encoder.append(nn.Linear(obs_dim, hidden_dims[i]))
             else:
                 self.encoder.append(nn.Linear(hidden_dims[i - 1], hidden_dims[i]))
+        self.float()
         self.to(device)
         self.device = device
         self.optimizer = torch.optim.Adam(self.parameters())
@@ -71,6 +72,7 @@ class ffEncoder(nn.Module):
         if debug:
             print(f"ffEncoder after T: x {x}")
         for layer in self.encoder:
+            # print(f"ffEncoder: layer {layer.weight.dtype}")
             x = self.activation(layer(x))
         return x
 

@@ -60,6 +60,7 @@ class TD3(Agent):
             discrete_action_dims
         ), "max_actions should be provided for each discrete action dim"
 
+        self.device = device
         self.total_action_dim = continuous_action_dim + np.sum(
             np.array(discrete_action_dims)
         )
@@ -80,7 +81,7 @@ class TD3(Agent):
             encoder=None,
             tau=gumbel_tau,
             hard=False,
-        )
+        ).float()
         self.actor_target = MixedActor(
             obs_dim,
             continuous_action_dim=continuous_action_dim,
@@ -92,7 +93,7 @@ class TD3(Agent):
             encoder=None,
             tau=0.3,
             hard=False,
-        )
+        ).float()
         if continuous_action_dim > 0:
             self.min_actions = torch.from_numpy(np.array(min_actions)).to(self.device)
             self.max_actions = torch.from_numpy(np.array(max_actions)).to(self.device)
@@ -103,41 +104,42 @@ class TD3(Agent):
         self.step = 0
         self.rl_step = 0
         self.actor_target.load_state_dict(self.actor.state_dict())
+
         self.actor.to(device)
         self.actor_target.to(device)
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters())
 
         self.critic1 = ValueSA(
             obs_dim, self.total_action_dim, hidden_dim=256, device=device
-        )
+        ).float()
         self.critic2 = ValueSA(
             obs_dim, self.total_action_dim, hidden_dim=256, device=device
-        )
+        ).float()
         self.critic1_target = ValueSA(
             obs_dim, self.total_action_dim, hidden_dim=256, device=device
-        )
+        ).float()
         self.critic2_target = ValueSA(
             obs_dim, self.total_action_dim, hidden_dim=256, device=device
-        )
+        ).float()
         self.critic1_target.load_state_dict(self.critic1.state_dict())
         self.critic2_target.load_state_dict(self.critic2.state_dict())
         # self.critic2.load_state_dict(self.critic1.state_dict())
         self.critic1.to(device)
         self.critic2.to(device)
+        self.critic1_target.to(device)
+        self.critic2_target.to(device)
         self.critic_optimizer = torch.optim.Adam(
             list(self.critic1.parameters()) + list(self.critic2.parameters())
         )
-
-        self.device = device
 
     def __noise__(self, continuous_actions: torch.Tensor):
         noise = torch.normal(
             0,
             self.action_noise,
-            (continuous_actions.shape[0], self.continuous_action_dim),
+            continuous_actions.shape,
         ).to(self.device)
-        if noise.shape[0] == 1:
-            noise = noise.squeeze(0)
+        # if noise.shape[0] == 1:
+        # noise = noise.squeeze(0)
         return noise
 
     def _add_noise(self, continuous_actions):
@@ -154,8 +156,9 @@ class TD3(Agent):
             torch.rand(size=(self.continuous_action_dim,), device=self.device) * 2 - 1
         ) * self.actor.action_scales - self.actor.action_biases
         discrete_actions = torch.zeros(
-            (1, len(self.discrete_action_dims)), device=self.device, dtype=torch.long
+            (len(self.discrete_action_dims),), device=self.device, dtype=torch.long
         )
+
         for dim, dim_size in enumerate(self.discrete_action_dims):
             discrete_actions[dim] = torch.randint(dim_size, (1,))
         return discrete_actions, continuous_actions
@@ -163,7 +166,7 @@ class TD3(Agent):
     def train_actions(self, observations, action_mask=None, step=False, debug=False):
         observations = T(observations, self.device, debug=debug)
         if debug:
-            print("TD3 train_actions Observations: ", observations)
+            print("    TD3 train_actions Observations: ", observations)
         if step:
             self.step += 1
         if self.step < self.rand_steps:
@@ -187,12 +190,16 @@ class TD3(Agent):
             discrete_logprobs = None
 
             if debug:
-                print("TD3 train_actions continuous_actions: ", continuous_actions)
+                print("    TD3 train_actions continuous_actions: ", continuous_actions)
                 print(
-                    "TD3 train_actions discrete_action_activations: ",
+                    "    TD3 train_actions continuous_actions_noisy: ",
+                    continuous_actions_noisy,
+                )
+                print(
+                    "    TD3 train_actions discrete_action_activations: ",
                     discrete_action_activations,
                 )
-                print("TD3 noise: ", self.__noise__(continuous_actions))
+                print("    TD3 noise: ", self.__noise__(continuous_actions))
             # u = torch.cat(
             #     (
             #         continuous_actions_noisy,
@@ -218,23 +225,25 @@ class TD3(Agent):
                     dtype=torch.long,
                 )
             if debug:
-                print("TD3 discrete_action_activtions: ", discrete_action_activations)
+                print(
+                    "    TD3 discrete_action_activtions: ", discrete_action_activations
+                )
             for i, activation in enumerate(discrete_action_activations):
                 if debug:
-                    print("TD3 train_actions activation: ", activation)
+                    print("    TD3 train_actions activation: ", activation)
                 discrete_actions[:, i] = torch.argmax(activation, dim=-1)
 
             if debug:
                 print(
-                    "TD3 train_actions discrete_actions after argmax: ",
+                    "    TD3 train_actions discrete_actions after argmax: ",
                     discrete_actions,
                 )
 
             discrete_actions = discrete_actions.detach().cpu().numpy()
-            continuous_actions = continuous_actions.detach().cpu().numpy()
+            continuous_actions_noisy = continuous_actions_noisy.detach().cpu().numpy()
             return (
                 discrete_actions,
-                continuous_actions,
+                continuous_actions_noisy,
                 discrete_logprobs,
                 continuous_logprobs,
                 0,  # value.detach().cpu().numpy(),
@@ -288,10 +297,15 @@ class TD3(Agent):
                 print("TD3 reinforcement_learn daa_: ", daa_)
                 # input()
             u_ = torch.cat([self._add_noise(continuous_actions_)] + daa_, dim=-1)
+
+            if debug:
+                print("u_: ", u_, "shape: ", u_.shape)
             qtarget = torch.minimum(
                 self.critic1_target(x=batch.obs_[agent_num], u=u_),
                 self.critic2_target(x=batch.obs_[agent_num], u=u_),
-            )
+            ).squeeze(-1)
+            if debug:
+                print("TD3 reinforcement_learn qtarget: ", qtarget)
             # TODO configure reward channel beyong just global_rewards
             next_q_value = (
                 batch.global_rewards + (1 - batch.terminated) * self.gamma * qtarget
@@ -312,8 +326,8 @@ class TD3(Agent):
             ],
             dim=-1,
         )
-        q1_values = self.critic1(batch.obs[agent_num], actions)  # .squeeze(-1)
-        q2_values = self.critic2(batch.obs[agent_num], actions)  # .squeeze(-1)
+        q1_values = self.critic1(batch.obs[agent_num], actions).squeeze(-1)
+        q2_values = self.critic2(batch.obs[agent_num], actions).squeeze(-1)
         qf1_loss = F.mse_loss(q1_values, next_q_value)
         qf2_loss = F.mse_loss(q2_values, next_q_value)
         L = qf1_loss + qf2_loss
@@ -324,6 +338,7 @@ class TD3(Agent):
         self.critic_optimizer.step()
 
         if self.rl_step % self.policy_frequency == 0 and not critic_only:
+            print("   TD3 reinforcement_learn actor update")
             c_act, d_act = self.actor(batch.obs[agent_num], mask)
 
             # TODO Check and make sure that the discrete actions are concatenated correctly
@@ -412,3 +427,57 @@ class TD3(Agent):
 
 if __name__ == "__main__":
 
+    print("Testing TD3 functionality")
+
+    c_act_dim = 2
+    d_act_dims = [4, 3]
+    obs = np.random.rand(10).astype(np.float32)
+    obs_ = np.random.rand(10).astype(np.float32)
+    obs_batch = np.random.rand(5, 10).astype(np.float32)
+    obs_batch_ = obs_batch + 0.1
+
+    dacs = np.stack(
+        (np.random.randint(0, 4, size=(5)), np.random.randint(0, 3, size=(5))), axis=-1
+    )
+    dacs = np.array([dacs])
+    print(dacs.shape)
+    print(dacs)
+    mem = FlexiBatch(
+        obs=np.array([obs_batch]),
+        obs_=np.array([obs_batch_]),
+        continuous_actions=np.array([np.random.rand(5, 2).astype(np.float32)]),
+        discrete_actions=dacs,
+        global_rewards=np.random.rand(5).astype(np.float32),
+        terminated=np.random.randint(0, 2, size=5),
+    )
+    mem.to_torch("cuda")
+
+    td3 = TD3(
+        obs_dim=10,
+        continuous_action_dim=c_act_dim,
+        discrete_action_dims=d_act_dims,
+        max_actions=np.array([1, 1]),
+        min_actions=np.array([-1, -1]),
+        hidden_dims=[128, 128],
+        gamma=0.99,
+        policy_frequency=1,
+        action_noise=0.05,
+        name="TD3_Test",
+        device="cuda",
+        eval_mode=False,
+        gumbel_tau=0.5,
+        rand_steps=2,
+    )
+
+    # discrete_actions,
+    # continuous_actions,
+    # discrete_logprobs,
+    # continuous_logprobs,
+    # value
+    print("Testing train_actions")
+    print("act rand: ", td3.train_actions(obs, step=True, debug=True))
+    print("act not_rand: ", td3.train_actions(obs, step=True, debug=True))
+    print("act not_rand: ", td3.train_actions(obs, step=True, debug=True))
+
+    print("Testing reinforcement_learn")
+    print("rl: ", td3.reinforcement_learn(mem, agent_num=0, debug=True))
