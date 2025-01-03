@@ -270,6 +270,97 @@ class QSAA(nn.Module):
         return x
 
 
+# TODO: Make Dueling heads 2 layers and add activation functions for nonlinearities
+
+
+class DuelingQSCA(nn.Module):
+    def __init__(
+        self,
+        obs_dim,
+        continuois_action_dim=0,
+        discrete_action_dims=[1],
+        hidden_dim=256,
+        device="cpu",
+    ):
+        super(DuelingQSCA, self).__init__()
+        self.device = device
+        self.l1 = nn.Linear(obs_dim, hidden_dim)
+        self.l2 = nn.Linear(hidden_dim, hidden_dim)
+        self.value_head = nn.Linear(hidden_dim, 1)
+        self.advantage_heads = nn.ModuleList()
+        if discrete_action_dims is not None and len(discrete_action_dims) > 0:
+            for dim in discrete_action_dims:
+                self.advantage_heads.append(
+                    nn.Linear(hidden_dim + continuois_action_dim, dim)
+                )
+        self.to(device)
+
+    def forward(self, x, u):
+        x = T(x, self.device)
+        x = F.relu(self.l1(x))
+        x = F.relu(self.l2(x))
+        values = self.value_head(x)
+        advantages = []
+        xu = torch.cat([x, u], dim=-1)
+        for i, head in enumerate(self.advantage_heads):
+            Adv = head(xu)
+            Adv = Adv - Adv.mean(dim=-1, keepdim=True)
+            advantages.append(Adv)
+        return values, advantages
+
+
+class DuelingQSAA(nn.Module):
+    def __init__(
+        self,
+        obs_dim,
+        continuous_action_dim=0,
+        discrete_action_dims=[1],
+        hidden_dim=256,
+        device="cpu",
+    ):
+        super(DuelingQSAA, self).__init__()
+        self.device = device
+        total_discrete_dims = sum(discrete_action_dims)
+        input_dim = obs_dim
+        self.l1 = nn.Linear(input_dim, hidden_dim)
+        self.l2 = nn.Linear(hidden_dim, hidden_dim)
+        self.value_head = nn.Linear(hidden_dim, 1)
+        self.advantage_head = nn.Linear(
+            hidden_dim + continuous_action_dim + total_discrete_dims, 1
+        )
+
+        self.to(device)
+
+    def forward(self, x, a_c=None, a_d=None):
+        if a_c is None:
+            a_c = torch.tensor([]).to(self.device)
+        if a_d is None:
+            a_d = torch.tensor([]).to(self.device)
+
+        x = T(x, self.device)
+        x = F.relu(self.l1(x))
+        x = F.relu(self.l2(x))
+        values = self.value_head(x)
+        advantages = []
+        xu = torch.cat([x, a_c, a_d], dim=-1)
+        for i, head in enumerate(self.advantage_heads):
+            Adv = head(xu)
+            # Adv = Adv - Adv.mean(dim=-1, keepdim=True)
+            # Sample some kind of action space and then calculate the advantage
+            advantages.append(Adv)
+        return values, advantages
+
+
+# Q(s) -> R^n
+# Q(s,a) -> R
+
+# Q(s,a_c)     = R^n
+# Q(s,a_c,a_d) = R
+
+# Q(s) ->   V(s)+A(s,a)      A - mean(A)
+# Q(s,a) -> V(s)+A(s,a)      Posisibilities to adapt
+
+
 if __name__ == "__main__":
     device = "cuda"
     # Example instantiations
