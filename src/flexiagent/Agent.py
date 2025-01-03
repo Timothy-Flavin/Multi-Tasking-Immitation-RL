@@ -43,8 +43,16 @@ class Agent(ABC):
         print("Load not implemented")
 
 
+def orthogonal_init(layer, std=np.sqrt(2), bias_const=0.0):
+    torch.nn.init.orthogonal_(layer.weight, std)
+    torch.nn.init.constant_(layer.bias, bias_const)
+    return layer
+
+
 class ffEncoder(nn.Module):
-    def __init__(self, obs_dim, hidden_dims, activation="relu", device="cpu"):
+    def __init__(
+        self, obs_dim, hidden_dims, activation="relu", device="cpu", orthogonal=False
+    ):
         super(ffEncoder, self).__init__()
         activations = {
             "relu": F.relu,
@@ -60,6 +68,8 @@ class ffEncoder(nn.Module):
                 self.encoder.append(nn.Linear(obs_dim, hidden_dims[i]))
             else:
                 self.encoder.append(nn.Linear(hidden_dims[i - 1], hidden_dims[i]))
+            if orthogonal:
+                orthogonal_init(self.encoder[-1])
         self.float()
         self.to(device)
         self.device = device
@@ -90,6 +100,8 @@ class MixedActor(nn.Module):
         device="cpu",
         tau=1.0,
         hard=False,
+        orthogonal=False,
+        activation="relu",
     ):
         super(MixedActor, self).__init__()
         self.device = device
@@ -98,7 +110,9 @@ class MixedActor(nn.Module):
         self.hard = hard
 
         if encoder is None and len(hidden_dims) > 0:
-            self.encoder = ffEncoder(obs_dim, hidden_dims, device=device)
+            self.encoder = ffEncoder(
+                obs_dim, hidden_dims, device=device, activation=activation
+            )
 
         assert not (
             continuous_action_dim is None and discrete_action_dims is None
@@ -126,11 +140,15 @@ class MixedActor(nn.Module):
             self.continuous_actions_head = nn.Linear(
                 hidden_dims[-1], continuous_action_dim
             )
+            if orthogonal:
+                orthogonal_init(self.continuous_actions_head)
 
         self.discrete_action_heads = nn.ModuleList()
         if discrete_action_dims is not None and len(discrete_action_dims) > 0:
             for dim in discrete_action_dims:
                 self.discrete_action_heads.append(nn.Linear(hidden_dims[-1], dim))
+                if orthogonal:
+                    orthogonal_init(self.discrete_action_heads[-1])
         self.max_actions = max_actions
         self.to(device)
 
@@ -270,7 +288,8 @@ class QSAA(nn.Module):
         return x
 
 
-# TODO: Make Dueling heads 2 layers and add activation functions for nonlinearities
+# TODO: Try Dueling heads 2 layers and add activation functions for nonlinearities
+# TODO: Add V and A into one output to make consistent. Make sure V applies to all A in dim -1
 
 
 class DuelingQSCA(nn.Module):
@@ -427,10 +446,10 @@ if __name__ == "__main__":
             f"Discrete action {i}:", da, "Shape:", da.shape if da is not None else None
         )
 
-    print(f"Discrete Actions Concatenated")
+    print("Discrete Actions Concatenated")
     print(torch.cat(disc_acts, dim=0))
 
-    print(f"All actions concatenated")
+    print("All actions concatenated")
     print(torch.cat((cont_acts, torch.cat(disc_acts, dim=-1)), dim=-1))
     # Test value functions
     # Single state
@@ -457,10 +476,10 @@ if __name__ == "__main__":
     )
     print("QSAA batch: ", qsaa_out, "Shape: ", qsaa_out.shape)
 
-    print(f"Discrete Actions Batch Concatenated")
+    print("Discrete Actions Batch Concatenated")
     print(torch.cat(disc_acts_batch, dim=-1))
 
-    print(f"All actions Batch concatenated")
+    print("All actions Batch concatenated")
     print(torch.cat((cont_acts_batch, torch.cat(disc_acts_batch, dim=-1)), dim=-1))
     # Batch of states
     val_sa_batch = value_sa(
