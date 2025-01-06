@@ -2,6 +2,7 @@ from Agent import ValueS, MixedActor, Agent
 import torch
 from flexibuff import FlexiBatch
 from torch.distributions import Categorical
+from Util import T
 
 
 class PPO(Agent):
@@ -16,10 +17,11 @@ class PPO(Agent):
         lr_critic=0.003,
         gamma=0.99,
         eps_clip=0.2,
-        n_epochs=5,
+        n_epochs=3,
         device="cpu",
         entropy_loss=0.05,
-        encoder_dims=[256, 256],
+        hidden_dims=[256, 256],
+        activation="relu",
     ):
         super().__init__()
         assert (
@@ -32,6 +34,7 @@ class PPO(Agent):
         self.continuous_action_dim = continuous_action_dim
         self.discrete_action_dims = discrete_action_dims
         self.n_epochs = n_epochs
+        self.activation = activation
 
         self.policy_loss = 1
         self.critic_loss = 1
@@ -39,24 +42,30 @@ class PPO(Agent):
 
         self.actor = MixedActor(
             obs_dim=obs_dim,
-            continuous_action_dim=continuous_action_dim,
+            continuous_action_dim=continuous_action_dim * 2,
             discrete_action_dims=discrete_action_dims,
             max_actions=max_actions,
             min_actions=min_actions,
-            hidden_dims=encoder_dims,
+            hidden_dims=hidden_dims,
             device=device,
+            orthogonal_init=True,
         )
         self.actor_old = MixedActor(
             obs_dim=obs_dim,
-            continuous_action_dim=continuous_action_dim,
+            continuous_action_dim=continuous_action_dim * 2,
             discrete_action_dims=discrete_action_dims,
             max_actions=max_actions,
             min_actions=min_actions,
-            hidden_dims=encoder_dims,
+            hidden_dims=hidden_dims,
             device=device,
         )
         self.actor_old.load_state_dict(self.actor.state_dict())
-        self.critic = ValueS(state_size=obs_dim, hidden_size=256, device=self.device)
+        self.critic = ValueS(
+            obs_dim=obs_dim,
+            hidden_dim=256,
+            device=self.device,
+            orthogonal_init=True,
+        )
 
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=lr_actor)
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=lr_critic)
@@ -65,48 +74,63 @@ class PPO(Agent):
         self, logits, debug=False
     ):  # logits of the form [action_dim, batch_size, action_dim_size]
         actions = torch.zeros(
-            size=(logits[0].shape[-1], len(self.discrete_action_dims))
+            size=(len(self.discrete_action_dims),),
+            device=self.device,
+            dtype=torch.int,
         )
         log_probs = torch.zeros(
-            size=(logits[0].shape[-1], len(self.discrete_action_dims))
+            size=(len(self.discrete_action_dims),),
+            device=self.device,
         )
         for i in range(len(self.discrete_action_dims)):
             dist = Categorical(logits=logits[i])
-            actions[:, i] = dist.sample()
-            log_probs[:, i] = dist.log_prob(actions[i])
+            actions[i] = dist.sample()
+            log_probs[i] = dist.log_prob(actions[i])
         return actions, log_probs
 
-    def train_action(self, observations, action_mask=None, step=False):
+    def train_actions(self, observations, action_mask=None, step=False, debug=False):
+
         if not torch.is_tensor(observations):
-            observations = torch.tensor(observations, dtype=torch.float).to(self.device)
+            observations = T(observations, device=self.device, dtype=torch.float)
         if not torch.is_tensor(action_mask) and action_mask is not None:
             action_mask = torch.tensor(action_mask, dtype=torch.float).to(self.device)
-        continuous_logits, descrete_logits = self.actor(
+
+        # print(f"Observations: {observations.shape} {observations}")
+        continuous_logits, discrete_logits = self.actor(
             x=observations, action_mask=action_mask, gumbel=False, debug=False
         )
-        if len(continuous_logits.shape) == 1:
-            continuous_logits = continuous_logits.unsqueeze(0)
+        # print(f"continuous_logits: {continuous_logits.shape} {continuous_logits}")
+        # print(f"discrete_logits: {discrete_logits[0].shape} {discrete_logits}")
+        # if len(continuous_logits.shape) == 1:
+        # continuous_logits = continuous_logits.unsqueeze(0)
 
         continuous_dist = torch.distributions.Normal(
-            loc=continuous_logits[:, : self.continuous_action_dim],
-            scale=torch.exp(continuous_logits[:, self.continuous_action_dim :]),
+            loc=continuous_logits[: self.continuous_action_dim],
+            scale=torch.exp(continuous_logits[self.continuous_action_dim :]),
         )
+        # print(discrete_logits)
         discrete_actions, discrete_log_probs = self._sample_multi_discrete(
-            descrete_logits
+            discrete_logits
         )
+        # print(continuous_logits)
+
         continuous_actions = continuous_dist.sample()
+
+        # print(continuous_actions)
+        # exit()
         continuous_log_probs = continuous_dist.log_prob(continuous_actions)
-        vals = self.critic(observations).detach()
+        # print(continuous_log_probs)
+        vals = self.critic(observations)
         return (
-            discrete_actions,
-            continuous_actions,
-            discrete_log_probs,
-            continuous_log_probs,
-            vals,
+            discrete_actions.detach().cpu().numpy(),
+            continuous_actions.detach().cpu().numpy(),
+            discrete_log_probs.detach().cpu().numpy(),
+            continuous_log_probs.detach().cpu().numpy(),
+            vals.detach().cpu().numpy(),
         )
 
     # takes the observations and returns the action with the highest probability
-    def ego_action(self, observations, action_mask=None):
+    def ego_actions(self, observations, action_mask=None):
         with torch.no_grad():
             continuous_actions, discrete_action_activations = self.actor(
                 observations, action_mask, gumbel=False
@@ -177,6 +201,7 @@ class PPO(Agent):
                 1 - batch.terminated[i]
             )
         G = G.unsqueeze(-1)
+        # G = G / 100
         with torch.no_grad():
             advantages = G - self.critic(batch.obs)
 
@@ -207,36 +232,66 @@ class PPO(Agent):
             self.critic_optimizer.step()
 
             critic_loss = loss.item()
-            print(f"critic_loss: {critic_loss}")
+            # print(f"critic_loss: {critic_loss}")
 
-            act, probs, log_probs = self.actor.evaluate(
+            cont_probs, disc_probs = self.actor(
                 batch.obs[agent_num], action_mask=action_mask
             )
-            dist = Categorical(probs)
-            dist_entropy = dist.entropy()
-            selected_log_probs = torch.gather(
-                input=log_probs,
-                dim=-1,
-                index=batch.discrete_actions[agent_num],  # act.unsqueeze(-1)
+            actor_loss = 0
+
+            continuous_dist = torch.distributions.Normal(
+                loc=cont_probs[:, : self.continuous_action_dim],
+                scale=torch.exp(cont_probs[:, self.continuous_action_dim :]),
             )
-            ratios = torch.exp(selected_log_probs - batch.discrete_log_probs[agent_num])
-            # Calculate surrogate loss
-            surr1 = ratios * advantages
-            surr2 = (
-                torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip) * advantages
+            continuous_log_probs = continuous_dist.log_prob(
+                batch.continuous_actions[agent_num, :, : self.continuous_action_dim]
             )
-            actor_loss = (
-                -self.policy_loss * torch.min(surr1, surr2).mean()
-                + self.entropy_loss * dist_entropy.mean()
+            # print(batch.continuous_log_probs.shape)
+            # print(continuous_log_probs.shape)
+            # print(batch.continuous_actions.shape)
+            # exit()
+            continuous_ratios = torch.exp(
+                continuous_log_probs - batch.continuous_log_probs[agent_num]
             )
+            continuous_surr1 = continuous_ratios * advantages
+            continuous_surr2 = (
+                torch.clamp(continuous_ratios, 1 - self.eps_clip, 1 + self.eps_clip)
+                * advantages
+            )
+            actor_loss += (
+                -self.policy_loss * torch.min(continuous_surr1, continuous_surr2).mean()
+                + self.entropy_loss * continuous_dist.entropy().mean()
+            )
+
+            for head in range(len(self.discrete_action_dims)):
+                dist = Categorical(disc_probs[head])
+                dist_entropy = dist.entropy()
+                selected_log_probs = dist.log_prob(
+                    batch.discrete_actions[agent_num][head]
+                )
+
+                ratios = torch.exp(
+                    selected_log_probs - batch.discrete_log_probs[agent_num]
+                )
+                # Calculate surrogate loss
+                surr1 = ratios * advantages
+                surr2 = (
+                    torch.clamp(ratios, 1 - self.eps_clip, 1 + self.eps_clip)
+                    * advantages
+                )
+                actor_loss += (
+                    -self.policy_loss * torch.min(surr1, surr2).mean()
+                    + self.entropy_loss * dist_entropy.mean()
+                )
+
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
             self.actor_optimizer.step()
             avg_actor_loss += actor_loss.item()
-            print(f"actor_loss: {actor_loss.item()}")
+            # print(f"actor_loss: {actor_loss.item()}")
 
         avg_actor_loss /= self.n_epochs
-
+        print(avg_actor_loss, critic_loss)
         return avg_actor_loss, critic_loss
 
     def save(self, checkpoint_path):

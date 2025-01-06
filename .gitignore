@@ -164,3 +164,4 @@ TestModels/
 Lib/
 Scripts/
 pyvenv.cfg
+share/

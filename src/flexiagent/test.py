@@ -4,6 +4,8 @@ from TD3 import TD3
 from PPO import PPO
 import gymnasium as gym
 import numpy as np
+from Agent import Agent
+from typing import List
 
 
 def test_single_env(
@@ -14,6 +16,7 @@ def test_single_env(
     joint_obs_dim=7,
     discrete=False,
     debug=False,
+    online=False,
 ):
     agent: DDPG
     rewards = []
@@ -28,18 +31,21 @@ def test_single_env(
             discrete_actions, continuous_actions, cont_lp, disc_lp, value = (
                 agent.train_actions(obs, step=True, debug=debug)
             )
+            # print(discrete_actions, continuous_actions)
             if discrete:
                 actions = discrete_actions[0]
             else:
                 actions = continuous_actions
+            if cont_lp is None:
+                cont_lp = 0
+            if disc_lp is None:
+                disc_lp = 0
             # print(actions)
             # print(
-            #     f"c_a: {continuous_actions}, d_a: {discrete_actions}, actions: {actions}"
+            #    f"c_a: {continuous_actions}, d_a: {discrete_actions}, actions: {actions}"
             # )
-
             obs_, reward, terminated, truncated, _ = env.step(actions)
             obs_ = np.pad(obs_, (0, joint_obs_dim - len(obs_)), "constant")
-
             buffer.save_transition(
                 obs=obs,
                 obs_=obs_,
@@ -47,16 +53,29 @@ def test_single_env(
                 discrete_actions=discrete_actions,
                 global_reward=reward,
                 terminated=terminated or truncated,
+                discrete_log_probs=disc_lp,
+                continuous_log_probs=cont_lp,
             )
             # env.render()
             obs = obs_
             ep_reward += reward
-            if buffer.steps_recorded > 256 and buffer.episode_inds is not None:
-                episodes = buffer.sample_episodes(256, as_torch=True)
+            # print(buffer.steps_recorded)
+            if (buffer.steps_recorded > 256 and buffer.episode_inds is not None) or (
+                buffer.episode_inds is not None
+                and len(buffer.episode_inds) > 1
+                and online
+            ):
+                episodes = 0
+                if online:
+                    episodes = buffer.sample_episodes(n_episodes=1, as_torch=True)
+                else:
+                    episodes = buffer.sample_episodes(256, as_torch=True)
                 for ep in episodes:
                     closs, aloss = agent.reinforcement_learn(
                         ep, agent_num=0, debug=debug
                     )
+                if online:
+                    buffer.reset()
         # print(aloss, closs)
         print(f"n_ep: {episode} r: {ep_reward}, step: {step}")
         rewards.append(ep_reward)
@@ -72,6 +91,7 @@ def test_dual_env(
     n_steps=50000,
     joint_obs_dim=7,
     debug=False,
+    online=False,
 ):
     agent: DDPG
     rewards = [[], []]
@@ -86,6 +106,10 @@ def test_dual_env(
         discrete_actions, continuous_actions, cont_lp, disc_lp, value = (
             agent.train_actions(obs, step=True, debug=debug)
         )
+        if disc_lp is None:
+            disc_lp = 0
+        if cont_lp is None:
+            cont_lp = 0
 
         discrete_actions = discrete_actions[0]
         continuous_actions = continuous_actions
@@ -106,6 +130,8 @@ def test_dual_env(
             discrete_actions=discrete_actions,
             global_reward=d_reward + (c_reward + 1000) / 30,
             terminated=d_terminated,
+            discrete_log_probs=disc_lp,
+            continuous_log_probs=cont_lp,
         )
         # env.render()
         ep_rewards[0] += d_reward
@@ -134,6 +160,8 @@ def test_dual_env(
             episodes = buffer.sample_episodes(256, as_torch=True)
             for ep in episodes:
                 closs, aloss = agent.reinforcement_learn(ep, agent_num=0, debug=debug)
+            if online:
+                buffer.reset()
         # print(aloss, closs)
 
     return rewards
@@ -142,7 +170,7 @@ def test_dual_env(
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
 
-    discrete_env = gym.make("Acrobot-v1")  # "CartPole-v1")  # , render_mode="human")
+    discrete_env = gym.make("CartPole-v1")  # "Acrobot-v1")   # , render_mode="human")
     continuous_env = gym.make("Pendulum-v1")
     joint_obs_dim = (
         discrete_env.observation_space.shape[0]
@@ -158,10 +186,10 @@ if __name__ == "__main__":
                 discrete_action_dims=[discrete_env.action_space.n],
                 continuous_action_dim=continuous_env.action_space.shape[0],
                 hidden_dims=np.array([128, 128]),
+                min_actions=continuous_env.action_space.low,
+                max_actions=continuous_env.action_space.high,
                 gamma=0.99,
-                name="PPO_cd_test",
                 device="cuda",
-                eval_mode=False,
             ),
             DDPG(
                 obs_dim=joint_obs_dim,
@@ -207,6 +235,8 @@ if __name__ == "__main__":
         n_agents=1,
         state_size=None,
         global_reward=True,
+        log_prob_discrete=True,
+        log_prob_continuous=1,
     )
 
     models, names = make_models()
@@ -216,36 +246,40 @@ if __name__ == "__main__":
         results[n] = []
 
     for n in range(len(names)):
+        models, names = make_models()
+        mem_buffer.reset()
+        print("Testing Discrete Environment")
+        rewards = test_single_env(
+            env=discrete_env,
+            agent=models[n],
+            buffer=mem_buffer,
+            n_episodes=200,
+            discrete=True,
+            joint_obs_dim=joint_obs_dim,
+            online=names[n] in ["PPO"],
+        )
+        print(rewards)
+        plt.plot(rewards)
+        plt.show()
+        models[n].save(f"../../TestModels/{names[n]}_Discrete")
+
         mem_buffer.reset()
         print("Testing Continuous Environment")
         rewards = test_single_env(
             continuous_env,
-            models[0],
-            mem_buffer,
-            n_episodes=50,
-            discrete=False,
-        )
-        print(rewards)
-        plt.plot(rewards)
-        plt.show()
-        models[0].save("../../TestModels/TD3_Continuous")
-
-        models = make_models()
-        mem_buffer.reset()
-        print("Testing Discrete Environment")
-        rewards = test_single_env(
-            discrete_env,
-            models[0],
-            mem_buffer,
+            agent=models[n],
+            buffer=mem_buffer,
             n_episodes=100,
-            discrete=True,
+            discrete=False,
+            joint_obs_dim=joint_obs_dim,
+            online=names[n] in ["PPO"],
         )
         print(rewards)
         plt.plot(rewards)
         plt.show()
-        models[0].save("../../TestModels/TD3_Discrete")
+        models[n].save(f"../../TestModels/{names[n]}_Continuous")
 
-        models = make_models()
+        models, names = make_models()
         mem_buffer.reset()
         print("Testing Dual Environment")
         r1, r2 = test_dual_env(
@@ -257,7 +291,7 @@ if __name__ == "__main__":
             joint_obs_dim=joint_obs_dim,
             debug=False,
         )
-        models[0].save("../../TestModels/TD3_Dual")
+        models[n].save(f"../../TestModels/{names[n]}_Dual")
 
     r1 = np.array(r1)
     r2 = np.array(r2)

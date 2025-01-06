@@ -43,7 +43,7 @@ class Agent(ABC):
         print("Load not implemented")
 
 
-def orthogonal_init(layer, std=np.sqrt(2), bias_const=0.0):
+def _orthogonal_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
     torch.nn.init.constant_(layer.bias, bias_const)
     return layer
@@ -51,7 +51,12 @@ def orthogonal_init(layer, std=np.sqrt(2), bias_const=0.0):
 
 class ffEncoder(nn.Module):
     def __init__(
-        self, obs_dim, hidden_dims, activation="relu", device="cpu", orthogonal=False
+        self,
+        obs_dim,
+        hidden_dims,
+        activation="relu",
+        device="cpu",
+        orthogonal_init=False,
     ):
         super(ffEncoder, self).__init__()
         activations = {
@@ -68,8 +73,8 @@ class ffEncoder(nn.Module):
                 self.encoder.append(nn.Linear(obs_dim, hidden_dims[i]))
             else:
                 self.encoder.append(nn.Linear(hidden_dims[i - 1], hidden_dims[i]))
-            if orthogonal:
-                orthogonal_init(self.encoder[-1])
+            if orthogonal_init:
+                _orthogonal_init(self.encoder[-1])
         self.float()
         self.to(device)
         self.device = device
@@ -100,7 +105,7 @@ class MixedActor(nn.Module):
         device="cpu",
         tau=1.0,
         hard=False,
-        orthogonal=False,
+        orthogonal_init=False,
         activation="relu",
     ):
         super(MixedActor, self).__init__()
@@ -140,15 +145,15 @@ class MixedActor(nn.Module):
             self.continuous_actions_head = nn.Linear(
                 hidden_dims[-1], continuous_action_dim
             )
-            if orthogonal:
-                orthogonal_init(self.continuous_actions_head)
+            if orthogonal_init:
+                _orthogonal_init(self.continuous_actions_head)
 
         self.discrete_action_heads = nn.ModuleList()
         if discrete_action_dims is not None and len(discrete_action_dims) > 0:
             for dim in discrete_action_dims:
                 self.discrete_action_heads.append(nn.Linear(hidden_dims[-1], dim))
-                if orthogonal:
-                    orthogonal_init(self.discrete_action_heads[-1])
+                if orthogonal_init:
+                    _orthogonal_init(self.discrete_action_heads[-1])
         self.max_actions = max_actions
         self.to(device)
 
@@ -191,9 +196,17 @@ class MixedActor(nn.Module):
 
 
 class ValueSA(nn.Module):
-    def __init__(self, obs_dim, action_dim, hidden_dim=256, device="cpu"):
+    def __init__(
+        self, obs_dim, action_dim, hidden_dim=256, device="cpu", activation="relu"
+    ):
         super(ValueSA, self).__init__()
         self.device = device
+        if activation not in ["relu", "tanh", "sigmoid"]:
+            raise ValueError(
+                "Invalid activation function, should be: relu, tanh, sigmoid"
+            )
+        activations = {"relu": F.relu, "tanh": torch.tanh, "sigmoid": torch.sigmoid}
+        self.activation = activations[activation]
         self.l1 = nn.Linear(obs_dim + action_dim, hidden_dim)
         self.l2 = nn.Linear(hidden_dim, hidden_dim)
         self.l3 = nn.Linear(hidden_dim, 1)
@@ -202,25 +215,43 @@ class ValueSA(nn.Module):
     def forward(self, x, u, debug=False):
         if debug:
             print(f"ValueSA: x {x}, u {u}")
-        x = F.relu(self.l1(torch.cat([x, u], -1)))
-        x = F.relu(self.l2(x))
+        x = self.activation(self.l1(torch.cat([x, u], -1)))
+        x = self.activation(self.l2(x))
         x = self.l3(x)
         return x
 
 
 class ValueS(nn.Module):
-    def __init__(self, obs_dim, hidden_dim=256, device="cpu"):
+    def __init__(
+        self,
+        obs_dim,
+        hidden_dim=256,
+        device="cpu",
+        activation="relu",
+        orthogonal_init=False,
+    ):
         super(ValueS, self).__init__()
         self.device = device
+        if activation not in ["relu", "tanh", "sigmoid"]:
+            raise ValueError(
+                "Invalid activation function, should be: relu, tanh, sigmoid"
+            )
+        activations = {"relu": F.relu, "tanh": torch.tanh, "sigmoid": torch.sigmoid}
+        self.activation = activations[activation]
         self.l1 = nn.Linear(obs_dim, hidden_dim)
         self.l2 = nn.Linear(hidden_dim, hidden_dim)
         self.l3 = nn.Linear(hidden_dim, 1)
+
+        if orthogonal_init:
+            _orthogonal_init(self.l1)
+            _orthogonal_init(self.l2)
+            _orthogonal_init(self.l3)
         self.to(device)
 
     def forward(self, x):
         x = T(x, self.device)
-        x = F.relu(self.l1(x))
-        x = F.relu(self.l2(x))
+        x = self.activation(self.l1(x))
+        x = self.activation(self.l2(x))
         x = self.l3(x)
         return x
 
