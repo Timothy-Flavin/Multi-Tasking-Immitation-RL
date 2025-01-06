@@ -142,7 +142,7 @@ def test_dual_env(
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
 
-    discrete_env = gym.make("CartPole-v1")  # , render_mode="human")
+    discrete_env = gym.make("Acrobot-v1")  # "CartPole-v1")  # , render_mode="human")
     continuous_env = gym.make("Pendulum-v1")
     joint_obs_dim = (
         discrete_env.observation_space.shape[0]
