@@ -12,11 +12,11 @@ class PPO(Agent):
         max_actions=None,
         min_actions=None,
         discrete_action_dims=None,
-        lr_actor=0.0001,
-        lr_critic=0.0003,
+        lr_actor=0.001,
+        lr_critic=0.003,
         gamma=0.99,
         eps_clip=0.2,
-        n_epochs=10,
+        n_epochs=5,
         device="cpu",
         entropy_loss=0.05,
         encoder_dims=[256, 256],
@@ -61,22 +61,26 @@ class PPO(Agent):
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=lr_actor)
         self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=lr_critic)
 
-    def _sample_multi_discrete(self, logits, debug=False): #logits of the form [action_dim, batch_size, action_dim_size]
-        actions = torch.zeros(size=(logits[0].shape[-1], len(self.discrete_action_dims)))
-        log_probs = torch.zeros(size=(logits[0].shape[-1], len(self.discrete_action_dims)))
+    def _sample_multi_discrete(
+        self, logits, debug=False
+    ):  # logits of the form [action_dim, batch_size, action_dim_size]
+        actions = torch.zeros(
+            size=(logits[0].shape[-1], len(self.discrete_action_dims))
+        )
+        log_probs = torch.zeros(
+            size=(logits[0].shape[-1], len(self.discrete_action_dims))
+        )
         for i in range(len(self.discrete_action_dims)):
             dist = Categorical(logits=logits[i])
-            actions[:,i] = dist.sample()
-            log_probs[:,i] = dist.log_prob(actions[i])
+            actions[:, i] = dist.sample()
+            log_probs[:, i] = dist.log_prob(actions[i])
         return actions, log_probs
 
     def train_action(self, observations, action_mask=None, step=False):
         if not torch.is_tensor(observations):
             observations = torch.tensor(observations, dtype=torch.float).to(self.device)
         if not torch.is_tensor(action_mask) and action_mask is not None:
-            action_mask = torch.tensor(action_mask, dtype=torch.float).to(
-                self.device
-            )
+            action_mask = torch.tensor(action_mask, dtype=torch.float).to(self.device)
         continuous_logits, descrete_logits = self.actor(
             x=observations, action_mask=action_mask, gumbel=False, debug=False
         )
@@ -84,14 +88,22 @@ class PPO(Agent):
             continuous_logits = continuous_logits.unsqueeze(0)
 
         continuous_dist = torch.distributions.Normal(
-            loc=continuous_logits[:, :self.continuous_action_dim],
-            scale=torch.exp(continuous_logits[:,self.continuous_action_dim :]),
+            loc=continuous_logits[:, : self.continuous_action_dim],
+            scale=torch.exp(continuous_logits[:, self.continuous_action_dim :]),
         )
-        discrete_actions, discrete_log_probs = self._sample_multi_discrete(descrete_logits)
+        discrete_actions, discrete_log_probs = self._sample_multi_discrete(
+            descrete_logits
+        )
         continuous_actions = continuous_dist.sample()
         continuous_log_probs = continuous_dist.log_prob(continuous_actions)
         vals = self.critic(observations).detach()
-        return discrete_actions,continuous_actions,discrete_log_probs,continuous_log_probs, vals  
+        return (
+            discrete_actions,
+            continuous_actions,
+            discrete_log_probs,
+            continuous_log_probs,
+            vals,
+        )
 
     # takes the observations and returns the action with the highest probability
     def ego_action(self, observations, action_mask=None):

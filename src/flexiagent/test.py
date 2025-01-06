@@ -1,6 +1,7 @@
 from flexibuff import FlexibleBuffer
 from DDPG import DDPG
 from TD3 import TD3
+from PPO import PPO
 import gymnasium as gym
 import numpy as np
 
@@ -150,7 +151,32 @@ if __name__ == "__main__":
 
     def make_models():
         print("Making TD3 Model")
+        names = ["PPO", "TD3", "DDPG"]
         models = [
+            PPO(
+                obs_dim=joint_obs_dim,
+                discrete_action_dims=[discrete_env.action_space.n],
+                continuous_action_dim=continuous_env.action_space.shape[0],
+                hidden_dims=np.array([128, 128]),
+                gamma=0.99,
+                name="PPO_cd_test",
+                device="cuda",
+                eval_mode=False,
+            ),
+            DDPG(
+                obs_dim=joint_obs_dim,
+                discrete_action_dims=[discrete_env.action_space.n],
+                continuous_action_dim=continuous_env.action_space.shape[0],
+                min_actions=continuous_env.action_space.low,
+                max_actions=continuous_env.action_space.high,
+                hidden_dims=np.array([128, 128]),
+                gamma=0.99,
+                policy_frequency=4,
+                name="TD3_cd_test",
+                device="cuda",
+                eval_mode=False,
+                rand_steps=1500,
+            ),
             TD3(
                 obs_dim=joint_obs_dim,
                 discrete_action_dims=[discrete_env.action_space.n],
@@ -164,9 +190,9 @@ if __name__ == "__main__":
                 device="cuda",
                 eval_mode=False,
                 rand_steps=1500,
-            )
+            ),
         ]
-        return models
+        return models, names
 
     print("Making Discrete Flexible Buffers")
 
@@ -183,49 +209,55 @@ if __name__ == "__main__":
         global_reward=True,
     )
 
-    models = make_models()
-    mem_buffer.reset()
-    print("Testing Continuous Environment")
-    rewards = test_single_env(
-        continuous_env,
-        models[0],
-        mem_buffer,
-        n_episodes=50,
-        discrete=False,
-    )
-    print(rewards)
-    plt.plot(rewards)
-    plt.show()
-    models[0].save("../../TestModels/TD3_Continuous")
+    models, names = make_models()
 
-    models = make_models()
-    mem_buffer.reset()
-    print("Testing Discrete Environment")
-    rewards = test_single_env(
-        discrete_env,
-        models[0],
-        mem_buffer,
-        n_episodes=100,
-        discrete=True,
-    )
-    print(rewards)
-    plt.plot(rewards)
-    plt.show()
-    models[0].save("../../TestModels/TD3_Discrete")
+    results = {}
+    for n in names:
+        results[n] = []
 
-    models = make_models()
-    mem_buffer.reset()
-    print("Testing Dual Environment")
-    r1, r2 = test_dual_env(
-        discrete_env=discrete_env,
-        continuous_env=continuous_env,
-        agent=models[0],
-        buffer=mem_buffer,
-        n_steps=25000,
-        joint_obs_dim=joint_obs_dim,
-        debug=False,
-    )
-    models[0].save("../../TestModels/TD3_Dual")
+    for n in range(len(names)):
+        mem_buffer.reset()
+        print("Testing Continuous Environment")
+        rewards = test_single_env(
+            continuous_env,
+            models[0],
+            mem_buffer,
+            n_episodes=50,
+            discrete=False,
+        )
+        print(rewards)
+        plt.plot(rewards)
+        plt.show()
+        models[0].save("../../TestModels/TD3_Continuous")
+
+        models = make_models()
+        mem_buffer.reset()
+        print("Testing Discrete Environment")
+        rewards = test_single_env(
+            discrete_env,
+            models[0],
+            mem_buffer,
+            n_episodes=100,
+            discrete=True,
+        )
+        print(rewards)
+        plt.plot(rewards)
+        plt.show()
+        models[0].save("../../TestModels/TD3_Discrete")
+
+        models = make_models()
+        mem_buffer.reset()
+        print("Testing Dual Environment")
+        r1, r2 = test_dual_env(
+            discrete_env=discrete_env,
+            continuous_env=continuous_env,
+            agent=models[0],
+            buffer=mem_buffer,
+            n_steps=25000,
+            joint_obs_dim=joint_obs_dim,
+            debug=False,
+        )
+        models[0].save("../../TestModels/TD3_Dual")
 
     r1 = np.array(r1)
     r2 = np.array(r2)
