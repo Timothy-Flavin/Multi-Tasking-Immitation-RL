@@ -23,7 +23,7 @@ class TD3(Agent):
         name="Test_TD3",
         device="cpu",
         eval_mode=False,
-        gumbel_tau=0.5,
+        gumbel_tau=0.25,
         rand_steps=10000,
     ):
         # documentation
