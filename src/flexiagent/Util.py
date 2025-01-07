@@ -25,3 +25,7 @@ def get_multi_discrete_one_hot(x, discrete_action_dims, debug=False):
         print(f"get_multi_discrete_one_hot: {x}, {discrete_action_dims}, {onehot}")
         # input()
     return onehot
+
+
+def normgrad(parameters, grad_clip=0.5):
+    torch.nn.utils.clip_grad_norm_(parameters, grad_clip)

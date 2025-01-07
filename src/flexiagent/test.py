@@ -20,8 +20,11 @@ def test_single_env(
 ):
     agent: DDPG
     rewards = []
+    aloss_return = []
+    closs_return = []
     step = 0
     for episode in range(n_episodes):
+        m_aloss, m_closs = 0, 0
         ep_reward = 0
         obs, info = env.reset()
         obs = np.pad(obs, (0, joint_obs_dim - len(obs)), "constant")
@@ -62,25 +65,36 @@ def test_single_env(
             # print(buffer.steps_recorded)
             if (buffer.steps_recorded > 256 and buffer.episode_inds is not None) or (
                 buffer.episode_inds is not None
-                and len(buffer.episode_inds) > 1
+                # and len(buffer.episode_inds) > 5
                 and online
+                and buffer.steps_recorded > 128
             ):
-                episodes = 0
                 if online:
-                    episodes = buffer.sample_episodes(n_episodes=1, as_torch=True)
-                else:
-                    episodes = buffer.sample_episodes(256, as_torch=True)
-                for ep in episodes:
-                    closs, aloss = agent.reinforcement_learn(
-                        ep, agent_num=0, debug=debug
+                    batch = buffer.sample_transitions(
+                        idx=np.arange(0, buffer.steps_recorded), as_torch=True
                     )
+                else:
+                    batch = buffer.sample_transitions(batch_size=256, as_torch=True)
+                # for ep in episodes:
+                aloss, closs = agent.reinforcement_learn(
+                    batch, agent_num=0, debug=debug
+                )
+                m_aloss += aloss
+                m_closs += closs
                 if online:
                     buffer.reset()
         # print(aloss, closs)
-        print(f"n_ep: {episode} r: {ep_reward}, step: {step}")
+        aloss_return.append(m_aloss)
+        closs_return.append(m_closs)
         rewards.append(ep_reward)
+        if episode % 100 == 0 and episode > 1:
+            print(f"n_ep: {episode} r: {sum(rewards[-100:])/100}, step: {step}")
+            # env = gym.make("CartPole-v1", render_mode="human")
+        if episode % 101 == 0 and episode > 1:
+            env = gym.make("CartPole-v1")
+
     env.close()
-    return rewards
+    return rewards, aloss_return, closs_return
 
 
 def test_dual_env(
@@ -185,11 +199,12 @@ if __name__ == "__main__":
                 obs_dim=joint_obs_dim,
                 discrete_action_dims=[discrete_env.action_space.n],
                 continuous_action_dim=continuous_env.action_space.shape[0],
-                hidden_dims=np.array([128, 128]),
+                hidden_dims=np.array([256, 256]),
                 min_actions=continuous_env.action_space.low,
                 max_actions=continuous_env.action_space.high,
                 gamma=0.99,
                 device="cuda",
+                entropy_loss=0.05,
             ),
             DDPG(
                 obs_dim=joint_obs_dim,
@@ -249,11 +264,11 @@ if __name__ == "__main__":
         models, names = make_models()
         mem_buffer.reset()
         print("Testing Discrete Environment")
-        rewards = test_single_env(
+        rewards, aloss, closs = test_single_env(
             env=discrete_env,
             agent=models[n],
             buffer=mem_buffer,
-            n_episodes=200,
+            n_episodes=5000,
             discrete=True,
             joint_obs_dim=joint_obs_dim,
             online=names[n] in ["PPO"],
@@ -261,21 +276,32 @@ if __name__ == "__main__":
         print(rewards)
         plt.plot(rewards)
         plt.show()
+        am = np.abs(aloss).max()
+        cm = np.abs(closs).max()
+        plt.plot(aloss / am)
+        plt.plot(closs / cm)
+        plt.legend([f"actor {am}", f"critic {cm}"])
+        plt.show()
         models[n].save(f"../../TestModels/{names[n]}_Discrete")
 
         mem_buffer.reset()
         print("Testing Continuous Environment")
-        rewards = test_single_env(
+        rewards, aloss, closs = test_single_env(
             continuous_env,
             agent=models[n],
             buffer=mem_buffer,
-            n_episodes=100,
+            n_episodes=200,
             discrete=False,
             joint_obs_dim=joint_obs_dim,
             online=names[n] in ["PPO"],
         )
         print(rewards)
         plt.plot(rewards)
+        plt.show()
+
+        plt.plot(aloss)
+        plt.plot(closs)
+        plt.legend(["actor", "critic"])
         plt.show()
         models[n].save(f"../../TestModels/{names[n]}_Continuous")
 
@@ -291,6 +317,10 @@ if __name__ == "__main__":
             joint_obs_dim=joint_obs_dim,
             debug=False,
         )
+        plt.plot(aloss)
+        plt.plot(closs)
+        plt.legend(["actor", "critic"])
+        plt.show()
         models[n].save(f"../../TestModels/{names[n]}_Dual")
 
     r1 = np.array(r1)

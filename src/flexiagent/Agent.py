@@ -78,7 +78,7 @@ class ffEncoder(nn.Module):
         self.float()
         self.to(device)
         self.device = device
-        self.optimizer = torch.optim.Adam(self.parameters())
+        # self.optimizer = torch.optim.Adam(self.parameters())
 
     def forward(self, x, debug=False):
         if debug:
@@ -86,9 +86,17 @@ class ffEncoder(nn.Module):
         x = T(x, self.device)
         if debug:
             print(f"ffEncoder after T: x {x}")
+        interlist = []
+        interlist.append(x)
         for layer in self.encoder:
             # print(f"ffEncoder: layer {layer.weight.dtype}")
             x = self.activation(layer(x))
+            interlist.append(x)
+        # if x contains nan, print the intermediate list and encoder weights
+        if torch.isnan(x).any():
+            print(f"Intermediate list: {interlist}")
+            for layer in self.encoder:
+                print(f"Layer {layer.weight}")
         return x
 
 
@@ -158,6 +166,7 @@ class MixedActor(nn.Module):
         self.to(device)
 
     def forward(self, x, action_mask=None, gumbel=False, debug=False):
+        ogx = x
         if debug:
             print(f"MixedActor: x {x}, action_mask {action_mask}, gumbel {gumbel}")
         if self.encoder is not None:
@@ -172,6 +181,11 @@ class MixedActor(nn.Module):
                 F.tanh(self.continuous_actions_head(x)) * self.action_scales
                 + self.action_biases
             )
+            # If continuous action contains nan, print x and the continuous actions
+            if torch.isnan(continuous_actions).any():
+                print(f"Continuous actions: {continuous_actions}")
+                print(f"X: {x}, ogx: {ogx}")
+                # raise ValueError("Continuous actions contain nan")
 
         # TODO: Put this into it's own function and implement the ppo way of sampling
         if self.discrete_action_heads is not None:
