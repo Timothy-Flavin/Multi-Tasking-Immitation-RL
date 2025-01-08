@@ -165,3 +165,4 @@ Lib/
 Scripts/
 pyvenv.cfg
 share/
+include/

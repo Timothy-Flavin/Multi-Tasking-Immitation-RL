@@ -92,13 +92,13 @@ def test_single_env(
         aloss_return.append(m_aloss)
         closs_return.append(m_closs)
         rewards.append(ep_reward)
-        er = 100
+        er = 50
         if episode % er == 0 and episode > 1:
             print(f"n_ep: {episode} r: {sum(rewards[-er:])/er}, step: {step}")
             # plt.plot(rewards)
             # plt.show()
             env = gym.make(gym_disc_env, render_mode="human")
-        if episode % (er + 1) == 0 and episode > 1:
+        if episode % (er) == 1 and episode > 1:
             env = gym.make(gym_disc_env)
         # env = gym.make("CartPole-v1")
 
@@ -216,6 +216,10 @@ if __name__ == "__main__":
                 gamma=0.99,
                 device="cuda",
                 entropy_loss=0.5,
+                mini_batch_size=32,
+                n_epochs=2,
+                lr=3e-4,
+                advantage_type="gv",
             ),
             DDPG(
                 obs_dim=joint_obs_dim,
@@ -283,27 +287,6 @@ if __name__ == "__main__":
         results[n] = []
 
     for n in range(len(names)):
-        mem_buffer.reset()
-        print("Testing Continuous Environment")
-        rewards, aloss, closs = test_single_env(
-            continuous_env,
-            agent=models[n],
-            buffer=mem_buffer,
-            n_episodes=200,
-            discrete=False,
-            joint_obs_dim=joint_obs_dim,
-            online=names[n] in ["PPO"],
-        )
-        print(rewards)
-        plt.plot(rewards)
-        plt.show()
-
-        plt.plot(aloss)
-        plt.plot(closs)
-        plt.legend(["actor", "critic"])
-        plt.show()
-        models[n].save(f"../../TestModels/{names[n]}_Continuous")
-
         print("Testing Model ", names[n])
         models, names = make_models()
         mem_buffer.reset()
@@ -327,6 +310,27 @@ if __name__ == "__main__":
         plt.legend([f"actor {am}", f"critic {cm}"])
         plt.show()
         models[n].save(f"../../TestModels/{names[n]}_Discrete")
+
+        mem_buffer.reset()
+        print("Testing Continuous Environment")
+        rewards, aloss, closs = test_single_env(
+            continuous_env,
+            agent=models[n],
+            buffer=mem_buffer,
+            n_episodes=200,
+            discrete=False,
+            joint_obs_dim=joint_obs_dim,
+            online=names[n] in ["PPO"],
+        )
+        print(rewards)
+        plt.plot(rewards)
+        plt.show()
+
+        plt.plot(aloss)
+        plt.plot(closs)
+        plt.legend(["actor", "critic"])
+        plt.show()
+        models[n].save(f"../../TestModels/{names[n]}_Continuous")
 
         models, names = make_models()
         mem_buffer.reset()

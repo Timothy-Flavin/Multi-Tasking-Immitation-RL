@@ -119,13 +119,11 @@ class PG(Agent, nn.Module):
             )
             if debug:
                 print(f"  After actor: clog {continuous_logits}, dlog{discrete_logits}")
-        # print(f"continuous_logits: {continuous_logits.shape} {continuous_logits}")
-        # print(f"discrete_logits: {discrete_logits[0].shape} {discrete_logits}")
-        # if len(continuous_logits.shape) == 1:
-        # continuous_logits = continuous_logits.unsqueeze(0)
-        print(
-            f" Expanding actor logstd {self.actor_logstd.squeeze(0)}, {continuous_logits}"
-        )
+
+        if debug:
+            print(
+                f" Expanding actor logstd {self.actor_logstd.squeeze(0)}, {continuous_logits}"
+            )
         try:
             # action_logstd = self.actor_logstd
             action_std = torch.exp(self.actor_logstd.squeeze(0))
@@ -291,7 +289,7 @@ class PG(Agent, nn.Module):
                 )
         #
         G = advantages + values
-        return G, advantages
+        return G.unsqueeze(-1), advantages.unsqueeze(-1)
 
     def _td(self, batch, agent_num):
         reward_arr = batch.global_rewards
@@ -307,7 +305,7 @@ class PG(Agent, nn.Module):
                 - old_values[t]
             )
         G = td + old_values
-        return G, td
+        return G.unsqueeze(-1), td.unsqueeze(-1)
 
     def reinforcement_learn(
         self,
@@ -429,9 +427,8 @@ class PG(Agent, nn.Module):
                             print(f"    Discrete head: {head}")
                             print(f"    disc_probs: {disc_probs[head]}")
                             print(
-                                f"    batch.discrete_actions: {batch.discrete_actions[agent_num].shape}"
+                                f"    batch.discrete_actions: {batch.discrete_actions[agent_num,indices,head]}"
                             )
-                            exit()
                         probs = disc_probs[head]  # Categorical()
                         dist = Categorical(probs=probs)
                         entropy = dist.entropy().mean()
@@ -439,7 +436,12 @@ class PG(Agent, nn.Module):
                             batch.discrete_actions[agent_num, indices, head]
                         )
 
-                        discrete_policy_gradient = -selected_log_probs * advantages
+                        if debug:
+                            print(f"    selected log probs{selected_log_probs}")
+
+                        discrete_policy_gradient = (
+                            -selected_log_probs * advantages[indices]
+                        )
 
                         actor_loss += (
                             self.policy_loss * discrete_policy_gradient.mean()
@@ -504,6 +506,7 @@ if __name__ == "__main__":
         advantage_type="G",
         norm_advantages=True,
         mini_batch_size=7,
+        n_epochs=2,
     )
     obs = np.random.rand(obs_dim).astype(np.float32)
     obs_ = np.random.rand(obs_dim).astype(np.float32)
@@ -519,7 +522,7 @@ if __name__ == "__main__":
         obs=np.array([obs_batch]),
         obs_=np.array([obs_batch_]),
         continuous_actions=np.array([np.random.rand(14, 2).astype(np.float32)]),
-        discrete_actions=dacs,
+        discrete_actions=np.array([dacs]),
         global_rewards=np.random.rand(14).astype(np.float32),
         terminated=np.random.randint(0, 2, size=14),
     )
