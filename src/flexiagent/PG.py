@@ -4,9 +4,10 @@ from flexibuff import FlexiBatch
 from torch.distributions import Categorical
 from Util import T
 import numpy as np
+import torch.nn as nn
 
 
-class PG(Agent):
+class PG(Agent, nn.Module):
     def __init__(
         self,
         obs_dim,
@@ -27,7 +28,7 @@ class PG(Agent):
         norm_advantages=False,
         mini_batch_size=64,
     ):
-        super().__init__()
+        super(PG, self).__init__()
         assert (
             continuous_action_dim > 0 or discrete_action_dims is not None
         ), "At least one action dim should be provided"
@@ -77,7 +78,8 @@ class PG(Agent):
         )
         self.actor_logstd = torch.nn.Parameter(
             torch.zeros(1, continuous_action_dim), requires_grad=True
-        )
+        ).to(device)
+        print(self.actor_logstd)
         self.total_params = self.parameters()
         self.optimizer = torch.optim.AdamW(self.total_params, lr=lr)
         # self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=lr_critic)
@@ -101,24 +103,32 @@ class PG(Agent):
         return actions, log_probs
 
     def train_actions(self, observations, action_mask=None, step=False, debug=False):
-
+        if debug:
+            print(f"  Testing Train Actions: Observations: {observations}")
         if not torch.is_tensor(observations):
             observations = T(observations, device=self.device, dtype=torch.float)
         if not torch.is_tensor(action_mask) and action_mask is not None:
             action_mask = torch.tensor(action_mask, dtype=torch.float).to(self.device)
 
+        if debug:
+            print(f"  After tensor check: Observations{observations}")
         # print(f"Observations: {observations.shape} {observations}")
         with torch.no_grad():
             continuous_logits, discrete_logits = self.actor(
                 x=observations, action_mask=action_mask, gumbel=False, debug=False
             )
+            if debug:
+                print(f"  After actor: clog {continuous_logits}, dlog{discrete_logits}")
         # print(f"continuous_logits: {continuous_logits.shape} {continuous_logits}")
         # print(f"discrete_logits: {discrete_logits[0].shape} {discrete_logits}")
         # if len(continuous_logits.shape) == 1:
         # continuous_logits = continuous_logits.unsqueeze(0)
+        print(
+            f" Expanding actor logstd {self.actor_logstd.squeeze(0)}, {continuous_logits}"
+        )
         try:
-            action_logstd = self.actor_logstd.expand_as(continuous_logits)
-            action_std = torch.exp(action_logstd)
+            # action_logstd = self.actor_logstd
+            action_std = torch.exp(self.actor_logstd.squeeze(0))
             continuous_dist = torch.distributions.Normal(
                 loc=continuous_logits,
                 scale=action_std,
@@ -127,38 +137,20 @@ class PG(Agent):
             print(
                 f"bad stuff, {continuous_logits}, {discrete_logits}, {observations}, {action_mask} {e}"
             )
-            with torch.no_grad():
-                continuous_logits, discrete_logits = self.actor(
-                    x=observations * 0, action_mask=None, gumbel=False, debug=False
-                )
-            print(
-                f"still bad?, {continuous_logits}, {discrete_logits}, {observations*0}, {action_mask}"
-            )
-            action_logstd = self.actor_logstd.expand_as(continuous_logits)
-            action_std = torch.exp(action_logstd)
-            continuous_dist = torch.distributions.Normal(
-                loc=continuous_logits,
-                scale=action_std,
-            )
+            exit()
 
-        # print(discrete_logits)
         discrete_actions, discrete_log_probs = self._sample_multi_discrete(
             discrete_logits
         )
-        # print(continuous_logits)
-
         continuous_actions = continuous_dist.sample()
-        # print(continuous_actions)
-        # exit()
         continuous_log_probs = continuous_dist.log_prob(continuous_actions)
-        # print(continuous_log_probs)
-        vals = self.critic(observations)
+        vals = 0  # self.critic(observations)
         return (
             discrete_actions.detach().cpu().numpy(),
             continuous_actions.detach().cpu().numpy(),
             discrete_log_probs.detach().cpu().numpy(),
             continuous_log_probs.detach().cpu().numpy(),
-            vals.detach().cpu().numpy(),
+            0,  # vals.detach().cpu().numpy(), TODO: re-enable this when flexibuff is done
         )
 
     # takes the observations and returns the action with the highest probability
@@ -328,7 +320,8 @@ class PG(Agent):
         # print(f"Doing PPO learn for agent {agent_num}")
         # Update the critic with Bellman Equation
         # Monte Carlo Estimate of returns
-
+        if debug:
+            print(f"Starting Reinforcement Learn for agent {agent_num}")
         # # G = G / 100
         with torch.no_grad():
             if self.advantage_type == "gv":
@@ -344,30 +337,54 @@ class PG(Agent):
             elif self.advantage_type == "g":
                 G = self._G(batch, agent_num)
                 advantages = G
+            else:
+                raise ValueError("Invalid advantage type")
             if self.norm_advantages:
                 advantages = (advantages - advantages.mean()) / (
                     advantages.std() + 1e-8
                 )
+            if debug:
+                print(f"  batch rewards: {batch.global_rewards}")
+                print(f"  raw critic: {self.critic(batch.obs[agent_num])}")
+                print(f"  Advantages: {advantages}")
+                print(f"  G: {G}")
+
         avg_actor_loss = 0
         avg_critic_loss = 0
         # Update the actor
         action_mask = None
         if batch.action_mask is not None:
-            action_mask = batch.action_mask[agent_num]
+            action_mask = batch.action_mask[agent_num]  # TODO: Unit test this later
 
         bsize = len(batch.global_rewards)
         nbatch = bsize // self.mini_batch_size
         mini_batch_indices = np.arange(len(batch.global_rewards))
         np.random.shuffle(mini_batch_indices)
 
-        for epoch in range(self.n_epochs):
+        if debug:
+            print(
+                f"  bsize: {bsize}, Mini batch indices: {mini_batch_indices}, nbatch: {nbatch}"
+            )
 
+        for epoch in range(self.n_epochs):
+            if debug:
+                print("  Starting epoch", epoch)
             for bstart in range(0, bsize, self.mini_batch_size):
                 # Get Critic Loss
                 bend = bstart + self.mini_batch_size
                 indices = mini_batch_indices[bstart:bend]
 
+                if debug:
+                    print(
+                        f"    Mini batch: {bstart}:{bend}, Indices: {indices}, {len(indices)}"
+                    )
+
                 V_current = self.critic(batch.obs[agent_num, indices])
+                if debug:
+                    print(
+                        f"    V_current: {V_current.shape}, G[indices] {G[indices].shape}"
+                    )
+                    input()
                 critic_loss = 0.5 * ((V_current - G[indices]) ** 2).mean()
 
                 if not critic_only:
@@ -378,19 +395,29 @@ class PG(Agent):
                     actor_loss = 0
 
                     if self.continuous_action_dim > 0:
-                        print(cont_probs.shape)
-                        input("what is up with continuous probabilities")
+                        if debug:
+                            print(f"    cont probs: {cont_probs.shape}")
+                            print(
+                                f"    logstd: {self.actor_logstd.expand_as(cont_probs)}"
+                            )
+                            print(f"    advantages: {advantages[indices]}")
+                        # input("what is up with continuous probabilities")
                         cont_probs = cont_probs
                         continuous_dist = torch.distributions.Normal(
                             loc=cont_probs,
                             scale=torch.exp(self.actor_logstd.expand_as(cont_probs)),
                         )
                         continuous_log_probs = continuous_dist.log_prob(
-                            batch.continuous_actions[agent_num]
+                            batch.continuous_actions[agent_num, indices]
                         )
                         continuous_policy_gradient = (
-                            continuous_log_probs * advantages[mini_batch_indices]
+                            continuous_log_probs * advantages[indices]
                         )
+                        if debug:
+                            print(f"    continuous_log_probs: {continuous_log_probs}")
+                            print(
+                                f"    continuous_policy_gradient: {continuous_policy_gradient}"
+                            )
 
                         actor_loss += (
                             -self.policy_loss * continuous_policy_gradient.mean()
@@ -398,11 +425,18 @@ class PG(Agent):
                         )
 
                     for head in range(len(self.discrete_action_dims)):
+                        if debug:
+                            print(f"    Discrete head: {head}")
+                            print(f"    disc_probs: {disc_probs[head]}")
+                            print(
+                                f"    batch.discrete_actions: {batch.discrete_actions[agent_num].shape}"
+                            )
+                            exit()
                         probs = disc_probs[head]  # Categorical()
                         dist = Categorical(probs=probs)
                         entropy = dist.entropy().mean()
                         selected_log_probs = dist.log_prob(
-                            batch.discrete_actions[agent_num][mini_batch_indices, head]
+                            batch.discrete_actions[agent_num, indices, head]
                         )
 
                         discrete_policy_gradient = -selected_log_probs * advantages
@@ -460,9 +494,11 @@ if __name__ == "__main__":
     agent = PG(
         obs_dim=obs_dim,
         continuous_action_dim=continuous_action_dim,
+        max_actions=np.array([1, 2]),
+        min_actions=np.array([0, 0]),
         discrete_action_dims=[4, 5],
         hidden_dims=[32, 32],
-        device="gpu",
+        device="cuda:0",
         lr=0.001,
         activation="relu",
         advantage_type="G",
@@ -478,5 +514,25 @@ if __name__ == "__main__":
         (np.random.randint(0, 4, size=(14)), np.random.randint(0, 5, size=(14))),
         axis=-1,
     )
-    print(dacs.shape)
-    print(dacs)
+
+    mem = FlexiBatch(
+        obs=np.array([obs_batch]),
+        obs_=np.array([obs_batch_]),
+        continuous_actions=np.array([np.random.rand(14, 2).astype(np.float32)]),
+        discrete_actions=dacs,
+        global_rewards=np.random.rand(14).astype(np.float32),
+        terminated=np.random.randint(0, 2, size=14),
+    )
+    mem.to_torch("cuda:0")
+
+    d_acts, c_acts, d_log, c_log, _ = agent.train_actions(obs, step=True, debug=True)
+    print(f"Training actions: c: {c_acts}, d: {d_acts}, d_log: {d_log}, c_log: {c_log}")
+
+    for adv_type in ["g", "gae", "a2c", "constant", "gv"]:
+        agent.advantage_type = adv_type
+        print(f"Reinforcement learning with advantage type {adv_type}")
+        aloss, closs = agent.reinforcement_learn(mem, 0, critic_only=False, debug=True)
+        print("Done")
+        input("Check next one?")
+
+    print("Finished Testing")
