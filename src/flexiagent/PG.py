@@ -6,7 +6,7 @@ from Util import T
 import numpy as np
 
 
-class VPG(Agent):
+class PG(Agent):
     def __init__(
         self,
         obs_dim,
@@ -14,18 +14,34 @@ class VPG(Agent):
         max_actions=None,
         min_actions=None,
         discrete_action_dims=None,
-        lr_actor=2.5e-4,
+        lr=2.5e-4,
         gamma=0.99,
         n_epochs=2,
         device="cpu",
-        entropy_loss=0.01,
+        entropy_loss=0.05,
         hidden_dims=[256, 256],
         activation="relu",
+        ppo_clip=0.2,
+        value_loss_coef=0.5,
+        advantage_type="gae",
+        norm_advantages=False,
+        mini_batch_size=64,
     ):
         super().__init__()
         assert (
             continuous_action_dim > 0 or discrete_action_dims is not None
         ), "At least one action dim should be provided"
+        self.ppo_clip = ppo_clip
+        self.value_loss_coef = value_loss_coef
+        self.mini_batch_size = mini_batch_size
+        assert advantage_type.lower() in [
+            "gae",
+            "a2c",
+            "constant",
+            "gv",
+            "g",
+        ], "Invalid advantage type"
+        self.advantage_type = advantage_type
         self.gae_lambda = 0.95
         self.device = device
         self.gamma = gamma
@@ -34,9 +50,10 @@ class VPG(Agent):
         self.discrete_action_dims = discrete_action_dims
         self.n_epochs = n_epochs
         self.activation = activation
+        self.norm_advantages = norm_advantages
 
         self.policy_loss = 1
-        self.critic_loss = 1
+        self.critic_loss_coef = 1
         self.entropy_loss = entropy_loss
 
         self.actor = MixedActor(
@@ -62,7 +79,7 @@ class VPG(Agent):
             torch.zeros(1, continuous_action_dim), requires_grad=True
         )
         self.total_params = self.parameters()
-        self.optimizer = torch.optim.AdamW(self.total_params, lr=lr_actor)
+        self.optimizer = torch.optim.AdamW(self.total_params, lr=lr)
         # self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=lr_critic)
 
     def _sample_multi_discrete(
@@ -211,13 +228,15 @@ class VPG(Agent):
     def _get_cont_log_probs_entropy(self, logits, actions):
         log_probs = torch.zeros_like(actions, dtype=torch.float)
         dist = torch.distributions.Normal(
-            loc=logits, scale=torch.exp(self.actor_logstd)
+            loc=logits, scale=torch.exp(self.actor_logstd.expand_as(logits))
         )
         log_probs = dist.log_prob(actions)
         return log_probs, dist.entropy().mean()
 
-    def _get_probs_and_entropy(self, batch:FlexiBatch, agent_num):
-        cp, dp = self.actor(batch.obs[agent_num], action_mask=batch.action_mask[agent_num])
+    def _get_probs_and_entropy(self, batch: FlexiBatch, agent_num):
+        cp, dp = self.actor(
+            batch.obs[agent_num], action_mask=batch.action_mask[agent_num]
+        )
         if len(self.discrete_action_dims) > 0:
             old_disc_log_probs = []
             old_disc_entropy = []
@@ -240,7 +259,64 @@ class VPG(Agent):
             old_cont_log_probs = 0
             old_cont_entropy = 0
 
-        return old_disc_log_probs, old_disc_entropy, old_cont_log_probs, old_cont_entropy
+        return (
+            old_disc_log_probs,
+            old_disc_entropy,
+            old_cont_log_probs,
+            old_cont_entropy,
+        )
+
+    def _G(self, batch, agent_num):
+        G = torch.zeros_like(batch.global_rewards).to(self.device)
+        G[-1] = batch.global_rewards[-1]
+        if batch.terminated[-1] < 0.5:
+            G[-1] += self.gamma * self.critic(batch.obs[agent_num][-1]).squeeze(-1)
+
+        for i in range(len(batch.global_rewards) - 2, -1, -1):
+            G[i] = batch.global_rewards[i] + self.gamma * G[i + 1] * (
+                1 - batch.terminated[i]
+            )
+        G = G.unsqueeze(-1)
+        return G
+
+    def _gae(self, batch, agent_num):
+        with torch.no_grad():
+            values = self.critic(batch.obs[agent_num]).squeeze(-1)
+            num_steps = batch.global_rewards.shape[0]
+            advantages = torch.zeros_like(batch.global_rewards).to(self.device)
+            lastgaelam = 0
+            for t in reversed(range(num_steps - 1)):
+                nextnonterminal = 1.0 - batch.terminated[t + 1]
+                nextvalues = values[t + 1]
+                delta = (
+                    batch.global_rewards[t]
+                    + self.gamma * nextvalues * nextnonterminal
+                    - values[t]
+                )
+                # print(delta)
+                advantages[t] = lastgaelam = (
+                    delta + self.gamma * self.gae_lambda * nextnonterminal * lastgaelam
+                )
+        #
+        G = advantages + values
+        return G, advantages
+
+    def _td(self, batch, agent_num):
+        reward_arr = batch.global_rewards
+        with torch.no_grad():
+            old_values = self.critic(batch.obs[agent_num]).squeeze(-1)
+
+        td = torch.zeros_like(reward_arr).to(self.device)
+
+        for t in range(len(reward_arr) - 1):
+            td[t] = (
+                reward_arr[t]
+                + self.gamma * old_values[t + 1] * (1 - batch.terminated[t])
+                - old_values[t]
+            )
+        G = td + old_values
+        return G, td
+
     def reinforcement_learn(
         self,
         batch: FlexiBatch,
@@ -252,154 +328,155 @@ class VPG(Agent):
         # print(f"Doing PPO learn for agent {agent_num}")
         # Update the critic with Bellman Equation
         # Monte Carlo Estimate of returns
-        G = torch.zeros_like(batch.global_rewards).to(self.device)
-        G[-1] = batch.global_rewards[-1]
-        for i in range(len(batch.global_rewards) - 2, -1, -1):
-            G[i] = batch.global_rewards[i] + self.gamma * G[i + 1] * (
-                1 - batch.terminated[i]
-            )
-        G = G.unsqueeze(-1)
+
         # # G = G / 100
         with torch.no_grad():
-            advantages = G - self.critic(batch.obs[agent_num])
-        # reward_arr = batch.global_rewards
-        # with torch.no_grad():
-        #    old_values = self.critic(batch.obs[agent_num]).squeeze(-1)
-
-        # advantage = torch.zeros_like(reward_arr).to(self.device)
-
-        # for t in range(len(reward_arr) - 1):
-        #     discount = 1
-        #     a_t = 0
-        #     for k in range(t, len(reward_arr) - 1):
-        #         a_t += discount * (
-        #             reward_arr[k]
-        #             + self.gamma * old_values[k + 1] * (1 - batch.terminated[k])
-        #             - old_values[k]
-        #         )
-        #         discount *= self.gamma * self.gae_lambda
-        #     advantage[t] = a_t
-
-        # G = advantage + old_values
-        ########################################################################################
-        # print(G)
-        # print(batch.terminated)
-        # advantage = T.tensor(advantage).to(self.actor.device)
-        # values = T.tensor(values).to(self.actor.device)
-
-        # with torch.no_grad():
-        #     values = self.critic(batch.obs[agent_num]).squeeze(-1)
-        #     num_steps = batch.global_rewards.shape[0]
-        #     advantages = torch.zeros_like(batch.global_rewards).to(self.device)
-        #     lastgaelam = 0
-        #     for t in reversed(range(num_steps - 1)):
-        #         nextnonterminal = 1.0 - batch.terminated[t + 1]
-        #         nextvalues = values[t + 1]
-        #         delta = (
-        #             batch.global_rewards[t]
-        #             + self.gamma * nextvalues * nextnonterminal
-        #             - values[t]
-        #         )
-        #         # print(delta)
-        #         advantages[t] = lastgaelam = (
-        #             delta + self.gamma * self.gae_lambda * nextnonterminal * lastgaelam
-        #         )
-        # #
-        # G = advantages + values
-
+            if self.advantage_type == "gv":
+                G = self._G(batch, agent_num)
+                advantages = G - self.critic(batch.obs[agent_num])
+            elif self.advantage_type == "gae":
+                G, advantages = self._gae(batch, agent_num)
+            elif self.advantage_type == "a2c":
+                G, advantages = self._td(batch, agent_num)
+            elif self.advantage_type == "constant":
+                G = self._G(batch, agent_num)
+                advantages = G - G.mean()
+            elif self.advantage_type == "g":
+                G = self._G(batch, agent_num)
+                advantages = G
+            if self.norm_advantages:
+                advantages = (advantages - advantages.mean()) / (
+                    advantages.std() + 1e-8
+                )
         avg_actor_loss = 0
+        avg_critic_loss = 0
         # Update the actor
         action_mask = None
         if batch.action_mask is not None:
             action_mask = batch.action_mask[agent_num]
 
-        with torch.no_grad():
-            
-            
+        bsize = len(batch.global_rewards)
+        nbatch = bsize // self.mini_batch_size
+        mini_batch_indices = np.arange(len(batch.global_rewards))
+        np.random.shuffle(mini_batch_indices)
 
         for epoch in range(self.n_epochs):
 
-            V_current = self.critic(batch.obs[agent_num])
-            critic_loss = 0.5 * ((V_current - G) ** 2).mean()
+            for bstart in range(0, bsize, self.mini_batch_size):
+                # Get Critic Loss
+                bend = bstart + self.mini_batch_size
+                indices = mini_batch_indices[bstart:bend]
 
-            if not critic_only:
-                advantages = G - V_current
-                advantages = (advantages - advantages.mean()) / (
-                    advantages.std() + 1e-8
-                )
+                V_current = self.critic(batch.obs[agent_num, indices])
+                critic_loss = 0.5 * ((V_current - G[indices]) ** 2).mean()
 
-                cont_probs, disc_probs = self.actor(
-                    batch.obs[agent_num], action_mask=action_mask
-                )
-                actor_loss = 0
-
-                if self.continuous_action_dim > 0:
-                    cont_probs = cont_probs.squeeze(0)
-                    continuous_dist = torch.distributions.Normal(
-                        loc=cont_probs,
-                        scale=torch.exp(self.actor_logstd),
+                if not critic_only:
+                    cont_probs, disc_probs = self.actor(
+                        batch.obs[agent_num, indices],
+                        action_mask=action_mask,  # TODO fix action mask by indices
                     )
-                    continuous_log_probs = continuous_dist.log_prob(
-                        batch.continuous_actions[agent_num]
-                    )
-                    continuous_surr1 = continuous_log_probs * advantages
+                    actor_loss = 0
 
-                    actor_loss += (
-                        -self.policy_loss * continuous_surr1.mean()
-                        + self.entropy_loss * continuous_dist.entropy().mean()
-                    )
-
-                for head in range(len(self.discrete_action_dims)):
-                    probs = disc_probs[head]  # Categorical()
-                    selected_log_probs = torch.log(
-                        probs.gather(
-                            -1, batch.discrete_actions[agent_num][:, head].unsqueeze(-1)
+                    if self.continuous_action_dim > 0:
+                        print(cont_probs.shape)
+                        input("what is up with continuous probabilities")
+                        cont_probs = cont_probs
+                        continuous_dist = torch.distributions.Normal(
+                            loc=cont_probs,
+                            scale=torch.exp(self.actor_logstd.expand_as(cont_probs)),
                         )
-                    )
-                    entropy = Categorical(probs=probs).entropy().mean()
+                        continuous_log_probs = continuous_dist.log_prob(
+                            batch.continuous_actions[agent_num]
+                        )
+                        continuous_policy_gradient = (
+                            continuous_log_probs * advantages[mini_batch_indices]
+                        )
 
-                    surr1 = selected_log_probs * advantages
+                        actor_loss += (
+                            -self.policy_loss * continuous_policy_gradient.mean()
+                            + self.entropy_loss * continuous_dist.entropy().mean()
+                        )
 
-                    actor_loss += (
-                        self.policy_loss * -surr1.mean() - self.entropy_loss * entropy
-                    )
+                    for head in range(len(self.discrete_action_dims)):
+                        probs = disc_probs[head]  # Categorical()
+                        dist = Categorical(probs=probs)
+                        entropy = dist.entropy().mean()
+                        selected_log_probs = dist.log_prob(
+                            batch.discrete_actions[agent_num][mini_batch_indices, head]
+                        )
 
-                self.optimizer.zero_grad()
-                loss = actor_loss + critic_loss * self.critic_loss
-                loss.backward()
-                try:
+                        discrete_policy_gradient = -selected_log_probs * advantages
 
-                    torch.nn.utils.clip_grad_norm_(
-                        self.total_params, 0.5, error_if_nonfinite=True
-                    )
-                except:
-                    input("print rest?")
-                    print("Error in clipping")
-                    print(actor_loss.item(), critic_loss.item())
+                        actor_loss += (
+                            self.policy_loss * discrete_policy_gradient.mean()
+                            - self.entropy_loss * entropy
+                        )
 
-                    print(f"surr1: {surr1}")
-                    print(selected_log_probs, old_log_probs)
-                    print(disc_probs)
-                    paramvec = torch.nn.utils.parameters_to_vector(self.total_params)
-                    # paramvec has nan
+                    self.optimizer.zero_grad()
+                    loss = actor_loss + critic_loss * self.critic_loss_coef
+                    loss.backward()
+                    try:
+                        torch.nn.utils.clip_grad_norm_(
+                            self.total_params, 0.5, error_if_nonfinite=True
+                        )
+                    except Exception as e:
+                        print(f"Error in clipping {e}")
+                        print(actor_loss.item(), critic_loss.item())
+                        print(
+                            f"surr1: {discrete_policy_gradient}, {continuous_policy_gradient}"
+                        )
+                        print(disc_probs)
+                        paramvec = torch.nn.utils.parameters_to_vector(
+                            self.total_params
+                        )
+                        print(max(paramvec), min(paramvec), torch.linalg.norm(paramvec))
+                        print("paramvec", paramvec.isnan().sum())
+                        print("loss", loss.isnan().sum())
+                        print("entropy", entropy.isnan().sum())
+                        # exit()
+                    self.optimizer.step()
 
-                    print(max(paramvec), min(paramvec), torch.linalg.norm(paramvec))
-                    print("paramvec", paramvec.isnan().sum())
-                    print("surr1", surr1.isnan().sum())
-                    print("loss", loss.isnan().sum())
-                    print("entropy", entropy.isnan().sum())
-                    # exit()
-                self.optimizer.step()
-
-                avg_actor_loss += actor_loss.item()
+                    avg_actor_loss += actor_loss.item()
+                    avg_critic_loss += critic_loss.item()
+            avg_actor_loss /= nbatch
+            avg_critic_loss /= nbatch
             # print(f"actor_loss: {actor_loss.item()}")
 
         avg_actor_loss /= self.n_epochs
+        avg_critic_loss /= self.n_epochs
         # print(avg_actor_loss, critic_loss.item())
-        return avg_actor_loss, critic_loss.item()
+        return avg_actor_loss, avg_critic_loss
 
     def save(self, checkpoint_path):
         print("Save not implemeted")
 
     def load(self, checkpoint_path):
         print("Load not implemented")
+
+
+if __name__ == "__main__":
+    obs_dim = 3
+    continuous_action_dim = 2
+    agent = PG(
+        obs_dim=obs_dim,
+        continuous_action_dim=continuous_action_dim,
+        discrete_action_dims=[4, 5],
+        hidden_dims=[32, 32],
+        device="gpu",
+        lr=0.001,
+        activation="relu",
+        advantage_type="G",
+        norm_advantages=True,
+        mini_batch_size=7,
+    )
+    obs = np.random.rand(obs_dim).astype(np.float32)
+    obs_ = np.random.rand(obs_dim).astype(np.float32)
+    obs_batch = np.random.rand(14, obs_dim).astype(np.float32)
+    obs_batch_ = obs_batch + 0.1
+
+    dacs = np.stack(
+        (np.random.randint(0, 4, size=(14)), np.random.randint(0, 5, size=(14))),
+        axis=-1,
+    )
+    print(dacs.shape)
+    print(dacs)

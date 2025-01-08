@@ -13,8 +13,7 @@ class PPO(Agent):
         max_actions=None,
         min_actions=None,
         discrete_action_dims=None,
-        lr_actor=2.5e-4,
-        lr_critic=1.5e-3,
+        lr=2.5e-4,
         gamma=0.99,
         eps_clip=0.2,
         n_epochs=4,
@@ -63,7 +62,7 @@ class PPO(Agent):
         self.total_params = list(self.critic.parameters()) + list(
             self.actor.parameters()
         )
-        self.optimizer = torch.optim.Adam(self.total_params, lr=lr_actor)
+        self.optimizer = torch.optim.Adam(self.total_params, lr=lr)
         # self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=lr_critic)
 
     def _sample_multi_discrete(

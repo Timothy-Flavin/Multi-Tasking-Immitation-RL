@@ -6,7 +6,7 @@ import gymnasium as gym
 import numpy as np
 from Agent import Agent
 from typing import List
-from VPG import VPG
+from PG import PG
 
 
 gym_disc_env = "CartPole-v1"
@@ -206,7 +206,7 @@ if __name__ == "__main__":
         print("Making Model")
         names = ["PPO", "TD3", "DDPG"]
         models = [
-            VPG(
+            PG(
                 obs_dim=joint_obs_dim,
                 discrete_action_dims=[discrete_env.action_space.n],
                 continuous_action_dim=continuous_env.action_space.shape[0],
