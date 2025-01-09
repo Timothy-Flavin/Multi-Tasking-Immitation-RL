@@ -145,11 +145,15 @@ class TD3(Agent):
     def _add_noise(self, continuous_actions):
         if self.continuous_action_dim == 0:
             return 0
-        return torch.clip(
+        # print(self.min_actions)
+        # print(self.max_actions)
+        noisyact = torch.clip(
             continuous_actions + self.__noise__(continuous_actions),
             self.min_actions,
             self.max_actions,
         )
+        # print(noisyact)
+        return noisyact
 
     def _get_random_actions(self, action_mask=None, debug=False):
         continuous_actions = (
@@ -169,10 +173,12 @@ class TD3(Agent):
             print("    TD3 train_actions Observations: ", observations)
         if step:
             self.step += 1
+
         if self.step < self.rand_steps:
             discrete_actions, continuous_actions = self._get_random_actions(
                 action_mask, debug=debug
             )
+
             return (
                 discrete_actions.detach().cpu().numpy(),
                 continuous_actions.detach().cpu().numpy(),

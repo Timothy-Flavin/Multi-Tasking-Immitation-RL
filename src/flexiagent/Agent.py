@@ -57,6 +57,7 @@ class ffEncoder(nn.Module):
         activation="relu",
         device="cpu",
         orthogonal_init=False,
+        dropout=0.6,
     ):
         super(ffEncoder, self).__init__()
         activations = {
@@ -67,6 +68,7 @@ class ffEncoder(nn.Module):
         }
         assert activation in activations, "Invalid activation function"
         self.activation = activations[activation]
+        self.dropout = nn.Dropout(p=dropout)
         self.encoder = nn.ModuleList()
         for i in range(len(hidden_dims)):
             if i == 0:
@@ -86,12 +88,16 @@ class ffEncoder(nn.Module):
         x = T(x, self.device)
         if debug:
             print(f"ffEncoder after T: x {x}")
-        interlist = []
-        interlist.append(x)
-        for layer in self.encoder:
-            # print(f"ffEncoder: layer {layer.weight.dtype}")
-            x = self.activation(layer(x))
+        if debug:
+            interlist = []
             interlist.append(x)
+        for layer in self.encoder:
+            if layer == self.encoder[0]:
+                x = self.activation(self.dropout(layer(x)))
+            else:
+                x = self.activation(layer(x))
+            if debug:
+                interlist.append(x)
         # if x contains nan, print the intermediate list and encoder weights
         if torch.isnan(x).any():
             print(f"Intermediate list: {interlist}")
@@ -124,17 +130,16 @@ class MixedActor(nn.Module):
 
         if encoder is None and len(hidden_dims) > 0:
             self.encoder = ffEncoder(
-                obs_dim, hidden_dims, device=device, activation=activation
+                obs_dim, hidden_dims, device=device, activation=activation, dropout=0
             )
 
         assert not (
             continuous_action_dim is None and discrete_action_dims is None
         ), "At least one action dim should be provided"
-        assert len(max_actions) == len(discrete_action_dims) and len(
-            min_actions
-        ) == len(
-            discrete_action_dims
-        ), "max_actions should be provided for each discrete action dim"
+        assert (
+            len(max_actions) == continuous_action_dim
+            and len(min_actions) == continuous_action_dim
+        ), f"max_actions should be provided for each continuous action dim {len(max_actions)},{continuous_action_dim}"
 
         # print(
         #    f"Min actions: {min_actions}, max actions: {max_actions}, torch {torch.from_numpy(max_actions - min_actions)}"

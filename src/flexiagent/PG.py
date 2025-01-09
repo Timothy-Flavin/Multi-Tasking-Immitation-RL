@@ -15,7 +15,7 @@ class PG(Agent, nn.Module):
         max_actions=None,
         min_actions=None,
         discrete_action_dims=None,
-        lr=2.5e-4,
+        lr=2.5e-3,
         gamma=0.99,
         n_epochs=2,
         device="cpu",
@@ -27,6 +27,7 @@ class PG(Agent, nn.Module):
         advantage_type="gae",
         norm_advantages=False,
         mini_batch_size=64,
+        anneal_lr=200000,
     ):
         super(PG, self).__init__()
         assert (
@@ -66,22 +67,27 @@ class PG(Agent, nn.Module):
             hidden_dims=hidden_dims,
             device=device,
             orthogonal_init=True,
-            activation="tanh",
+            activation=activation,
         )
 
         self.critic = ValueS(
             obs_dim=obs_dim,
-            hidden_dim=256,
+            hidden_dim=hidden_dims[0],
             device=self.device,
             orthogonal_init=True,
-            activation="tanh",
+            activation=activation,
         )
         self.actor_logstd = torch.nn.Parameter(
             torch.zeros(1, continuous_action_dim), requires_grad=True
         ).to(device)
-        print(self.actor_logstd)
+        # print(self.actor_logstd)
         self.total_params = self.parameters()
-        self.optimizer = torch.optim.AdamW(self.total_params, lr=lr)
+
+        self.optimizer = torch.optim.Adam(self.total_params, lr=lr)
+        self.g_mean = 0
+        self.steps = 0
+        self.anneal_lr = anneal_lr
+        self.lr = lr
         # self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=lr_critic)
 
     def _sample_multi_discrete(
@@ -97,8 +103,13 @@ class PG(Agent, nn.Module):
             device=self.device,
         )
         for i in range(len(self.discrete_action_dims)):
+            # print(f"logits: {logits}")
             dist = Categorical(logits=logits[i])
             actions[i] = dist.sample()
+            # print(f"act: {actions[i]}")
+            # print(
+            #    f"logprob: {dist.log_prob(actions[i])}, {torch.log(logits[i][actions[i]])}"
+            # )
             log_probs[i] = dist.log_prob(actions[i])
         return actions, log_probs
 
@@ -113,6 +124,14 @@ class PG(Agent, nn.Module):
         if debug:
             print(f"  After tensor check: Observations{observations}")
         # print(f"Observations: {observations.shape} {observations}")
+
+        if step:
+            self.steps += 1
+        if self.anneal_lr > 0:
+            frac = max(1.0 - (self.steps - 1.0) / self.anneal_lr, 0.001)
+            lrnow = frac * self.lr
+            self.optimizer.param_groups[0]["lr"] = lrnow
+
         with torch.no_grad():
             continuous_logits, discrete_logits = self.actor(
                 x=observations, action_mask=action_mask, gumbel=False, debug=False
@@ -124,30 +143,41 @@ class PG(Agent, nn.Module):
             print(
                 f" Expanding actor logstd {self.actor_logstd.squeeze(0)}, {continuous_logits}"
             )
+        continuous_actions, continuous_log_probs = None, None
         try:
-            # action_logstd = self.actor_logstd
-            action_std = torch.exp(self.actor_logstd.squeeze(0))
-            continuous_dist = torch.distributions.Normal(
-                loc=continuous_logits,
-                scale=action_std,
-            )
+            if self.continuous_action_dim > 0:
+                # action_logstd = self.actor_logstd
+                action_std = torch.exp(self.actor_logstd.squeeze(0))
+                continuous_dist = torch.distributions.Normal(
+                    loc=continuous_logits,
+                    scale=action_std,
+                )
+                continuous_actions = continuous_dist.sample()
+                continuous_log_probs = (
+                    continuous_dist.log_prob(continuous_actions).detach().cpu().numpy()
+                )
+                continuous_actions = continuous_actions.detach().cpu().numpy()
         except Exception as e:
             print(
                 f"bad stuff, {continuous_logits}, {discrete_logits}, {observations}, {action_mask} {e}"
             )
             exit()
 
-        discrete_actions, discrete_log_probs = self._sample_multi_discrete(
-            discrete_logits
-        )
-        continuous_actions = continuous_dist.sample()
-        continuous_log_probs = continuous_dist.log_prob(continuous_actions)
+        discrete_actions, discrete_log_probs = None, None
+        if self.discrete_action_dims is not None:
+            # print(f"obs: {observations}")
+            discrete_actions, discrete_log_probs = self._sample_multi_discrete(
+                discrete_logits
+            )
+            discrete_actions = discrete_actions.detach().cpu().numpy()
+            discrete_log_probs = discrete_log_probs.detach().cpu().numpy()
+
         vals = 0  # self.critic(observations)
         return (
-            discrete_actions.detach().cpu().numpy(),
-            continuous_actions.detach().cpu().numpy(),
-            discrete_log_probs.detach().cpu().numpy(),
-            continuous_log_probs.detach().cpu().numpy(),
+            discrete_actions,
+            continuous_actions,
+            discrete_log_probs,
+            continuous_log_probs,
             0,  # vals.detach().cpu().numpy(), TODO: re-enable this when flexibuff is done
         )
 
@@ -260,6 +290,7 @@ class PG(Agent, nn.Module):
         G = torch.zeros_like(batch.global_rewards).to(self.device)
         G[-1] = batch.global_rewards[-1]
         if batch.terminated[-1] < 0.5:
+            # print("oops")
             G[-1] += self.gamma * self.critic(batch.obs[agent_num][-1]).squeeze(-1)
 
         for i in range(len(batch.global_rewards) - 2, -1, -1):
@@ -307,6 +338,16 @@ class PG(Agent, nn.Module):
         G = td + old_values
         return G.unsqueeze(-1), td.unsqueeze(-1)
 
+    def _print_grad_norm(self):
+        total_norm = 0
+        for p in self.parameters():
+            if p is None or p.grad is None:
+                continue
+            param_norm = p.grad.data.norm(2)
+            total_norm += param_norm.item() ** 2
+        total_norm = total_norm ** (1.0 / 2)
+        print(total_norm)
+
     def reinforcement_learn(
         self,
         batch: FlexiBatch,
@@ -331,16 +372,19 @@ class PG(Agent, nn.Module):
                 G, advantages = self._td(batch, agent_num)
             elif self.advantage_type == "constant":
                 G = self._G(batch, agent_num)
-                advantages = G - G.mean()
+                self.g_mean = 0.9 * self.g_mean + 0.1 * G.mean()
+                advantages = G - self.g_mean
             elif self.advantage_type == "g":
                 G = self._G(batch, agent_num)
                 advantages = G
+
             else:
                 raise ValueError("Invalid advantage type")
             if self.norm_advantages:
                 advantages = (advantages - advantages.mean()) / (
                     advantages.std() + 1e-8
                 )
+                # print(advantages.squeeze(-1))
             if debug:
                 print(f"  batch rewards: {batch.global_rewards}")
                 print(f"  raw critic: {self.critic(batch.obs[agent_num])}")
@@ -367,11 +411,14 @@ class PG(Agent, nn.Module):
         for epoch in range(self.n_epochs):
             if debug:
                 print("  Starting epoch", epoch)
-            for bstart in range(0, bsize, self.mini_batch_size):
-                # Get Critic Loss
-                bend = bstart + self.mini_batch_size
-                indices = mini_batch_indices[bstart:bend]
+            bnum = 0
 
+            while bsize * bnum < self.mini_batch_size:
+                # Get Critic Loss
+                bstart = bsize * bnum
+                bend = min(bstart + self.mini_batch_size, self.mini_batch_size - 1)
+                indices = mini_batch_indices[bstart:bend]
+                bnum += 1
                 if debug:
                     print(
                         f"    Mini batch: {bstart}:{bend}, Indices: {indices}, {len(indices)}"
@@ -386,12 +433,13 @@ class PG(Agent, nn.Module):
                 critic_loss = 0.5 * ((V_current - G[indices]) ** 2).mean()
 
                 if not critic_only:
+
+                    actor_loss = 0
                     cont_probs, disc_probs = self.actor(
                         batch.obs[agent_num, indices],
                         action_mask=action_mask,  # TODO fix action mask by indices
+                        gumbel=False,
                     )
-                    actor_loss = 0
-
                     if self.continuous_action_dim > 0:
                         if debug:
                             print(f"    cont probs: {cont_probs.shape}")
@@ -422,54 +470,87 @@ class PG(Agent, nn.Module):
                             + self.entropy_loss * continuous_dist.entropy().mean()
                         )
 
-                    for head in range(len(self.discrete_action_dims)):
-                        if debug:
-                            print(f"    Discrete head: {head}")
-                            print(f"    disc_probs: {disc_probs[head]}")
-                            print(
-                                f"    batch.discrete_actions: {batch.discrete_actions[agent_num,indices,head]}"
+                    if self.discrete_action_dims is not None:
+                        for head in range(len(self.discrete_action_dims)):
+                            if debug:
+                                print(f"    Discrete head: {head}")
+                                print(f"    disc_probs: {disc_probs[head]}")
+                                print(
+                                    f"    batch.discrete_actions: {batch.discrete_actions[agent_num,indices,head]}"
+                                )
+                            probs: torch.Tensor = disc_probs[head]  # Categorical()
+                            dist = Categorical(probs=probs)
+                            entropy = dist.entropy().mean()
+                            # print(probs)
+                            # print(batch.discrete_actions[agent_num, indices, head])
+                            selectedprobs = probs.gather(
+                                -1,
+                                batch.discrete_actions[
+                                    agent_num, indices, head
+                                ].unsqueeze(-1),
                             )
-                        probs = disc_probs[head]  # Categorical()
-                        dist = Categorical(probs=probs)
-                        entropy = dist.entropy().mean()
-                        selected_log_probs = dist.log_prob(
-                            batch.discrete_actions[agent_num, indices, head]
-                        )
 
-                        if debug:
-                            print(f"    selected log probs{selected_log_probs}")
+                            selected_log_probs = dist.log_prob(
+                                batch.discrete_actions[agent_num, indices, head]
+                            )
+                            # cont_probs, disc_probs = self.actor(
+                            #    batch.obs[agent_num, indices],
+                            #    action_mask=action_mask,  # TODO fix action mask by indices
+                            #    gumbel=False,
+                            # )
+                            # print(f"probs {probs}")
+                            # print(f"cont_probs {probs-disc_probs[head]}")
+                            # exit()
+                            # print(
+                            #    f"actions {batch.discrete_actions[agent_num, indices, head]}"
+                            # )
+                            # print(f"selected probs {selectedprobs}")
+                            # print(torch.log(selectedprobs).squeeze(-1))
+                            # print(f"log {selected_log_probs}")
+                            # print(advantages[indices])
 
-                        discrete_policy_gradient = (
-                            -selected_log_probs * advantages[indices]
-                        )
+                            if debug:
+                                print(f"    selected log probs{selected_log_probs}")
 
-                        actor_loss += (
-                            self.policy_loss * discrete_policy_gradient.mean()
-                            - self.entropy_loss * entropy
-                        )
+                            discrete_policy_gradient = -selected_log_probs * advantages[
+                                indices
+                            ].squeeze(-1)
+                            # print(discrete_policy_gradient)
+                            # print(f"obs: {batch.obs[agent_num]}")
+                            # input()
+                            # exit()
+
+                            actor_loss += (
+                                self.policy_loss * discrete_policy_gradient.mean()
+                                - self.entropy_loss * entropy
+                            )
 
                     self.optimizer.zero_grad()
                     loss = actor_loss + critic_loss * self.critic_loss_coef
                     loss.backward()
-                    try:
-                        torch.nn.utils.clip_grad_norm_(
-                            self.total_params, 0.5, error_if_nonfinite=True
-                        )
-                    except Exception as e:
-                        print(f"Error in clipping {e}")
-                        print(actor_loss.item(), critic_loss.item())
-                        print(
-                            f"surr1: {discrete_policy_gradient}, {continuous_policy_gradient}"
-                        )
-                        print(disc_probs)
-                        paramvec = torch.nn.utils.parameters_to_vector(
-                            self.total_params
-                        )
-                        print(max(paramvec), min(paramvec), torch.linalg.norm(paramvec))
-                        print("paramvec", paramvec.isnan().sum())
-                        print("loss", loss.isnan().sum())
-                        print("entropy", entropy.isnan().sum())
-                        # exit()
+                    total_norm = 0
+
+                    torch.nn.utils.clip_grad_norm_(
+                        self.parameters(), 1.0, error_if_nonfinite=True, foreach=True
+                    )
+
+                    # try:
+                    #
+                    # except Exception as e:
+                    #     print(f"Error in clipping {e}")
+                    #     print(actor_loss.item(), critic_loss.item())
+                    #     print(
+                    #         f"surr1: {discrete_policy_gradient}, {continuous_policy_gradient}"
+                    #     )
+                    #     print(disc_probs)
+                    #     paramvec = torch.nn.utils.parameters_to_vector(
+                    #         self.total_params
+                    #     )
+                    #     print(max(paramvec), min(paramvec), torch.linalg.norm(paramvec))
+                    #     print("paramvec", paramvec.isnan().sum())
+                    #     print("loss", loss.isnan().sum())
+                    #     print("entropy", entropy.isnan().sum())
+                    #     # exit()
                     self.optimizer.step()
 
                     avg_actor_loss += actor_loss.item()

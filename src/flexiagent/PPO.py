@@ -42,7 +42,7 @@ class PPO(Agent):
 
         self.actor = MixedActor(
             obs_dim=obs_dim,
-            continuous_action_dim=continuous_action_dim * 2,
+            continuous_action_dim=continuous_action_dim,
             discrete_action_dims=discrete_action_dims,
             max_actions=max_actions,
             min_actions=min_actions,
