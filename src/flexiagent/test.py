@@ -115,7 +115,7 @@ def test_single_env(
         aloss_return.append(m_aloss)
         closs_return.append(m_closs)
         rewards.append(ep_reward)
-        er = 10
+        er = 100
         if episode % er == 0 and episode > 1:
             print(
                 f"n_ep: {episode} r: {sum(rewards[-10:])/10}, step: {step}, best: {max(rewards[-10:])} m_aloss: {m_aloss}, m_closs: {m_closs}"
@@ -251,14 +251,16 @@ if __name__ == "__main__":
                 max_actions=continuous_env.action_space.high,
                 gamma=0.99,
                 device="cuda",
-                entropy_loss=0.01,
-                mini_batch_size=128,
-                n_epochs=1,
-                lr=0.01,
-                advantage_type="gv",
+                entropy_loss=0.0,
+                mini_batch_size=32,
+                n_epochs=4,
+                lr=3e-4,
+                advantage_type="gae",
                 norm_advantages=True,
                 anneal_lr=2000000,
-                value_loss_coef=0.001,  # 5,
+                value_loss_coef=0.5,  # 5,
+                ppo_clip=0.2,
+                value_clip=0.5,
             ),
             TD3(
                 obs_dim=joint_obs_dim,
