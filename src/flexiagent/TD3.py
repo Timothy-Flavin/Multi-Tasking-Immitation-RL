@@ -54,11 +54,10 @@ class TD3(Agent):
         assert not (
             continuous_action_dim is None and discrete_action_dims is None
         ), "At least one action dim should be provided"
-        assert len(max_actions) == len(discrete_action_dims) and len(
-            min_actions
-        ) == len(
-            discrete_action_dims
-        ), "max_actions should be provided for each discrete action dim"
+        assert (
+            len(max_actions) == continuous_action_dim
+            and len(min_actions) == continuous_action_dim
+        ), "max_actions should be provided for each contin action dim"
 
         self.device = device
         self.total_action_dim = continuous_action_dim + np.sum(

@@ -12,7 +12,7 @@ from torch.distributions import Categorical
 from Agent import MixedActor
 
 env = gym.make("CartPole-v1")
-torch.manual_seed(1)
+torch.manual_seed(10)
 learning_rate = 0.01
 gamma = 0.99
 

@@ -68,8 +68,10 @@ class ffEncoder(nn.Module):
         }
         assert activation in activations, "Invalid activation function"
         self.activation = activations[activation]
+        self.drop = dropout
         self.dropout = nn.Dropout(p=dropout)
         self.encoder = nn.ModuleList()
+        print(obs_dim, hidden_dims)
         for i in range(len(hidden_dims)):
             if i == 0:
                 self.encoder.append(nn.Linear(obs_dim, hidden_dims[i]))
@@ -85,15 +87,16 @@ class ffEncoder(nn.Module):
     def forward(self, x, debug=False):
         if debug:
             print(f"ffEncoder: x {x}")
-        x = T(x, self.device)
+        x = T(x, self.device).float()
         if debug:
             print(f"ffEncoder after T: x {x}")
         if debug:
             interlist = []
             interlist.append(x)
         for layer in self.encoder:
-            if layer == self.encoder[0]:
+            if layer == self.encoder[0] and self.drop > 0:
                 x = self.activation(self.dropout(layer(x)))
+
             else:
                 x = self.activation(layer(x))
             if debug:
@@ -127,7 +130,7 @@ class MixedActor(nn.Module):
 
         self.tau = tau
         self.hard = hard
-
+        print(hidden_dims)
         if encoder is None and len(hidden_dims) > 0:
             self.encoder = ffEncoder(
                 obs_dim, hidden_dims, device=device, activation=activation, dropout=0

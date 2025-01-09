@@ -7,7 +7,7 @@ import numpy as np
 import torch.nn as nn
 
 
-class PG(Agent, nn.Module):
+class PG(nn.Module, Agent):
     def __init__(
         self,
         obs_dim,
@@ -55,7 +55,7 @@ class PG(Agent, nn.Module):
         self.norm_advantages = norm_advantages
 
         self.policy_loss = 1
-        self.critic_loss_coef = 1
+        self.critic_loss_coef = value_loss_coef
         self.entropy_loss = entropy_loss
 
         self.actor = MixedActor(
@@ -77,13 +77,16 @@ class PG(Agent, nn.Module):
             orthogonal_init=True,
             activation=activation,
         )
-        self.actor_logstd = torch.nn.Parameter(
+        self.actor_logstd = nn.Parameter(
             torch.zeros(1, continuous_action_dim), requires_grad=True
         ).to(device)
         # print(self.actor_logstd)
-        self.total_params = self.parameters()
+        self.actor_logstd.retain_grad()
+        # print(self.actor_logstd.grad)
 
-        self.optimizer = torch.optim.Adam(self.total_params, lr=lr)
+        self.optimizer = torch.optim.Adam(
+            list(self.parameters()) + [self.actor_logstd], lr=lr
+        )
         self.g_mean = 0
         self.steps = 0
         self.anneal_lr = anneal_lr
@@ -290,8 +293,7 @@ class PG(Agent, nn.Module):
         G = torch.zeros_like(batch.global_rewards).to(self.device)
         G[-1] = batch.global_rewards[-1]
         if batch.terminated[-1] < 0.5:
-            # print("oops")
-            G[-1] += self.gamma * self.critic(batch.obs[agent_num][-1]).squeeze(-1)
+            G[-1] = self.gamma * self.critic(batch.obs[agent_num][-1]).squeeze(-1)
 
         for i in range(len(batch.global_rewards) - 2, -1, -1):
             G[i] = batch.global_rewards[i] + self.gamma * G[i + 1] * (
@@ -399,6 +401,8 @@ class PG(Agent, nn.Module):
             action_mask = batch.action_mask[agent_num]  # TODO: Unit test this later
 
         bsize = len(batch.global_rewards)
+        # print(bsize)
+        # print(self.mini_batch_size)
         nbatch = bsize // self.mini_batch_size
         mini_batch_indices = np.arange(len(batch.global_rewards))
         np.random.shuffle(mini_batch_indices)
@@ -453,6 +457,8 @@ class PG(Agent, nn.Module):
                             loc=cont_probs,
                             scale=torch.exp(self.actor_logstd.expand_as(cont_probs)),
                         )
+                        # print(cont_probs)
+
                         continuous_log_probs = continuous_dist.log_prob(
                             batch.continuous_actions[agent_num, indices]
                         )
@@ -464,7 +470,7 @@ class PG(Agent, nn.Module):
                             print(
                                 f"    continuous_policy_gradient: {continuous_policy_gradient}"
                             )
-
+                        # print(continuous_policy_gradient)
                         actor_loss += (
                             -self.policy_loss * continuous_policy_gradient.mean()
                             + self.entropy_loss * continuous_dist.entropy().mean()
@@ -520,14 +526,23 @@ class PG(Agent, nn.Module):
                             # input()
                             # exit()
 
-                            actor_loss += (
-                                self.policy_loss * discrete_policy_gradient.mean()
-                                - self.entropy_loss * entropy
-                            )
+                            # actor_loss += (
+                            #    self.policy_loss * discrete_policy_gradient.mean()
+                            #    - self.entropy_loss * entropy
+                            # )
 
+                    # print("actor")
+                    # self.optimizer.zero_grad()
+                    # loss = actor_loss
+                    # loss.backward()
+                    # self._print_grad_norm()
+                    # print("critic")
                     self.optimizer.zero_grad()
                     loss = actor_loss + critic_loss * self.critic_loss_coef
                     loss.backward()
+                    # print(self.actor_logstd)
+                    # print(self.actor_logstd.grad)
+                    # self._print_grad_norm()
                     total_norm = 0
 
                     torch.nn.utils.clip_grad_norm_(
