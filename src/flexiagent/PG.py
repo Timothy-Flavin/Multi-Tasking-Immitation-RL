@@ -26,9 +26,11 @@ class PG(nn.Module, Agent):
         value_loss_coef=0.5,
         value_clip=0.5,
         advantage_type="gae",
-        norm_advantages=False,
+        norm_advantages=True,
         mini_batch_size=64,
         anneal_lr=200000,
+        orthogonal=True,
+        starting_actorlogstd=0,
     ):
         super(PG, self).__init__()
         assert (
@@ -68,7 +70,7 @@ class PG(nn.Module, Agent):
             min_actions=min_actions,
             hidden_dims=hidden_dims,
             device=device,
-            orthogonal_init=True,
+            orthogonal_init=orthogonal,
             activation=activation,
         )
 
@@ -76,12 +78,15 @@ class PG(nn.Module, Agent):
             obs_dim=obs_dim,
             hidden_dim=hidden_dims[0],
             device=self.device,
-            orthogonal_init=True,
+            orthogonal_init=orthogonal,
             activation=activation,
         )
-        self.actor_logstd = nn.Parameter(
-            torch.zeros(1, continuous_action_dim), requires_grad=True
-        ).to(device)
+        self.actor_logstd = (
+            nn.Parameter(torch.zeros(1, continuous_action_dim), requires_grad=True).to(
+                device
+            )
+            + starting_actorlogstd
+        )
         # print(self.actor_logstd)
         self.actor_logstd.retain_grad()
         # print(self.actor_logstd.grad)
@@ -295,7 +300,10 @@ class PG(nn.Module, Agent):
         G = torch.zeros_like(batch.global_rewards).to(self.device)
         G[-1] = batch.global_rewards[-1]
         if batch.terminated[-1] < 0.5:
-            G[-1] = self.gamma * self.critic(batch.obs[agent_num][-1]).squeeze(-1)
+            if self.advantage_type == "constant":
+                G[-1] = self.gamma * self.g_mean
+            else:
+                G[-1] = self.gamma * self.critic(batch.obs[agent_num][-1]).squeeze(-1)
 
         for i in range(len(batch.global_rewards) - 2, -1, -1):
             G[i] = batch.global_rewards[i] + self.gamma * G[i + 1] * (
@@ -328,7 +336,7 @@ class PG(nn.Module, Agent):
 
     def _td(self, batch, agent_num):
         reward_arr = batch.global_rewards
-        with torch.no_grad():
+        with torch.no_grad():  # If last obs is non terminal critic to not bias it
             old_values = self.critic(batch.obs[agent_num]).squeeze(-1)
 
         td = torch.zeros_like(reward_arr).to(self.device)
@@ -458,13 +466,11 @@ class PG(nn.Module, Agent):
                             )
                             print(f"    advantages: {mb_adv[indices]}")
                         # input("what is up with continuous probabilities")
-                        cont_probs = cont_probs
                         continuous_dist = torch.distributions.Normal(
                             loc=cont_probs,
                             scale=torch.exp(self.actor_logstd.expand_as(cont_probs)),
                         )
-                        # print(cont_probs)
-
+                        # print(batch.continuous_actions[agent_num, indices])
                         continuous_log_probs = continuous_dist.log_prob(
                             batch.continuous_actions[agent_num, indices]
                         )
@@ -474,14 +480,14 @@ class PG(nn.Module, Agent):
                                 continuous_log_probs
                                 - batch.continuous_log_probs[agent_num, indices]
                             )
+
                             ratio = logratio.exp()
+
                             pg_loss1 = mb_adv * ratio
                             pg_loss2 = mb_adv * torch.clamp(
                                 ratio, 1 - self.ppo_clip, 1 + self.ppo_clip
                             )
-                            continuous_policy_gradient = torch.min(
-                                pg_loss1, pg_loss2
-                            ).mean()
+                            continuous_policy_gradient = torch.min(pg_loss1, pg_loss2)
 
                         else:
                             continuous_policy_gradient = continuous_log_probs * mb_adv
@@ -496,6 +502,8 @@ class PG(nn.Module, Agent):
                             -self.policy_loss * continuous_policy_gradient.mean()
                             + self.entropy_loss * continuous_dist.entropy().mean()
                         )
+                        print(self.actor_logstd.exp())
+                        print(continuous_dist.loc.mean())
 
                     if self.discrete_action_dims is not None:
                         for head in range(len(self.discrete_action_dims)):
@@ -538,24 +546,24 @@ class PG(nn.Module, Agent):
 
                             if debug:
                                 print(f"    selected log probs{selected_log_probs}")
-                            print(f" slect lp: {selected_log_probs}")
-                            print(f" adv: {mb_adv.squeeze(-1)}")
+                            # print(f" slect lp: {selected_log_probs}")
+                            # print(f" adv: {mb_adv.squeeze(-1)}")
 
                             if self.ppo_clip > 0:
-                                print(selected_log_probs)
-                                print(
-                                    batch.discrete_log_probs[agent_num, indices, head]
-                                )
+                                # print(selected_log_probs)
+                                # print(
+                                #    batch.discrete_log_probs[agent_num, indices, head]
+                                # )
 
                                 logratio = (
                                     selected_log_probs
                                     - batch.discrete_log_probs[agent_num, indices, head]
                                 )
                                 ratio = logratio.exp()
-                                print(ratio)
-                                input("?????")
-                                pg_loss1 = mb_adv * ratio
-                                pg_loss2 = mb_adv * torch.clamp(
+                                # print(ratio)
+                                # input("?????")
+                                pg_loss1 = mb_adv.squeeze(-1) * ratio
+                                pg_loss2 = mb_adv.squeeze(-1) * torch.clamp(
                                     ratio, 1 - self.ppo_clip, 1 + self.ppo_clip
                                 )
                                 discrete_policy_gradient = torch.min(

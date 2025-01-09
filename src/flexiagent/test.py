@@ -11,7 +11,7 @@ import torch
 
 
 gym_disc_env = "CartPole-v1"
-gym_cont_env = "HalfCheetah-v4"
+gym_cont_env = "Pendulum-v1"  # "HalfCheetah-v4"
 
 
 def test_single_env(
@@ -86,7 +86,7 @@ def test_single_env(
             ) or (
                 # and len(buffer.episode_inds) > 5
                 online
-                and buffer.steps_recorded > 255
+                and buffer.steps_recorded > 2047
             ):
                 # print(online)
                 if online:
@@ -115,7 +115,7 @@ def test_single_env(
         aloss_return.append(m_aloss)
         closs_return.append(m_closs)
         rewards.append(ep_reward)
-        er = 100
+        er = 10
         if episode % er == 0 and episode > 1:
             print(
                 f"n_ep: {episode} r: {sum(rewards[-10:])/10}, step: {step}, best: {max(rewards[-10:])} m_aloss: {m_aloss}, m_closs: {m_closs}"
@@ -123,11 +123,13 @@ def test_single_env(
             # print(f"lr: {agent.optimizer.param_groups[0]["lr"]}, G: {agent.g_mean}")
             # plt.plot(rewards)
             # plt.show()
-            if episode % (er * 5) == 0:
+            if episode % er == 0:
+                print("human animating")
                 env = gym.make(
                     gym_disc_env if discrete else gym_cont_env, render_mode="human"
                 )
-        if episode % (er) == 1 and episode > 1:
+        if episode % er == 1 and episode > 1:
+            print("no more human")
             env.close()
             env = gym.make(id=gym_disc_env if discrete else gym_cont_env)
         # env = gym.make("CartPole-v1")
@@ -251,16 +253,19 @@ if __name__ == "__main__":
                 max_actions=continuous_env.action_space.high,
                 gamma=0.99,
                 device="cuda",
-                entropy_loss=0.0,
-                mini_batch_size=32,
-                n_epochs=4,
-                lr=3e-4,
-                advantage_type="gae",
-                norm_advantages=True,
+                entropy_loss=0,
+                mini_batch_size=64,
+                n_epochs=5,
+                lr=0.1,
+                advantage_type="constant",
+                norm_advantages=False,
                 anneal_lr=2000000,
-                value_loss_coef=0.5,  # 5,
-                ppo_clip=0.2,
+                value_loss_coef=0.1,  # 5,
+                ppo_clip=0.1,
                 value_clip=0.5,
+                orthogonal=True,
+                activation="tanh",
+                starting_actorlogstd=0,
             ),
             TD3(
                 obs_dim=joint_obs_dim,
