@@ -387,6 +387,8 @@ class PG(nn.Module, Agent):
 
     def _td(self, batch, agent_num):
         reward_arr = batch.global_rewards
+        td = torch.zeros_like(reward_arr).to(self.device)
+
         with torch.no_grad():  # If last obs is non terminal critic to not bias it
             old_values = self.critic(batch.obs[agent_num]).squeeze(-1)
             td[-1] = (
@@ -395,7 +397,6 @@ class PG(nn.Module, Agent):
                 * batch.terminated[-1]
                 - old_values[-1]
             )
-        td = torch.zeros_like(reward_arr).to(self.device)
 
         for t in range(len(reward_arr) - 1):
             td[t] = (
