@@ -166,3 +166,5 @@ Scripts/
 pyvenv.cfg
 share/
 include/
+sanity.py
+sanity2.py
