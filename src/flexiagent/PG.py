@@ -31,6 +31,8 @@ class PG(nn.Module, Agent):
         anneal_lr=200000,
         orthogonal=True,
         starting_actorlogstd=0,
+        clip_grad=True,
+        gae_lambda=0.95,
     ):
         super(PG, self).__init__()
         assert (
@@ -38,6 +40,7 @@ class PG(nn.Module, Agent):
         ), "At least one action dim should be provided"
         self.ppo_clip = ppo_clip
         self.value_clip = value_clip
+        self.gae_lambda = gae_lambda
         self.value_loss_coef = value_loss_coef
         self.mini_batch_size = mini_batch_size
         assert advantage_type.lower() in [
@@ -48,7 +51,7 @@ class PG(nn.Module, Agent):
             "g",
         ], "Invalid advantage type"
         self.advantage_type = advantage_type
-        self.gae_lambda = 0.95
+        self.clip_grad = clip_grad
         self.device = device
         self.gamma = gamma
         self.obs_dim = obs_dim
@@ -58,7 +61,7 @@ class PG(nn.Module, Agent):
         self.activation = activation
         self.norm_advantages = norm_advantages
 
-        self.policy_loss = 1
+        self.policy_loss = 5.0
         self.critic_loss_coef = value_loss_coef
         self.entropy_loss = entropy_loss
 
@@ -114,13 +117,14 @@ class PG(nn.Module, Agent):
         )
         for i in range(len(self.discrete_action_dims)):
             # print(f"logits: {logits}")
-            dist = Categorical(logits=logits[i])
+            dist = Categorical(probs=logits[i])
             actions[i] = dist.sample()
             # print(f"act: {actions[i]}")
             # print(
             #    f"logprob: {dist.log_prob(actions[i])}, {torch.log(logits[i][actions[i]])}"
             # )
             log_probs[i] = dist.log_prob(actions[i])
+            # print(dist)
         return actions, log_probs
 
     def train_actions(self, observations, action_mask=None, step=False, debug=False):
@@ -176,9 +180,17 @@ class PG(nn.Module, Agent):
         discrete_actions, discrete_log_probs = None, None
         if self.discrete_action_dims is not None:
             # print(f"obs: {observations}")
+
             discrete_actions, discrete_log_probs = self._sample_multi_discrete(
                 discrete_logits
             )
+            # print(
+            #     "Logit, act, logprob",
+            #     discrete_logits,
+            #     discrete_actions,
+            #     discrete_log_probs,
+            # )
+            # print(torch.log(discrete_logits[0][discrete_actions[0]]))
             discrete_actions = discrete_actions.detach().cpu().numpy()
             discrete_log_probs = discrete_log_probs.detach().cpu().numpy()
 
@@ -303,7 +315,7 @@ class PG(nn.Module, Agent):
             if self.advantage_type == "constant":
                 G[-1] = self.gamma * self.g_mean
             else:
-                G[-1] = self.gamma * self.critic(batch.obs[agent_num][-1]).squeeze(-1)
+                G[-1] = self.gamma * self.critic(batch.obs_[agent_num][-1]).squeeze(-1)
 
         for i in range(len(batch.global_rewards) - 2, -1, -1):
             G[i] = batch.global_rewards[i] + self.gamma * G[i + 1] * (
@@ -314,31 +326,75 @@ class PG(nn.Module, Agent):
 
     def _gae(self, batch, agent_num):
         with torch.no_grad():
-            values = self.critic(batch.obs[agent_num]).squeeze(-1)
-            num_steps = batch.global_rewards.shape[0]
+            # values = self.critic(batch.obs[agent_num]).squeeze(-1)
+            # num_steps = batch.global_rewards.shape[0]
+            # advantages = torch.zeros_like(batch.global_rewards).to(self.device)
+            # lastgaelam = 0
+            # advantages[-1] = (  # bootstrap advantage for last timestep
+            #     self.gamma
+            #     * self.critic(batch.obs_[agent_num, -1]).squeeze(-1)
+            #     * batch.terminated[-1]
+            #     - values[-1]
+            # )
+            # print(advantages)
+            # for t in reversed(range(num_steps - 1)):
+            #     nextnonterminal = 1.0 - batch.terminated[t + 1]
+            #     nextvalues = values[t + 1]
+            #     delta = (
+            #         batch.global_rewards[t]
+            #         + self.gamma * nextvalues * nextnonterminal
+            #         - values[t]
+            #     )
+            #     if t > num_steps - 10:
+            #         print(delta)
+            #     advantages[t] = lastgaelam = (
+            #         delta + self.gamma * self.gae_lambda * nextnonterminal * lastgaelam
+            #     )
+            # G = advantages + values
+
+            # print(f"old: advantages {advantages} and G {G}")
             advantages = torch.zeros_like(batch.global_rewards).to(self.device)
-            lastgaelam = 0
-            for t in reversed(range(num_steps - 1)):
-                nextnonterminal = 1.0 - batch.terminated[t + 1]
-                nextvalues = values[t + 1]
+            num_steps = batch.global_rewards.shape[0]
+            last_values = self.critic(batch.obs_[agent_num, -1]).squeeze(-1)
+            values = self.critic(batch.obs[agent_num]).squeeze(-1)
+
+            last_gae_lam = 0
+            for step in reversed(range(num_steps)):
+                if step == num_steps - 1:
+                    next_non_terminal = 1.0 - batch.terminated[-1]
+                    next_values = last_values
+                else:
+                    next_non_terminal = 1.0 - batch.terminated[step]
+                    next_values = values[step + 1]
                 delta = (
-                    batch.global_rewards[t]
-                    + self.gamma * nextvalues * nextnonterminal
-                    - values[t]
+                    batch.global_rewards[step]
+                    + self.gamma * next_values * next_non_terminal
+                    - values[step]
                 )
-                # print(delta)
-                advantages[t] = lastgaelam = (
-                    delta + self.gamma * self.gae_lambda * nextnonterminal * lastgaelam
+                last_gae_lam = (
+                    delta
+                    + self.gamma * self.gae_lambda * next_non_terminal * last_gae_lam
                 )
-        #
-        G = advantages + values
+                advantages[step] = last_gae_lam
+            # TD(lambda) estimator, see Github PR #375 or "Telescoping in TD(lambda)"
+            # in David Silver Lecture 4: https://www.youtube.com/watch?v=PnHCvfgC_ZA
+            #
+            G = advantages + values
+
+            # print(f"new: advantages {advantages} and G {G}")
+            # input()
         return G.unsqueeze(-1), advantages.unsqueeze(-1)
 
     def _td(self, batch, agent_num):
         reward_arr = batch.global_rewards
         with torch.no_grad():  # If last obs is non terminal critic to not bias it
             old_values = self.critic(batch.obs[agent_num]).squeeze(-1)
-
+            td[-1] = (
+                self.gamma
+                * self.critic(batch.obs_[agent_num, -1]).squeeze(-1)
+                * batch.terminated[-1]
+                - old_values[-1]
+            )
         td = torch.zeros_like(reward_arr).to(self.device)
 
         for t in range(len(reward_arr) - 1):
@@ -347,6 +403,7 @@ class PG(nn.Module, Agent):
                 + self.gamma * old_values[t + 1] * (1 - batch.terminated[t])
                 - old_values[t]
             )
+
         G = td + old_values
         return G.unsqueeze(-1), td.unsqueeze(-1)
 
@@ -399,7 +456,8 @@ class PG(nn.Module, Agent):
                 print(f"  raw critic: {self.critic(batch.obs[agent_num])}")
                 print(f"  Advantages: {advantages}")
                 print(f"  G: {G}")
-
+        if self.norm_advantages:
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         avg_actor_loss = 0
         avg_critic_loss = 0
         # Update the actor
@@ -412,7 +470,7 @@ class PG(nn.Module, Agent):
         # print(self.mini_batch_size)
         nbatch = bsize // self.mini_batch_size
         mini_batch_indices = np.arange(len(batch.global_rewards))
-        np.random.shuffle(mini_batch_indices)
+        # np.random.shuffle(mini_batch_indices)
 
         if debug:
             print(
@@ -428,11 +486,14 @@ class PG(nn.Module, Agent):
                 print("  Starting epoch", epoch)
             bnum = 0
 
-            while bsize * bnum < self.mini_batch_size:
+            while self.mini_batch_size * bnum < bsize:
                 # Get Critic Loss
-                bstart = bsize * bnum
-                bend = min(bstart + self.mini_batch_size, self.mini_batch_size - 1)
+                bstart = self.mini_batch_size * bnum
+                bend = min(bstart + self.mini_batch_size, bsize - 1)
                 indices = mini_batch_indices[bstart:bend]
+                # print(indices)
+                # print(bstart, bend)
+                # input()
                 bnum += 1
                 if debug:
                     print(
@@ -445,12 +506,14 @@ class PG(nn.Module, Agent):
                         f"    V_current: {V_current.shape}, G[indices] {G[indices].shape}"
                     )
                     input()
+                # print(V_current)
+                # print(G[indices])
+                # print(V_current - G[indices])
+                # input()
                 critic_loss = 0.5 * ((V_current - G[indices]) ** 2).mean()
-
+                # print(torch.abs(V_current - G[indices]).mean())
                 if not critic_only:
                     mb_adv = advantages[indices]
-                    if self.norm_advantages:
-                        mb_adv = (mb_adv - mb_adv.mean()) / (mb_adv.std() + 1e-8)
 
                     actor_loss = 0
                     cont_probs, disc_probs = self.actor(
@@ -500,10 +563,10 @@ class PG(nn.Module, Agent):
                         # print(continuous_policy_gradient)
                         actor_loss += (
                             -self.policy_loss * continuous_policy_gradient.mean()
-                            + self.entropy_loss * continuous_dist.entropy().mean()
+                            - self.entropy_loss * continuous_dist.entropy().mean()
                         )
-                        print(self.actor_logstd.exp())
-                        print(continuous_dist.loc.mean())
+                        # print(self.actor_logstd.exp())
+                        # print(continuous_dist.loc.mean())
 
                     if self.discrete_action_dims is not None:
                         for head in range(len(self.discrete_action_dims)):
@@ -523,11 +586,13 @@ class PG(nn.Module, Agent):
                             #     batch.discrete_actions[
                             #         agent_num, indices, head
                             #     ].unsqueeze(-1),
-                            # )
+                            # ).squeeze(-1)
+                            # print(selectedprobs)
 
                             selected_log_probs = dist.log_prob(
                                 batch.discrete_actions[agent_num, indices, head]
                             )
+
                             # cont_probs, disc_probs = self.actor(
                             #    batch.obs[agent_num, indices],
                             #    action_mask=action_mask,  # TODO fix action mask by indices
@@ -561,27 +626,28 @@ class PG(nn.Module, Agent):
                                 )
                                 ratio = logratio.exp()
                                 # print(ratio)
+                                # print(
+                                #    f"adv: {mb_adv.squeeze(-1).shape} * r{ratio.shape}"
+                                # )
                                 # input("?????")
                                 pg_loss1 = mb_adv.squeeze(-1) * ratio
                                 pg_loss2 = mb_adv.squeeze(-1) * torch.clamp(
                                     ratio, 1 - self.ppo_clip, 1 + self.ppo_clip
                                 )
-                                discrete_policy_gradient = torch.min(
-                                    pg_loss1, pg_loss2
-                                ).mean()
+                                discrete_policy_gradient = torch.min(pg_loss1, pg_loss2)
                             else:
                                 discrete_policy_gradient = (
-                                    -selected_log_probs * mb_adv.squeeze(-1)
+                                    selected_log_probs * mb_adv.squeeze(-1)
                                 )
                             # print(discrete_policy_gradient)
                             # print(f"obs: {batch.obs[agent_num]}")
                             # input()
                             # exit()
 
-                            # actor_loss += (
-                            #    self.policy_loss * discrete_policy_gradient.mean()
-                            #    - self.entropy_loss * entropy
-                            # )
+                            actor_loss += (
+                                -self.policy_loss * discrete_policy_gradient.mean()
+                                - self.entropy_loss * entropy
+                            )
 
                     # print("actor")
                     # self.optimizer.zero_grad()
@@ -592,14 +658,19 @@ class PG(nn.Module, Agent):
                     self.optimizer.zero_grad()
                     loss = actor_loss + critic_loss * self.critic_loss_coef
                     loss.backward()
+                    # self._print_grad_norm()
                     # print(self.actor_logstd)
                     # print(self.actor_logstd.grad)
                     # self._print_grad_norm()
                     total_norm = 0
 
-                    torch.nn.utils.clip_grad_norm_(
-                        self.parameters(), 0.5, error_if_nonfinite=True, foreach=True
-                    )
+                    if self.clip_grad:
+                        torch.nn.utils.clip_grad_norm_(
+                            self.parameters(),
+                            0.5,
+                            error_if_nonfinite=True,
+                            foreach=True,
+                        )
 
                     # try:
                     #

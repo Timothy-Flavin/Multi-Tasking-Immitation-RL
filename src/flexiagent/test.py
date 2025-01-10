@@ -10,8 +10,8 @@ from PG import PG
 import torch
 
 
-gym_disc_env = "CartPole-v1"
-gym_cont_env = "Pendulum-v1"  # "HalfCheetah-v4"
+gym_disc_env = "LunarLander-v3"  # "CartPole-v1"  #
+gym_cont_env = "LunarLander-v3"  # "Pendulum-v1"  # "HalfCheetah-v4"
 
 
 def test_single_env(
@@ -19,6 +19,7 @@ def test_single_env(
     agent: DDPG,
     buffer: FlexibleBuffer,
     n_episodes=100,
+    n_steps=1000000,
     joint_obs_dim=7,
     discrete=False,
     debug=False,
@@ -26,18 +27,20 @@ def test_single_env(
 ):
     agent: DDPG
     rewards = []
+    smooth_rewards = []
     aloss_return = []
     closs_return = []
-    term_array = []
     step = 0
-    for episode in range(n_episodes):
-        m_aloss, m_closs = 0, 0
+    episode = 0
+    m_aloss, m_closs = 0, 0
+    n_updates = 0
+    while step < n_steps and episode < n_episodes:
+
         ep_reward = 0
         obs, info = env.reset()
         obs = np.pad(obs, (0, joint_obs_dim - len(obs)), "constant")
         terminated, truncated = False, False
         while not (terminated or truncated):
-            step += 1
 
             discrete_actions, continuous_actions, disc_lp, cont_lp, value = (
                 agent.train_actions(obs, step=True, debug=debug)
@@ -59,7 +62,6 @@ def test_single_env(
             # )
 
             obs_, reward, terminated, truncated, _ = env.step(actions)
-            term_array.append(actions)
             obs_ = np.pad(obs_, (0, joint_obs_dim - len(obs_)), "constant")
 
             # print(disc_lp, cont_lp)
@@ -86,7 +88,7 @@ def test_single_env(
             ) or (
                 # and len(buffer.episode_inds) > 5
                 online
-                and buffer.steps_recorded > 2047
+                and buffer.steps_recorded > 511
             ):
                 # print(online)
                 if online:
@@ -99,6 +101,7 @@ def test_single_env(
                     # print(torch.from_numpy(np.array(term_array)).to("cuda:0"))
                     # print(batch.discrete_log_probs[0, :, 0])
                     # input()
+                    # print(agent.actor_logstd)
                     # print(batch.global_rewards)
                 else:
                     batch = buffer.sample_transitions(batch_size=256, as_torch=True)
@@ -106,36 +109,51 @@ def test_single_env(
                 aloss, closs = agent.reinforcement_learn(
                     batch, agent_num=0, debug=debug
                 )
+                # print(aloss, closs)
                 m_aloss += aloss
                 m_closs += closs
+                n_updates += 1
                 if online:
                     buffer.reset()
-                    term_array = []
+            step += 1
         # print(aloss, closs)
-        aloss_return.append(m_aloss)
-        closs_return.append(m_closs)
+        aloss_return.append(m_aloss / max(n_updates, 1))
+        closs_return.append(m_closs / max(n_updates, 1))
         rewards.append(ep_reward)
-        er = 10
+        rlen = min(len(rewards), 20)
+        smooth_rewards.append(sum(rewards[-rlen:]) / rlen)
+        # print(smooth_rewards[-1])
+        er = 100
+
         if episode % er == 0 and episode > 1:
+
             print(
                 f"n_ep: {episode} r: {sum(rewards[-10:])/10}, step: {step}, best: {max(rewards[-10:])} m_aloss: {m_aloss}, m_closs: {m_closs}"
             )
+            m_aloss = 0
+            m_closs = 0
+            n_updates = 0
             # print(f"lr: {agent.optimizer.param_groups[0]["lr"]}, G: {agent.g_mean}")
             # plt.plot(rewards)
             # plt.show()
-            if episode % er == 0:
+            if episode % (er * 5) == 0:
                 print("human animating")
                 env = gym.make(
-                    gym_disc_env if discrete else gym_cont_env, render_mode="human"
+                    gym_disc_env if discrete else gym_cont_env,
+                    render_mode="human",
+                    continuous=not discrete,
                 )
         if episode % er == 1 and episode > 1:
             print("no more human")
             env.close()
-            env = gym.make(id=gym_disc_env if discrete else gym_cont_env)
+            env = gym.make(
+                id=(gym_disc_env if discrete else gym_cont_env), continuous=not discrete
+            )
+        episode += 1
         # env = gym.make("CartPole-v1")
 
     env.close()
-    return rewards, aloss_return, closs_return
+    return smooth_rewards, aloss_return, closs_return
 
 
 def test_dual_env(
@@ -226,9 +244,9 @@ if __name__ == "__main__":
     import matplotlib.pyplot as plt
 
     discrete_env = gym.make(
-        gym_disc_env
+        gym_disc_env, continuous=False
     )  # """MountainCar-v0")  # )   # , render_mode="human")
-    continuous_env = gym.make(gym_cont_env)
+    continuous_env = gym.make(gym_cont_env, continuous=True)
     joint_obs_dim = (
         discrete_env.observation_space.shape[0]
         + continuous_env.observation_space.shape[0]
@@ -236,7 +254,11 @@ if __name__ == "__main__":
 
     def make_models():
         print("Making Model")
-        names = ["PG", "TD3", "DDPG"]
+        names = [
+            "TD3",
+            "DDPG",
+            "PG",
+        ]
         print(
             continuous_env.action_space.low,
             continuous_env.action_space.high,
@@ -244,29 +266,6 @@ if __name__ == "__main__":
             continuous_env.action_space.shape[0],
         )
         models = [
-            PG(
-                obs_dim=joint_obs_dim,
-                discrete_action_dims=[discrete_env.action_space.n],
-                continuous_action_dim=continuous_env.action_space.shape[0],
-                hidden_dims=np.array([64, 64]),
-                min_actions=continuous_env.action_space.low,
-                max_actions=continuous_env.action_space.high,
-                gamma=0.99,
-                device="cuda",
-                entropy_loss=0,
-                mini_batch_size=64,
-                n_epochs=5,
-                lr=0.1,
-                advantage_type="constant",
-                norm_advantages=False,
-                anneal_lr=2000000,
-                value_loss_coef=0.1,  # 5,
-                ppo_clip=0.1,
-                value_clip=0.5,
-                orthogonal=True,
-                activation="tanh",
-                starting_actorlogstd=0,
-            ),
             TD3(
                 obs_dim=joint_obs_dim,
                 discrete_action_dims=[discrete_env.action_space.n],
@@ -287,7 +286,7 @@ if __name__ == "__main__":
                 continuous_action_dim=continuous_env.action_space.shape[0],
                 min_actions=continuous_env.action_space.low,
                 max_actions=continuous_env.action_space.high,
-                hidden_dims=np.array([256, 256]),
+                hidden_dims=np.array([64, 64]),
                 gamma=0.99,
                 policy_frequency=4,
                 name="TD3_cd_test",
@@ -295,17 +294,30 @@ if __name__ == "__main__":
                 eval_mode=False,
                 rand_steps=10000,
             ),
-            # PPO(
-            #     obs_dim=joint_obs_dim,
-            #     discrete_action_dims=[discrete_env.action_space.n],
-            #     continuous_action_dim=continuous_env.action_space.shape[0],
-            #     hidden_dims=np.array([128, 128]),
-            #     min_actions=continuous_env.action_space.low,
-            #     max_actions=continuous_env.action_space.high,
-            #     gamma=0.99,
-            #     device="cuda",
-            #     entropy_loss=0.05,
-            # ),
+            PG(
+                obs_dim=joint_obs_dim,
+                discrete_action_dims=[discrete_env.action_space.n],
+                continuous_action_dim=continuous_env.action_space.shape[0],
+                hidden_dims=np.array([64, 64]),
+                min_actions=continuous_env.action_space.low,
+                max_actions=continuous_env.action_space.high,
+                gamma=0.999,
+                device="cuda",
+                entropy_loss=0.01,
+                mini_batch_size=32,
+                n_epochs=4,
+                lr=3e-4,
+                advantage_type="gae",
+                norm_advantages=True,
+                anneal_lr=2000000,
+                value_loss_coef=0.5,  # 5,
+                ppo_clip=0.2,
+                value_clip=0.5,
+                orthogonal=True,
+                activation="relu",
+                starting_actorlogstd=0,
+                gae_lambda=0.98,
+            ),
         ]
         return models, names
 
@@ -333,7 +345,29 @@ if __name__ == "__main__":
         results[n] = []
 
     for n in range(len(names)):
+        mem_buffer.reset()
         print("Testing Model ", names[n])
+        mem_buffer.reset()
+        print("Testing Discrete Environment")
+        rewards, aloss, closs = test_single_env(
+            env=discrete_env,
+            agent=models[n],
+            buffer=mem_buffer,
+            n_episodes=5000 if names[n] == "PG" else 1000,
+            discrete=True,
+            joint_obs_dim=joint_obs_dim,
+            online=names[n] in ["PPO", "PG"],
+        )
+        print(rewards)
+        plt.plot(rewards)
+        plt.show()
+        am = np.abs(aloss).max()
+        cm = np.abs(closs).max()
+        plt.plot(aloss / am)
+        plt.plot(closs / cm)
+        plt.legend([f"actor {am}", f"critic {cm}"])
+        plt.show()
+        models[n].save(f"../../TestModels/{names[n]}_Discrete")
 
         mem_buffer.reset()
         print("Testing Continuous Environment")
@@ -341,7 +375,8 @@ if __name__ == "__main__":
             continuous_env,
             agent=models[n],
             buffer=mem_buffer,
-            n_episodes=2000 if names[n] == "PG" else 200,
+            n_episodes=5000 if names[n] == "PG" else 2000,
+            n_steps=1000000 if names[n] == "PG" else 200000,
             discrete=False,
             joint_obs_dim=joint_obs_dim,
             online=names[n] in ["PPO", "PG"],
@@ -357,27 +392,6 @@ if __name__ == "__main__":
         models[n].save(f"../../TestModels/{names[n]}_Continuous")
 
         models, names = make_models()
-        mem_buffer.reset()
-        print("Testing Discrete Environment")
-        rewards, aloss, closs = test_single_env(
-            env=discrete_env,
-            agent=models[n],
-            buffer=mem_buffer,
-            n_episodes=2000 if names[n] == "PG" else 1000,
-            discrete=True,
-            joint_obs_dim=joint_obs_dim,
-            online=names[n] in ["PPO", "PG"],
-        )
-        print(rewards)
-        plt.plot(rewards)
-        plt.show()
-        am = np.abs(aloss).max()
-        cm = np.abs(closs).max()
-        plt.plot(aloss / am)
-        plt.plot(closs / cm)
-        plt.legend([f"actor {am}", f"critic {cm}"])
-        plt.show()
-        models[n].save(f"../../TestModels/{names[n]}_Discrete")
 
         continue
 

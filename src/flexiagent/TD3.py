@@ -90,7 +90,7 @@ class TD3(Agent):
             device=device,
             hidden_dims=hidden_dims,
             encoder=None,
-            tau=0.3,
+            tau=gumbel_tau,
             hard=False,
         ).float()
         if continuous_action_dim > 0:
@@ -109,16 +109,16 @@ class TD3(Agent):
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters())
 
         self.critic1 = ValueSA(
-            obs_dim, self.total_action_dim, hidden_dim=256, device=device
+            obs_dim, self.total_action_dim, hidden_dim=hidden_dims[-1], device=device
         ).float()
         self.critic2 = ValueSA(
-            obs_dim, self.total_action_dim, hidden_dim=256, device=device
+            obs_dim, self.total_action_dim, hidden_dim=hidden_dims[-1], device=device
         ).float()
         self.critic1_target = ValueSA(
-            obs_dim, self.total_action_dim, hidden_dim=256, device=device
+            obs_dim, self.total_action_dim, hidden_dim=hidden_dims[-1], device=device
         ).float()
         self.critic2_target = ValueSA(
-            obs_dim, self.total_action_dim, hidden_dim=256, device=device
+            obs_dim, self.total_action_dim, hidden_dim=hidden_dims[-1], device=device
         ).float()
         self.critic1_target.load_state_dict(self.critic1.state_dict())
         self.critic2_target.load_state_dict(self.critic2.state_dict())
