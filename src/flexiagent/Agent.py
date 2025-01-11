@@ -282,14 +282,14 @@ class QSCA(nn.Module):
     def __init__(
         self,
         obs_dim,
-        continuois_action_dim=0,
+        continuous_action_dim=0,
         discrete_action_dims=[1],
         hidden_dim=256,
         device="cpu",
     ):
         super(QSCA, self).__init__()
         self.device = device
-        self.l1 = nn.Linear(obs_dim + continuois_action_dim, hidden_dim)
+        self.l1 = nn.Linear(obs_dim + continuous_action_dim, hidden_dim)
         self.l2 = nn.Linear(hidden_dim, hidden_dim)
         self.discrete_Q_heads = nn.ModuleList()
         if discrete_action_dims is not None and len(discrete_action_dims) > 0:
@@ -341,6 +341,73 @@ class QSAA(nn.Module):
         return x
 
 
+class QS(nn.Module):
+    def __init__(
+        self,
+        obs_dim,
+        continuous_action_dim=0,
+        discrete_action_dims=[2],
+        hidden_dims=[64, 64],
+        encoder=None,
+        activation="relu",
+        orthogonal=False,
+        dropout=0.0,
+        dueling=False,
+        device="cpu",
+        n_c_action_bins=10,
+    ):
+
+        super(QS, self).__init__()
+        self.disc_action_dims = discrete_action_dims
+        self.cont_action_dims = continuous_action_dim
+        if encoder is not None:
+            self.encoder = encoder
+        else:
+            self.encoder = ffEncoder(
+                obs_dim, hidden_dims, activation, device, orthogonal, dropout
+            )
+        self.device = device
+        self.dueling = dueling
+        if self.dueling:
+            self.value_head = nn.Linear(hidden_dims, 1)
+        else:
+            self.value_head = None
+
+        self.discrete_advantage_heads = nn.ModuleList()
+        if discrete_action_dims is not None and len(discrete_action_dims) > 0:
+            for dim in discrete_action_dims:
+                self.discrete_advantage_heads.append(nn.Linear(hidden_dims[-1], dim))
+
+        self.continuous_advantage_heads = nn.ModuleList()
+        if continuous_action_dim > 0:
+            for dim in continuous_action_dim:
+                self.continuous_advantage_heads.append(
+                    nn.Linear(hidden_dims, n_c_action_bins)
+                )
+
+        self.to(device)
+
+    def forward(self, x):
+        x = T(x, self.device)
+        x = self.encoder(x)
+        values = 0
+        if self.dueling:
+            values = self.value_head(x)
+        disc_advantages = []
+        if len(self.disc_action_dims) > 0:
+            for i, head in enumerate(self.discrete_advantage_heads):
+                Adv = head(x)
+                Adv = Adv - Adv.mean(dim=-1, keepdim=True)
+                disc_advantages.append(Adv)
+        cont_advantages = []
+        if len(self.cont_action_dims) > 0:
+            for i, head in enumerate(self.continuous_advantage_heads):
+                Adv = head(x)
+                Adv = Adv - Adv.mean(dim=-1, keepdim=True)
+                cont_advantages.append(Adv)
+        return values, disc_advantages, cont_advantages
+
+
 # TODO: Try Dueling heads 2 layers and add activation functions for nonlinearities
 # TODO: Add V and A into one output to make consistent. Make sure V applies to all A in dim -1
 
@@ -349,7 +416,7 @@ class DuelingQSCA(nn.Module):
     def __init__(
         self,
         obs_dim,
-        continuois_action_dim=0,
+        continuous_action_dim=0,
         discrete_action_dims=[1],
         hidden_dim=256,
         device="cpu",
@@ -363,7 +430,7 @@ class DuelingQSCA(nn.Module):
         if discrete_action_dims is not None and len(discrete_action_dims) > 0:
             for dim in discrete_action_dims:
                 self.advantage_heads.append(
-                    nn.Linear(hidden_dim + continuois_action_dim, dim)
+                    nn.Linear(hidden_dim + continuous_action_dim, dim)
                 )
         self.to(device)
 
@@ -458,7 +525,7 @@ if __name__ == "__main__":
         obs_dim=10,
         hidden_dim=256,
         discrete_action_dims=d_dims,
-        continuois_action_dim=c_dim,
+        continuous_action_dim=c_dim,
         device=device,
     )
     qsaa_net = QSAA(
