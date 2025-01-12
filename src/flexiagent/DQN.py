@@ -66,7 +66,7 @@ class DQN(nn.Module):
 
         self.optimizer = torch.optim.Adam(self.Q1.parameters(), lr=lr)
 
-    def train_actions(self, observations, action_mask=None, step=False):
+    def train_actions(self, observations, action_mask=None, step=False, debug=False):
         if self.init_eps > 0.0:
             self.eps = self.init_eps * self.step / (self.step + self.half_life)
         value = 0
@@ -94,9 +94,22 @@ class DQN(nn.Module):
         else:
             value, disc_act, cont_act = self.Q1(observations, action_mask)
             # select actions from q function
+            d_act = np.zeros(len(disc_act), dtype=np.int32)
+            c_act = np.zeros(self.continuous_action_dims, dtype=np.float32)
+            if len(self.discrete_action_dims) > 0:
+                for i, da in enumerate(disc_act):
+                    d_act[i] = torch.argmax(da).detach().cpu().item()
+            if self.continuous_action_dims > 0:
+                for i, da in enumerate(cont_act):
+                    c_act[i] = (
+                        torch.argmax(da).detach().cpu().item()
+                        / (self.n_c_action_bins - 1)
+                        * self.action_ranges
+                        - self.action_means
+                    )
 
         self.step += int(step)
-        return 0, 0, 0  # Action 0, log_prob 0, value
+        return disc_act, cont_act, 0, 0, 0
 
     def ego_actions(self, observations, action_mask=None):
         return 0
@@ -120,3 +133,56 @@ class DQN(nn.Module):
 
     def load(self, checkpoint_path):
         print("Load not implemented")
+
+
+if __name__ == "__main__":
+    from flexibuff import FlexibleBuffer
+
+    obs_dim = 3
+    continuous_action_dim = 2
+    agent = DQN(
+        obs_dim=obs_dim,
+        continuous_action_dim=continuous_action_dim,
+        max_actions=np.array([1, 2]),
+        min_actions=np.array([0, 0]),
+        discrete_action_dims=[4, 5],
+        hidden_dims=[32, 32],
+        device="cuda:0",
+        lr=0.001,
+        activation="relu",
+        advantage_type="G",
+        norm_advantages=True,
+        mini_batch_size=7,
+        n_epochs=2,
+    )
+    obs = np.random.rand(obs_dim).astype(np.float32)
+    obs_ = np.random.rand(obs_dim).astype(np.float32)
+    obs_batch = np.random.rand(14, obs_dim).astype(np.float32)
+    obs_batch_ = obs_batch + 0.1
+
+    dacs = np.stack(
+        (np.random.randint(0, 4, size=(14)), np.random.randint(0, 5, size=(14))),
+        axis=-1,
+    )
+
+    mem = FlexiBatch(
+        obs=np.array([obs_batch]),
+        obs_=np.array([obs_batch_]),
+        continuous_actions=np.array([np.random.rand(14, 2).astype(np.float32)]),
+        discrete_actions=np.array([dacs]),
+        global_rewards=np.random.rand(14).astype(np.float32),
+        terminated=np.random.randint(0, 2, size=14),
+    )
+    mem.to_torch("cuda:0")
+
+    d_acts, c_acts, d_log, c_log, _ = agent.train_actions(obs, step=True, debug=True)
+    print(f"Training actions: c: {c_acts}, d: {d_acts}, d_log: {d_log}, c_log: {c_log}")
+
+    for adv_type in ["g", "gae", "a2c", "constant", "gv"]:
+        agent.advantage_type = adv_type
+        print(f"Reinforcement learning with advantage type {adv_type}")
+        aloss, closs = agent.reinforcement_learn(mem, 0, critic_only=False, debug=True)
+        print("Done")
+        input("Check next one?")
+
+    print("Finished Testing")
