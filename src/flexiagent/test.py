@@ -6,6 +6,7 @@ import numpy as np
 from Agent import Agent
 from typing import List
 from PG import PG
+from DQN import DQN
 import torch
 
 
@@ -122,7 +123,7 @@ def test_single_env(
         rlen = min(len(rewards), 20)
         smooth_rewards.append(sum(rewards[-rlen:]) / rlen)
         # print(smooth_rewards[-1])
-        er = 100
+        er = 10
 
         if episode % er == 0 and episode > 1:
 
@@ -254,6 +255,7 @@ if __name__ == "__main__":
     def make_models():
         print("Making Model")
         names = [
+            "DQN",
             "PG",
             "TD3",
             "DDPG",
@@ -265,6 +267,17 @@ if __name__ == "__main__":
             continuous_env.action_space.shape[0],
         )
         models = [
+            DQN(
+                obs_dim=joint_obs_dim,
+                continuous_action_dims=continuous_env.action_space.shape[0],
+                max_actions=continuous_env.action_space.high,
+                min_actions=continuous_env.action_space.low,
+                discrete_action_dims=[discrete_env.action_space.n],
+                hidden_dims=[64, 64],
+                device="cuda:0",
+                lr=3e-4,
+                activation="relu",
+            ),
             PG(
                 obs_dim=joint_obs_dim,
                 discrete_action_dims=[discrete_env.action_space.n],

@@ -380,14 +380,15 @@ class QS(nn.Module):
 
         self.continuous_advantage_heads = nn.ModuleList()
         if continuous_action_dim > 0:
-            for dim in continuous_action_dim:
+            for dim in range(continuous_action_dim):
                 self.continuous_advantage_heads.append(
-                    nn.Linear(hidden_dims, n_c_action_bins)
+                    nn.Linear(hidden_dims[-1], n_c_action_bins)
                 )
 
         self.to(device)
 
-    def forward(self, x):
+    def forward(self, x, action_mask=None):
+        # TODO: action mask implementation
         x = T(x, self.device)
         x = self.encoder(x)
         values = 0
@@ -397,13 +398,15 @@ class QS(nn.Module):
         if len(self.disc_action_dims) > 0:
             for i, head in enumerate(self.discrete_advantage_heads):
                 Adv = head(x)
-                Adv = Adv - Adv.mean(dim=-1, keepdim=True)
+                if self.dueling:
+                    Adv = Adv - Adv.mean(dim=-1, keepdim=True)
                 disc_advantages.append(Adv)
         cont_advantages = []
-        if len(self.cont_action_dims) > 0:
+        if self.cont_action_dims > 0:
             for i, head in enumerate(self.continuous_advantage_heads):
                 Adv = head(x)
-                Adv = Adv - Adv.mean(dim=-1, keepdim=True)
+                if self.dueling:
+                    Adv = Adv - Adv.mean(dim=-1, keepdim=True)
                 cont_advantages.append(Adv)
         return values, disc_advantages, cont_advantages
 
