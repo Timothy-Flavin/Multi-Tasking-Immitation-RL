@@ -1,7 +1,6 @@
 from flexibuff import FlexibleBuffer
 from DDPG import DDPG
 from TD3 import TD3
-from PPO import PPO
 import gymnasium as gym
 import numpy as np
 from Agent import Agent
@@ -255,9 +254,9 @@ if __name__ == "__main__":
     def make_models():
         print("Making Model")
         names = [
+            "PG",
             "TD3",
             "DDPG",
-            "PG",
         ]
         print(
             continuous_env.action_space.low,
@@ -266,6 +265,30 @@ if __name__ == "__main__":
             continuous_env.action_space.shape[0],
         )
         models = [
+            PG(
+                obs_dim=joint_obs_dim,
+                discrete_action_dims=[discrete_env.action_space.n],
+                continuous_action_dim=continuous_env.action_space.shape[0],
+                hidden_dims=np.array([64, 64]),
+                min_actions=continuous_env.action_space.low,
+                max_actions=continuous_env.action_space.high,
+                gamma=0.999,
+                device="cuda",
+                entropy_loss=0.01,
+                mini_batch_size=32,
+                n_epochs=4,
+                lr=3e-4,
+                advantage_type="gae",
+                norm_advantages=True,
+                anneal_lr=2000000,
+                value_loss_coef=0.5,  # 5,
+                ppo_clip=0.2,
+                value_clip=0.5,
+                orthogonal=True,
+                activation="relu",
+                starting_actorlogstd=0,
+                gae_lambda=0.98,
+            ),
             TD3(
                 obs_dim=joint_obs_dim,
                 discrete_action_dims=[discrete_env.action_space.n],
@@ -293,30 +316,6 @@ if __name__ == "__main__":
                 device="cuda",
                 eval_mode=False,
                 rand_steps=10000,
-            ),
-            PG(
-                obs_dim=joint_obs_dim,
-                discrete_action_dims=[discrete_env.action_space.n],
-                continuous_action_dim=continuous_env.action_space.shape[0],
-                hidden_dims=np.array([64, 64]),
-                min_actions=continuous_env.action_space.low,
-                max_actions=continuous_env.action_space.high,
-                gamma=0.999,
-                device="cuda",
-                entropy_loss=0.01,
-                mini_batch_size=32,
-                n_epochs=4,
-                lr=3e-4,
-                advantage_type="gae",
-                norm_advantages=True,
-                anneal_lr=2000000,
-                value_loss_coef=0.5,  # 5,
-                ppo_clip=0.2,
-                value_clip=0.5,
-                orthogonal=True,
-                activation="relu",
-                starting_actorlogstd=0,
-                gae_lambda=0.98,
             ),
         ]
         return models, names

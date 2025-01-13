@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch
 import torch.nn.functional as F
 from Agent import QS
+from flexibuff import FlexiBatch
 
 
 class DQN(nn.Module):
@@ -125,7 +126,20 @@ class DQN(nn.Module):
         print("expected_V not implemeted")
         return 0
 
-    def reinforcement_learn(self, batch, agent_num=0, critic_only=False, debug=False):
+    def reinforcement_learn(
+        self, batch: FlexiBatch, agent_num=0, critic_only=False, debug=False
+    ):
+
+        with torch.no_grad():
+            next_values, next_disc_adv, next_cont_adv = self.Q1(batch.obs_[agent_num])
+            #gather by max action:
+
+        values, disc_adv, cont_adv = self.Q1(batch.obs[agent_num])
+        # gather by batch action
+
+        qloss = self.gamma * batch.global_rewards * 
+        # final_value = self.Q1(batch.obs_[agent_num][-1])  # for boot strapping
+
         return 0, 0  # actor loss, critic loss
 
     def save(self, checkpoint_path):
