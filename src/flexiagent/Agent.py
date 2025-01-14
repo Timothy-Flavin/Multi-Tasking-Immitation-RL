@@ -369,7 +369,7 @@ class QS(nn.Module):
         self.device = device
         self.dueling = dueling
         if self.dueling:
-            self.value_head = nn.Linear(hidden_dims, 1)
+            self.value_head = nn.Linear(hidden_dims[-1], 1)
         else:
             self.value_head = None
 

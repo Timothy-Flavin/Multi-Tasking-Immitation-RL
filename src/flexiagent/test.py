@@ -277,6 +277,7 @@ if __name__ == "__main__":
                 device="cuda:0",
                 lr=3e-4,
                 activation="relu",
+                dueling=True,
             ),
             PG(
                 obs_dim=joint_obs_dim,
