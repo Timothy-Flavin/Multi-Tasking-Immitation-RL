@@ -18,5 +18,5 @@ classifiers = [
 ]
 
 [project.urls]
-"Homepage" = "https://github.com/Timothy-Flavin/FlexiAgent/"
-"Bug Tracker" = "https://github.com/Timothy-Flavin/FlexiAgent/issues"
+"Homepage" = "https://github.com/Timothy-Flavin/FlexiBuddiesRL/"
+"Bug Tracker" = "https://github.com/Timothy-Flavin/FlexiBuddiesRL/issues"
