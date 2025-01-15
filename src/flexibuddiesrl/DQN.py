@@ -132,6 +132,7 @@ class DQN(nn.Module):
             with torch.no_grad():
                 value, disc_act, cont_act = self.Q1(observations, action_mask)
                 # select actions from q function
+                # print(value, disc_act, cont_act)
                 d_act = np.zeros(len(disc_act), dtype=np.int32)
                 if len(self.discrete_action_dims) > 0:
                     for i, da in enumerate(disc_act):
@@ -180,6 +181,11 @@ class DQN(nn.Module):
             print("\nDoing Reinforcement learn \n")
         with torch.no_grad():
             next_values, next_disc_adv, next_cont_adv = self.Q1(batch.obs_[agent_num])
+            dnv_ = 0
+            cnv_ = 0
+            if self.dueling:
+                dnv_ = next_values.squeeze(-1)
+                cnv_ = next_values
             if debug:
                 print(
                     f"next vals: {next_values}, next_disct_adv: {next_disc_adv}, next_cont_adv: {next_cont_adv}"
@@ -191,9 +197,18 @@ class DQN(nn.Module):
                 dtype=torch.float32,
             ).to(self.device)
             for i in range(len(self.discrete_action_dims)):
-                dQ_[:, i] = torch.max(next_disc_adv[i], dim=-1).values + next_values
+                dQ_[:, i] = torch.max(next_disc_adv[i], dim=-1).values + dnv_
+
+            if debug:
+                print(
+                    f" q: {torch.stack(next_cont_adv, dim=1).shape} {torch.stack([cnv_, cnv_], dim=1).shape}"
+                )
             cQ_ = torch.max(
-                torch.stack(next_cont_adv, dim=1) + next_values, dim=-1
+                (
+                    torch.stack(next_cont_adv, dim=1)
+                    + (torch.stack([cnv_, cnv_], dim=1) if self.dueling else 0)
+                ),
+                dim=-1,
             ).values
 
             if debug:
@@ -210,6 +225,11 @@ class DQN(nn.Module):
             (batch.global_rewards.shape[0], len(self.discrete_action_dims)),
             dtype=torch.float32,
         ).to(self.device)
+        dnv = 0
+        cnv = 0
+        if self.dueling:
+            dnv = values.squeeze(-1)
+            cnv = values
         for i in range(len(self.discrete_action_dims)):
             if debug:
                 print(
@@ -221,25 +241,27 @@ class DQN(nn.Module):
                         disc_adv[i],
                         dim=-1,
                         index=batch.discrete_actions[agent_num, :, i].unsqueeze(-1),
-                    )
-                    + values
-                ).squeeze(-1)}"
+                    ).squeeze(-1)
+                    + dnv
+                )}"
                 )
+
             dQ[:, i] = (
                 torch.gather(
                     disc_adv[i],
                     dim=-1,
                     index=batch.discrete_actions[agent_num, :, i].unsqueeze(-1),
-                )
-                + values
-            ).squeeze(-1)
+                ).squeeze(-1)
+                + dnv
+            )
 
         if debug:
-            print(f"continout actions: {batch.continuous_actions[agent_num]}")
+            print(f"continout actions: {batch.continuous_actions[agent_num].shape}")
             print(
-                f"Discretized version: {self._discretize_actions(batch.continuous_actions[agent_num])}"
+                f"Discretized version: {self._discretize_actions(batch.continuous_actions[agent_num]).unsqueeze(-1).shape}"
             )
             print(f"c adv shape: {torch.stack(cont_adv, dim=1).shape}")
+            print(f" cnv shape {cnv.shape}")
         cQ = (
             torch.gather(
                 torch.stack(cont_adv, dim=1),
@@ -248,7 +270,7 @@ class DQN(nn.Module):
                     batch.continuous_actions[agent_num]
                 ).unsqueeze(-1),
             )
-            + values
+            + (torch.stack([cnv, cnv], dim=1) if self.dueling else 0)
         ).squeeze(-1)
         # print(f"dq: {dQ}, dq_: {dQ_}, cq: {cQ}, cq_: {cQ_}, rewards:\n\n")
         # gather by batch action
