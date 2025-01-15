@@ -38,7 +38,9 @@ def test_single_env(
 
         ep_reward = 0
         obs, info = env.reset()
+
         obs = np.pad(obs, (0, joint_obs_dim - len(obs)), "constant")
+
         terminated, truncated = False, False
         while not (terminated or truncated):
 
@@ -105,6 +107,7 @@ def test_single_env(
                     # print(batch.global_rewards)
                 else:
                     batch = buffer.sample_transitions(batch_size=256, as_torch=True)
+
                 # for ep in episodes:
                 aloss, closs = agent.reinforcement_learn(
                     batch, agent_num=0, debug=debug
@@ -136,6 +139,12 @@ def test_single_env(
             # print(f"lr: {agent.optimizer.param_groups[0]["lr"]}, G: {agent.g_mean}")
             # plt.plot(rewards)
             # plt.show()
+            obs, info = env.reset()
+
+            obs = np.pad(obs, (0, joint_obs_dim - len(obs)), "constant")
+            print(agent.train_actions(obs, step=False))
+            print(agent.Q1(obs))
+            print(agent.eps)
             if episode % (er * 5) == 0:
                 print("human animating")
                 env = gym.make(
@@ -275,9 +284,10 @@ if __name__ == "__main__":
                 discrete_action_dims=[discrete_env.action_space.n],
                 hidden_dims=[64, 64],
                 device="cuda:0",
-                lr=3e-4,
+                lr=3e-5,
                 activation="relu",
                 dueling=True,
+                n_c_action_bins=5,
             ),
             PG(
                 obs_dim=joint_obs_dim,

@@ -120,13 +120,15 @@ class DQN(nn.Module):
                     disc_act[i] = np.random.randint(0, self.discrete_action_dims[i])
 
             if self.continuous_action_dims > 0:
-                cont_act = np.zeros(shape=self.continuous_action_dims, dtype=np.int32)
-                for i in range(self.continuous_action_dims):
-                    cont_act[i] = np.random.randint(0, self.n_c_action_bins)
-
                 cont_act = (
-                    cont_act * 1.0 / (self.n_c_action_bins - 1)
-                ) * self.np_action_ranges - self.np_action_means
+                    np.random.rand(self.continuous_action_dims) - 0.5
+                ) * self.np_action_ranges - self.np_action_means  # np.zeros(shape=self.continuous_action_dims, dtype=np.int32)
+                # for i in range(self.continuous_action_dims):
+                #    cont_act[i] = np.random.random()#
+                #
+                # cont_act = (
+                #    cont_act * 1.0 / (self.n_c_action_bins - 1)
+                # ) * self.np_action_ranges - self.np_action_means
 
         else:
             with torch.no_grad():
@@ -301,7 +303,7 @@ class DQN(nn.Module):
         # print(dqloss.mean())
         # print(cqloss.mean())
         # print(self.eps)
-        loss = (dqloss + 0 * cqloss).mean()
+        loss = (dqloss + cqloss).mean()
 
         self.optimizer.zero_grad()
         loss.backward()
