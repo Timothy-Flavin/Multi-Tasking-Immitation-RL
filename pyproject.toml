@@ -3,7 +3,7 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "flexiagent"
+name = "flexibuddiesrl"
 version = "0.0.1"
 authors = [
   { name="Timothy Flavin", email="timothy.c.flavin@gmail.com" },
