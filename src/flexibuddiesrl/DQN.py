@@ -2,7 +2,7 @@ import numpy as np
 import torch.nn as nn
 import torch
 import torch.nn.functional as F
-from Agent import QS
+from flexibuddiesrl.Agent import QS
 from flexibuff import FlexiBatch
 
 

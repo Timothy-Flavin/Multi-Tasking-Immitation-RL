@@ -1,8 +1,8 @@
-from Agent import ValueS, MixedActor, Agent
+from flexibuddiesrl.Agent import ValueS, MixedActor, Agent
+from flexibuddiesrl.Util import T
 import torch
 from flexibuff import FlexiBatch
 from torch.distributions import Categorical
-from Util import T
 import numpy as np
 import torch.nn as nn
 
