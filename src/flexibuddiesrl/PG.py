@@ -313,9 +313,9 @@ class PG(nn.Module, Agent):
         G[-1] = batch.global_rewards[-1]
         if batch.terminated[-1] < 0.5:
             if self.advantage_type == "constant":
-                G[-1] = self.gamma * self.g_mean
+                G[-1] += self.gamma * self.g_mean
             else:
-                G[-1] = self.gamma * self.critic(batch.obs_[agent_num][-1]).squeeze(-1)
+                G[-1] += self.gamma * self.critic(batch.obs_[agent_num][-1]).squeeze(-1)
 
         for i in range(len(batch.global_rewards) - 2, -1, -1):
             G[i] = batch.global_rewards[i] + self.gamma * G[i + 1] * (
