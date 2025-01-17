@@ -10,8 +10,8 @@ from DQN import DQN
 import torch
 
 
-gym_disc_env = "LunarLander-v3"  # "CartPole-v1"  #
-gym_cont_env = "LunarLander-v3"  # "Pendulum-v1"  # "HalfCheetah-v4"
+gym_disc_env = "LunarLander-v2"  # "CartPole-v1"  #
+gym_cont_env = "LunarLander-v2"  # "Pendulum-v1"  # "HalfCheetah-v4"
 
 
 def test_single_env(
@@ -74,7 +74,7 @@ def test_single_env(
                     "obs_": obs_,
                     "continuous_actions": continuous_actions,
                     "discrete_actions": discrete_actions,
-                    "global_reward=": reward,  # + abs(obs[1]) * 100,
+                    "global_rewards": reward,  # + abs(obs[1]) * 100,
                     "discrete_log_probs": disc_lp,
                     "continuous_log_probs": cont_lp,
                 },
@@ -144,9 +144,9 @@ def test_single_env(
             obs, info = env.reset()
 
             obs = np.pad(obs, (0, joint_obs_dim - len(obs)), "constant")
-            print(agent.train_actions(obs, step=False))
-            print(agent.Q1(obs))
-            print(agent.eps)
+            # print(agent.train_actions(obs, step=False))
+            # print(agent.Q1(obs))
+            # print(agent.eps)
             if episode % (er * 5) == 0:
                 print("human animating")
                 env = gym.make(
@@ -356,15 +356,15 @@ if __name__ == "__main__":
         name="joint_buffer",
         n_agents=1,
         global_registered_vars={
-            "global_reward": (None, np.float32),
-            "obs": ([joint_obs_dim], np.float32),
-            "obs_": ([joint_obs_dim], np.float32),
+            "global_rewards": (None, np.float32),
         },
         individual_registered_vars={
-            "log_prob_discrete": ([1], np.int32),
-            "log_prob_continuous": ([1], np.int32),
-            "discrete_actions": ([1], np.int32),
+            "discrete_log_probs": ([1], np.float32),
+            "continuous_log_probs": ([1], np.float32),
+            "discrete_actions": ([1], np.int64),
             "continuous_actions": ([continuous_env.action_space.shape[0]], np.float32),
+            "obs": ([joint_obs_dim], np.float32),
+            "obs_": ([joint_obs_dim], np.float32),
         },
     )
 

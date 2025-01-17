@@ -236,6 +236,9 @@ class DQN(nn.Module):
                     f"Qs gathered: {(torch.gather(disc_adv[i],dim=-1,index=batch.discrete_actions[agent_num, :, i].unsqueeze(-1),).squeeze(-1)+ dnv)}"
                 )
 
+            # print(batch.discrete_actions.shape)
+            # print(disc_adv[i].shape)
+            # exit()
             dQ[:, i] = (
                 torch.gather(
                     disc_adv[i],
