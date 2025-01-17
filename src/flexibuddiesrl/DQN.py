@@ -148,12 +148,7 @@ class DQN(nn.Module):
                             f"  cont act {cont_act}, argmax: {torch.argmax(torch.stack(cont_act,dim=0),dim=-1).detach().cpu()}"
                         )
                         print(
-                            f"  Trying to store this in actions {(
-                                (torch.argmax(torch.stack(cont_act,dim=0),dim=-1)
-                                / (self.n_c_action_bins - 1) -0.5)
-                                * self.action_ranges
-                                + self.action_means
-                            )} calculated from da: {cont_act} with ranges: {self.action_ranges} and means: {self.action_means}"
+                            f"  Trying to store this in actions {((torch.argmax(torch.stack(cont_act,dim=0),dim=-1)/ (self.n_c_action_bins - 1) -0.5)* self.action_ranges+ self.action_means)} calculated from da: {cont_act} with ranges: {self.action_ranges} and means: {self.action_means}"
                         )
                     cont_act = self._cont_from_q(cont_act).cpu().numpy()
                 else:
@@ -238,14 +233,7 @@ class DQN(nn.Module):
                     f"dq[{i}]: {dQ[:,i]}, disc_adv[{i}] {disc_adv[i]}, and actions: {batch.discrete_actions[agent_num, :, i].unsqueeze(-1)}"
                 )
                 print(
-                    f"Qs gathered: {(
-                    torch.gather(
-                        disc_adv[i],
-                        dim=-1,
-                        index=batch.discrete_actions[agent_num, :, i].unsqueeze(-1),
-                    ).squeeze(-1)
-                    + dnv
-                )}"
+                    f"Qs gathered: {(torch.gather(disc_adv[i],dim=-1,index=batch.discrete_actions[agent_num, :, i].unsqueeze(-1),).squeeze(-1)+ dnv)}"
                 )
 
             dQ[:, i] = (

@@ -68,14 +68,16 @@ def test_single_env(
 
             # print(disc_lp, cont_lp)
             buffer.save_transition(
-                obs=obs,
-                obs_=obs_,
-                continuous_actions=continuous_actions,
-                discrete_actions=discrete_actions,
-                global_reward=reward,  # + abs(obs[1]) * 100,
                 terminated=terminated or truncated,
-                discrete_log_probs=disc_lp,
-                continuous_log_probs=cont_lp,
+                registered_vals={
+                    "obs": obs,
+                    "obs_": obs_,
+                    "continuous_actions": continuous_actions,
+                    "discrete_actions": discrete_actions,
+                    "global_reward=": reward,  # + abs(obs[1]) * 100,
+                    "discrete_log_probs": disc_lp,
+                    "continuous_log_probs": cont_lp,
+                },
             )
             # env.render()
             # print(abs(obs[1]) * 50)
@@ -348,17 +350,22 @@ if __name__ == "__main__":
 
     mem_buffer = FlexibleBuffer(
         num_steps=50000,
-        obs_size=joint_obs_dim,
-        action_mask=None,
+        track_action_mask=False,
         discrete_action_cardinalities=[discrete_env.action_space.n],
-        continuous_action_dimension=continuous_env.action_space.shape[0],
         path="./test_mem_buffer/",
         name="joint_buffer",
         n_agents=1,
-        state_size=None,
-        global_reward=True,
-        log_prob_discrete=True,
-        log_prob_continuous=continuous_env.action_space.shape[0],
+        global_registered_vars={
+            "global_reward": (None, np.float32),
+            "obs": ([joint_obs_dim], np.float32),
+            "obs_": ([joint_obs_dim], np.float32),
+        },
+        individual_registered_vars={
+            "log_prob_discrete": ([1], np.int32),
+            "log_prob_continuous": ([1], np.int32),
+            "discrete_actions": ([1], np.int32),
+            "continuous_actions": ([continuous_env.action_space.shape[0]], np.float32),
+        },
     )
 
     models, names = make_models()
