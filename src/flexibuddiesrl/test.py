@@ -307,7 +307,7 @@ if __name__ == "__main__":
                 advantage_type="gae",
                 norm_advantages=True,
                 anneal_lr=2000000,
-                value_loss_coef=0.5,  # 5,
+                # value_loss_coef=0.5,  # 5,
                 ppo_clip=0.2,
                 value_clip=0.5,
                 orthogonal=True,

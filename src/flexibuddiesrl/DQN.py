@@ -107,6 +107,7 @@ class DQN(nn.Module):
         )
 
     def train_actions(self, observations, action_mask=None, step=False, debug=False):
+        disc_act, cont_act = None, None
         if self.init_eps > 0.0:
             self.eps = self.init_eps * (1 - self.step / (self.step + self.half_life))
         value = 0
@@ -135,12 +136,13 @@ class DQN(nn.Module):
                 value, disc_act, cont_act = self.Q1(observations, action_mask)
                 # select actions from q function
                 # print(value, disc_act, cont_act)
-                d_act = np.zeros(len(disc_act), dtype=np.int32)
                 if len(self.discrete_action_dims) > 0:
-                    for i, da in enumerate(disc_act):
-                        d_act[i] = torch.argmax(da).detach().cpu().item()
+                    d_act = np.zeros(len(disc_act), dtype=np.int32)
+                    if len(self.discrete_action_dims) > 0:
+                        for i, da in enumerate(disc_act):
+                            d_act[i] = torch.argmax(da).detach().cpu().item()
 
-                disc_act = d_act
+                    disc_act = d_act
 
                 if self.continuous_action_dims > 0:
                     if debug:
@@ -151,8 +153,6 @@ class DQN(nn.Module):
                             f"  Trying to store this in actions {((torch.argmax(torch.stack(cont_act,dim=0),dim=-1)/ (self.n_c_action_bins - 1) -0.5)* self.action_ranges+ self.action_means)} calculated from da: {cont_act} with ranges: {self.action_ranges} and means: {self.action_means}"
                         )
                     cont_act = self._cont_from_q(cont_act).cpu().numpy()
-                else:
-                    cont_act = np.zeros(self.continuous_action_dims, dtype=np.float32)
 
         self.step += int(step)
         return disc_act, cont_act, 0, 0, 0
@@ -167,9 +167,65 @@ class DQN(nn.Module):
         return 0  # Returns the single-agent critic for a single action.
         # If actions are none then V(s)
 
-    def expected_V(self, obs, legal_action):
-        print("expected_V not implemeted")
-        return 0
+    def expected_V(self, obs, legal_action=None, debug=False):
+        with torch.no_grad():
+            value, dac, cac = self.Q1(obs, legal_action)
+            if debug:
+                print(f"value: {value}, dac: {dac}, cac: {cac}, eps: {self.eps}")
+            if self.dueling:
+                return value.cpu().item()
+
+            dq = 0
+            n = 0
+            if len(self.discrete_action_dims) > 0:
+                n += 1
+                for hi, h in enumerate(dac):
+                    a = torch.argmax(h, dim=-1)
+                    bestq = h[a].item()
+                    h[a] = 0
+                    if legal_action is not None:
+                        if torch.sum(legal_action[hi]) == 1:
+                            otherq = (
+                                bestq  # no other choices so 100% * only legal choice
+                            )
+                        else:
+                            otherq = torch.sum(  # average of other choices
+                                h * legal_action[hi], dim=-1
+                            ) / (torch.sum(legal_action[hi], dim=-1) - 1)
+                    else:
+                        otherq = torch.sum(h, dim=-1) / (
+                            self.discrete_action_dims[hi] - 1
+                        )
+                        if debug:
+                            print(
+                                f"{otherq} = self.eps * {torch.sum(h, dim=-1)} / ({self.discrete_action_dims[hi] - 1})"
+                            )
+
+                    qmean = (1 - self.eps) * bestq + self.eps * otherq
+                    if debug:
+                        print(
+                            f"dq: {qmean} = {(1 - self.eps)} * {bestq} + {self.eps} * {otherq}"
+                        )
+                    dq += qmean
+                dq = dq / len(self.discrete_action_dims)
+            cq = 0
+            if self.continuous_action_dims > 0:
+                n += 1
+                for h in cac:
+                    a = torch.argmax(h, dim=-1)
+
+                    bestq = h[a].item()
+                    h[a] = 0
+                    otherq = torch.sum(h, dim=-1) / (self.n_c_action_bins - 1)
+
+                    if debug:
+                        print(
+                            f"cq: {(1 - self.eps) * bestq + self.eps * otherq} = {(1 - self.eps)} * {bestq} + {self.eps} * ({otherq})"
+                        )
+                    cq += (1 - self.eps) * bestq + self.eps * otherq
+                cq = cq / self.continuous_action_dims
+
+            return (value + (cq + dq) / (max(n, 1))).cpu().item()
 
     def reinforcement_learn(
         self, batch: FlexiBatch, agent_num=0, critic_only=False, debug=False
@@ -338,14 +394,19 @@ if __name__ == "__main__":
     )
 
     mem = FlexiBatch(
-        obs=np.array([obs_batch]),
-        obs_=np.array([obs_batch_]),
-        continuous_actions=np.array([np.random.rand(14, 2).astype(np.float32)]),
-        discrete_actions=np.array([dacs]),
-        global_rewards=np.random.rand(14).astype(np.float32),
+        registered_vals={
+            "obs": np.array([obs_batch]),
+            "obs_": np.array([obs_batch_]),
+            "continuous_actions": np.array([np.random.rand(14, 2).astype(np.float32)]),
+            "discrete_actions": np.array([dacs]),
+            "global_rewards": np.random.rand(14).astype(np.float32),
+        },
         terminated=np.random.randint(0, 2, size=14),
     )
     mem.to_torch("cuda:0")
+
+    print(f"expected v: {agent.expected_V(obs, legal_action=None)}")
+    exit()
 
     d_acts, c_acts, d_log, c_log, _ = agent.train_actions(obs, step=True, debug=True)
     print(f"Training actions: c: {c_acts}, d: {d_acts}, d_log: {d_log}, c_log: {c_log}")
