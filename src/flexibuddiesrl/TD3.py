@@ -396,9 +396,33 @@ class TD3(Agent):
         return 0  # Returns the single-agent critic for a single action.
         # If actions are none then V(s)
 
-    def expected_V(self, obs, legal_action):
-        print("expected_V not implemeted")
-        return 0
+    def expected_V(self, obs, legal_action=None):
+        qtot = 0
+        with torch.no_grad:
+            for i in range(5):  # average of 5 sampled actions
+                c_act, d_act = self.actor(
+                    x=obs, action_mask=legal_action, gumbel=True, debug=False
+                )
+                disc_present = (
+                    self.discrete_action_dims is not None
+                    and len(self.discrete_action_dims) > 0
+                )
+                if disc_present:
+                    if len(d_act) == 1:
+                        daa = d_act[0]
+                    else:
+                        daa = torch.cat(d_act, dim=-1)
+                else:
+                    actions_ = c_act  # no discrete actions
+
+                if self.continuous_action_dim > 0 and disc_present:
+                    actions_ = torch.cat([c_act, daa], dim=-1)
+                elif disc_present:
+                    actions_ = daa
+                q = self.critic_target(obs, actions_).squeeze(-1)
+                qtot += q
+
+        return qtot / 5.0
 
     def save(self, checkpoint_path):
         if self.eval_mode:

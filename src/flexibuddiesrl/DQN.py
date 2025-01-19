@@ -1,7 +1,6 @@
 import numpy as np
 import torch.nn as nn
 import torch
-import torch.nn.functional as F
 from flexibuddiesrl.Agent import QS
 from flexibuff import FlexiBatch
 
@@ -368,8 +367,6 @@ class DQN(nn.Module):
 
 
 if __name__ == "__main__":
-    from flexibuff import FlexibleBuffer
-
     obs_dim = 3
     continuous_action_dim = 2
     agent = DQN(

@@ -194,7 +194,6 @@ class PG(nn.Module, Agent):
             discrete_actions = discrete_actions.detach().cpu().numpy()
             discrete_log_probs = discrete_log_probs.detach().cpu().numpy()
 
-        vals = 0  # self.critic(observations)
         return (
             discrete_actions,
             continuous_actions,
@@ -252,7 +251,7 @@ class PG(nn.Module, Agent):
             return self.critic(observations)
         # If actions are none then V(s)
 
-    def expected_V(self, obs, legal_action):
+    def expected_V(self, obs, legal_action=None):
         return self.critic(obs)
 
     def marl_learn(self, batch, agent_num, mixer, critic_only=False, debug=False):
@@ -663,7 +662,6 @@ class PG(nn.Module, Agent):
                     # print(self.actor_logstd)
                     # print(self.actor_logstd.grad)
                     # self._print_grad_norm()
-                    total_norm = 0
 
                     if self.clip_grad:
                         torch.nn.utils.clip_grad_norm_(
