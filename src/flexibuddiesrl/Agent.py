@@ -155,6 +155,8 @@ class MixedActor(nn.Module):
             self.action_biases = (
                 torch.from_numpy(max_actions + min_actions).float().to(device) / 2
             )
+            self.max_actions = max_actions
+            self.min_actions = min_actions
 
         self.continuous_actions_head = None
         if continuous_action_dim is not None and continuous_action_dim > 0:
@@ -170,7 +172,6 @@ class MixedActor(nn.Module):
                 self.discrete_action_heads.append(nn.Linear(hidden_dims[-1], dim))
                 if orthogonal_init:
                     _orthogonal_init(self.discrete_action_heads[-1])
-        self.max_actions = max_actions
         self.to(device)
 
     def forward(self, x, action_mask=None, gumbel=False, debug=False):
