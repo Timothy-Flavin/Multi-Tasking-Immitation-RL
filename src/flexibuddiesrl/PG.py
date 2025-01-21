@@ -5,12 +5,14 @@ from flexibuff import FlexiBatch
 from torch.distributions import Categorical
 import numpy as np
 import torch.nn as nn
+import pickle
+import os
 
 
 class PG(nn.Module, Agent):
     def __init__(
         self,
-        obs_dim,
+        obs_dim=10,
         continuous_action_dim=0,
         max_actions=None,
         min_actions=None,
@@ -33,11 +35,47 @@ class PG(nn.Module, Agent):
         starting_actorlogstd=0,
         clip_grad=True,
         gae_lambda=0.95,
+        load_from_checkpoint=None,
+        name="PPO",
+        eval_mode=False,
     ):
         super(PG, self).__init__()
+        self.eval_mode = eval_mode
+        self.attrs = [
+            "obs_dim",
+            "continuous_action_dim",
+            "max_actions",
+            "min_actions",
+            "discrete_action_dims",
+            "lr",
+            "gamma",
+            "n_epochs",
+            "device",
+            "entropy_loss",
+            "hidden_dims",
+            "activation",
+            "ppo_clip",
+            "value_loss_coef",
+            "value_clip",
+            "advantage_type",
+            "norm_advantages",
+            "mini_batch_size",
+            "anneal_lr",
+            "orthogonal",
+            "starting_actorlogstd",
+            "clip_grad",
+            "gae_lambda",
+            "g_mean",
+            "steps",
+            "eval_mode",
+        ]
         assert (
             continuous_action_dim > 0 or discrete_action_dims is not None
         ), "At least one action dim should be provided"
+        self.name = name
+        if load_from_checkpoint is not None:
+            self.load(load_from_checkpoint)
+            return
         self.ppo_clip = ppo_clip
         self.value_clip = value_clip
         self.gae_lambda = gae_lambda
@@ -65,43 +103,51 @@ class PG(nn.Module, Agent):
         self.critic_loss_coef = value_loss_coef
         self.entropy_loss = entropy_loss
 
-        self.actor = MixedActor(
-            obs_dim=obs_dim,
-            continuous_action_dim=continuous_action_dim,
-            discrete_action_dims=discrete_action_dims,
-            max_actions=max_actions,
-            min_actions=min_actions,
-            hidden_dims=hidden_dims,
-            device=device,
-            orthogonal_init=orthogonal,
-            activation=activation,
-        )
+        self.min_actions = min_actions
+        self.max_actions = max_actions
+        self.hidden_dims = hidden_dims
+        self.orthogonal = orthogonal
 
-        self.critic = ValueS(
-            obs_dim=obs_dim,
-            hidden_dim=hidden_dims[0],
-            device=self.device,
-            orthogonal_init=orthogonal,
-            activation=activation,
-        )
-        self.actor_logstd = (
-            nn.Parameter(torch.zeros(1, continuous_action_dim), requires_grad=True).to(
-                device
-            )
-            + starting_actorlogstd
-        )
-        # print(self.actor_logstd)
-        self.actor_logstd.retain_grad()
-        # print(self.actor_logstd.grad)
-
-        self.optimizer = torch.optim.Adam(
-            list(self.parameters()) + [self.actor_logstd], lr=lr
-        )
+        self.starting_actorlogstd = starting_actorlogstd
         self.g_mean = 0
         self.steps = 0
         self.anneal_lr = anneal_lr
         self.lr = lr
-        # self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=lr_critic)
+
+        self._get_torch_params(starting_actorlogstd)
+
+    def _get_torch_params(self, starting_actorlogstd):
+        self.actor = MixedActor(
+            obs_dim=self.obs_dim,
+            continuous_action_dim=self.continuous_action_dim,
+            discrete_action_dims=self.discrete_action_dims,
+            max_actions=self.max_actions,
+            min_actions=self.min_actions,
+            hidden_dims=self.hidden_dims,
+            device=self.device,
+            orthogonal_init=self.orthogonal,
+            activation=self.activation,
+        )
+
+        self.critic = ValueS(
+            obs_dim=self.obs_dim,
+            hidden_dim=self.hidden_dims[0],
+            device=self.device,
+            orthogonal_init=self.orthogonal,
+            activation=self.activation,
+        )
+        self.actor_logstd = (
+            nn.Parameter(
+                torch.zeros(1, self.continuous_action_dim), requires_grad=True
+            ).to(self.device)
+            + starting_actorlogstd
+        )
+        # print(self.actor_logstd)
+        self.actor_logstd.retain_grad()
+
+        self.optimizer = torch.optim.Adam(
+            list(self.parameters()) + [self.actor_logstd], lr=self.lr
+        )
 
     def _sample_multi_discrete(
         self, logits, debug=False
@@ -325,33 +371,6 @@ class PG(nn.Module, Agent):
 
     def _gae(self, batch, agent_num):
         with torch.no_grad():
-            # values = self.critic(batch.obs[agent_num]).squeeze(-1)
-            # num_steps = batch.global_rewards.shape[0]
-            # advantages = torch.zeros_like(batch.global_rewards).to(self.device)
-            # lastgaelam = 0
-            # advantages[-1] = (  # bootstrap advantage for last timestep
-            #     self.gamma
-            #     * self.critic(batch.obs_[agent_num, -1]).squeeze(-1)
-            #     * batch.terminated[-1]
-            #     - values[-1]
-            # )
-            # print(advantages)
-            # for t in reversed(range(num_steps - 1)):
-            #     nextnonterminal = 1.0 - batch.terminated[t + 1]
-            #     nextvalues = values[t + 1]
-            #     delta = (
-            #         batch.global_rewards[t]
-            #         + self.gamma * nextvalues * nextnonterminal
-            #         - values[t]
-            #     )
-            #     if t > num_steps - 10:
-            #         print(delta)
-            #     advantages[t] = lastgaelam = (
-            #         delta + self.gamma * self.gae_lambda * nextnonterminal * lastgaelam
-            #     )
-            # G = advantages + values
-
-            # print(f"old: advantages {advantages} and G {G}")
             advantages = torch.zeros_like(batch.global_rewards).to(self.device)
             num_steps = batch.global_rewards.shape[0]
             last_values = self.critic(batch.obs_[agent_num, -1]).squeeze(-1)
@@ -425,6 +444,8 @@ class PG(nn.Module, Agent):
         debug=False,
         conenv=False,
     ):
+        if self.eval_mode:
+            return 0, 0
         # print(f"Doing PPO learn for agent {agent_num}")
         # Update the critic with Bellman Equation
         # Monte Carlo Estimate of returns
@@ -476,10 +497,6 @@ class PG(nn.Module, Agent):
             print(
                 f"  bsize: {bsize}, Mini batch indices: {mini_batch_indices}, nbatch: {nbatch}"
             )
-
-        # if self.ppo_clip:
-        # old_cont_logprobs = batch.continuous_log_probs[agent_num]
-        # old_disc_logprobs = batch.discrete_log_probs[agent_num]
 
         for epoch in range(self.n_epochs):
             if debug:
@@ -593,43 +610,13 @@ class PG(nn.Module, Agent):
                                 batch.discrete_actions[agent_num, indices, head]
                             )
 
-                            # cont_probs, disc_probs = self.actor(
-                            #    batch.obs[agent_num, indices],
-                            #    action_mask=action_mask,  # TODO fix action mask by indices
-                            #    gumbel=False,
-                            # )
-                            # print(f"probs {probs}")
-                            # print(f"cont_probs {probs-disc_probs[head]}")
-                            # exit()
-                            # print(
-                            #    f"actions {batch.discrete_actions[agent_num, indices, head]}"
-                            # )
-                            # print(f"selected probs {selectedprobs}")
-                            # print(torch.log(selectedprobs).squeeze(-1))
-                            # print(f"log {selected_log_probs}")
-                            # print(advantages[indices])
-
-                            if debug:
-                                print(f"    selected log probs{selected_log_probs}")
-                            # print(f" slect lp: {selected_log_probs}")
-                            # print(f" adv: {mb_adv.squeeze(-1)}")
-
                             if self.ppo_clip > 0:
-                                # print(selected_log_probs)
-                                # print(
-                                #    batch.discrete_log_probs[agent_num, indices, head]
-                                # )
 
                                 logratio = (
                                     selected_log_probs
                                     - batch.discrete_log_probs[agent_num, indices, head]
                                 )
                                 ratio = logratio.exp()
-                                # print(ratio)
-                                # print(
-                                #    f"adv: {mb_adv.squeeze(-1).shape} * r{ratio.shape}"
-                                # )
-                                # input("?????")
                                 pg_loss1 = mb_adv.squeeze(-1) * ratio
                                 pg_loss2 = mb_adv.squeeze(-1) * torch.clamp(
                                     ratio, 1 - self.ppo_clip, 1 + self.ppo_clip
@@ -639,10 +626,6 @@ class PG(nn.Module, Agent):
                                 discrete_policy_gradient = (
                                     selected_log_probs * mb_adv.squeeze(-1)
                                 )
-                            # print(discrete_policy_gradient)
-                            # print(f"obs: {batch.obs[agent_num]}")
-                            # input()
-                            # exit()
 
                             actor_loss += (
                                 -self.policy_loss * discrete_policy_gradient.mean()
@@ -671,23 +654,6 @@ class PG(nn.Module, Agent):
                             foreach=True,
                         )
 
-                    # try:
-                    #
-                    # except Exception as e:
-                    #     print(f"Error in clipping {e}")
-                    #     print(actor_loss.item(), critic_loss.item())
-                    #     print(
-                    #         f"surr1: {discrete_policy_gradient}, {continuous_policy_gradient}"
-                    #     )
-                    #     print(disc_probs)
-                    #     paramvec = torch.nn.utils.parameters_to_vector(
-                    #         self.total_params
-                    #     )
-                    #     print(max(paramvec), min(paramvec), torch.linalg.norm(paramvec))
-                    #     print("paramvec", paramvec.isnan().sum())
-                    #     print("loss", loss.isnan().sum())
-                    #     print("entropy", entropy.isnan().sum())
-                    #     # exit()
                     self.optimizer.step()
 
                     avg_actor_loss += actor_loss.item()
@@ -701,11 +667,49 @@ class PG(nn.Module, Agent):
         # print(avg_actor_loss, critic_loss.item())
         return avg_actor_loss, avg_critic_loss
 
+    def _dump_attr(self, attr, path):
+        f = open(path, "wb")
+        pickle.dump(attr, f)
+        f.close()
+
+    def _load_attr(self, path):
+        f = open(path, "rb")
+        d = pickle.load(f)
+        f.close()
+        return d
+
     def save(self, checkpoint_path):
-        print("Save not implemeted")
+        if self.eval_mode:
+            print("Not saving because model in eval mode")
+            return
+        if checkpoint_path is None:
+            checkpoint_path = "./" + self.name + "/"
+        if not os.path.exists(checkpoint_path):
+            os.makedirs(checkpoint_path)
+        torch.save(self.actor.state_dict(), checkpoint_path + "/PI")
+        torch.save(self.critic.state_dict(), checkpoint_path + "/V")
+        torch.save(self.actor_logstd, checkpoint_path + "/actor_logstd")
+        for i in range(len(self.attrs)):
+            self._dump_attr(
+                self.__dict__[self.attrs[i]], checkpoint_path + f"/{self.attrs[i]}"
+            )
 
     def load(self, checkpoint_path):
-        print("Load not implemented")
+        if checkpoint_path is None:
+            checkpoint_path = "./" + self.name + "/"
+
+        for i in range(len(self.attrs)):
+            self.__dict__[self.attrs[i]] = self._load_attr(
+                checkpoint_path + f"/{self.attrs[i]}"
+            )
+        self._get_torch_params(self.starting_actorlogstd)
+        self.policy_loss = 5.0
+
+    def __str__(self):
+        st = ""
+        for d in self.__dict__.keys():
+            st += f"{d}: {self.__dict__[d]}"
+        return st
 
 
 if __name__ == "__main__":

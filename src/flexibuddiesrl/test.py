@@ -66,6 +66,9 @@ def test_single_env(
             obs_, reward, terminated, truncated, _ = env.step(actions)
             obs_ = np.pad(obs_, (0, joint_obs_dim - len(obs_)), "constant")
 
+            # print(
+            #    f"obs: {obs}, obs_:{obs_}, continuous: {continuous_actions}, discrete: {discrete_actions}, reward: {reward}, dlp: {disc_lp},clp: {cont_lp}"
+            # )
             # print(disc_lp, cont_lp)
             buffer.save_transition(
                 terminated=terminated or truncated,
@@ -362,7 +365,10 @@ if __name__ == "__main__":
         },
         individual_registered_vars={
             "discrete_log_probs": ([1], np.float32),
-            "continuous_log_probs": ([1], np.float32),
+            "continuous_log_probs": (
+                [continuous_env.action_space.shape[0]],
+                np.float32,
+            ),
             "discrete_actions": ([1], np.int64),
             "continuous_actions": ([continuous_env.action_space.shape[0]], np.float32),
             "obs": ([joint_obs_dim], np.float32),
@@ -385,7 +391,8 @@ if __name__ == "__main__":
             env=discrete_env,
             agent=models[n],
             buffer=mem_buffer,
-            n_episodes=5000 if names[n] == "PG" else 1000,
+            n_episodes=200 if names[n] == "PG" else 100,
+            n_steps=15000,
             discrete=True,
             joint_obs_dim=joint_obs_dim,
             online=names[n] in ["PPO", "PG"],
@@ -407,8 +414,8 @@ if __name__ == "__main__":
             continuous_env,
             agent=models[n],
             buffer=mem_buffer,
-            n_episodes=5000 if names[n] == "PG" else 2000,
-            n_steps=1000000 if names[n] == "PG" else 200000,
+            n_episodes=200 if names[n] == "PG" else 100,
+            n_steps=15000,  # if names[n] == "PG" else 100,
             discrete=False,
             joint_obs_dim=joint_obs_dim,
             online=names[n] in ["PPO", "PG"],

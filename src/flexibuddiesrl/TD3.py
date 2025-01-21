@@ -5,12 +5,13 @@ from flexibuddiesrl.Agent import Agent, MixedActor, ValueSA
 from flexibuddiesrl.Util import T, get_multi_discrete_one_hot
 from flexibuff import FlexiBatch
 import os
+import pickle
 
 
 class TD3(Agent):
     def __init__(
         self,
-        obs_dim,
+        obs_dim=10,
         continuous_action_dim=0,
         discrete_action_dims=[],
         max_actions=[],
@@ -51,6 +52,27 @@ class TD3(Agent):
             The name of the agent
         device: str
         """
+
+        self.attrs = [
+            "obs_dim",
+            "continuous_action_dim",
+            "discrete_action_dims",
+            "max_actions",
+            "min_actions",
+            "action_noise",
+            "hidden_dims",
+            "gamma",
+            "policy_frequency",
+            "target_update_percentage",
+            "name",
+            "device",
+            "eval_mode",
+            "gumbel_tau",
+            "rand_steps",
+            "step",
+            "rl_step",
+        ]
+
         assert not (
             continuous_action_dim is None and discrete_action_dims is None
         ), "At least one action dim should be provided"
@@ -60,73 +82,97 @@ class TD3(Agent):
         ), "max_actions should be provided for each contin action dim"
 
         self.device = device
-        self.total_action_dim = continuous_action_dim + np.sum(
-            np.array(discrete_action_dims)
-        )
+
+        self.gumbel_tau = gumbel_tau
+        self.obs_dim = obs_dim
         self.target_update_percentage = target_update_percentage
         self.rand_steps = rand_steps
         self.gamma = gamma
         self.policy_frequency = policy_frequency
         self.eval_mode = eval_mode
         self.name = name
-        self.actor = MixedActor(
-            obs_dim,
-            continuous_action_dim=continuous_action_dim,
-            discrete_action_dims=discrete_action_dims,
-            max_actions=max_actions,
-            min_actions=min_actions,
-            device=device,
-            hidden_dims=hidden_dims,
-            encoder=None,
-            tau=gumbel_tau,
-            hard=False,
-        ).float()
-        self.actor_target = MixedActor(
-            obs_dim,
-            continuous_action_dim=continuous_action_dim,
-            discrete_action_dims=discrete_action_dims,
-            max_actions=max_actions,
-            min_actions=min_actions,
-            device=device,
-            hidden_dims=hidden_dims,
-            encoder=None,
-            tau=gumbel_tau,
-            hard=False,
-        ).float()
-        if continuous_action_dim > 0:
-            self.min_actions = torch.from_numpy(np.array(min_actions)).to(self.device)
-            self.max_actions = torch.from_numpy(np.array(max_actions)).to(self.device)
+        self.hidden_dims = hidden_dims
 
+        self.total_action_dim = continuous_action_dim + np.sum(
+            np.array(discrete_action_dims)
+        )
         self.discrete_action_dims = discrete_action_dims
         self.continuous_action_dim = continuous_action_dim
         self.action_noise = action_noise
         self.step = 0
         self.rl_step = 0
+
+        self.min_actions = min_actions
+        self.max_actions = max_actions
+        self._get_torch_params()
+
+        if continuous_action_dim > 0:
+            self.min_actions = torch.from_numpy(np.array(min_actions)).to(self.device)
+            self.max_actions = torch.from_numpy(np.array(max_actions)).to(self.device)
+
+    def _get_torch_params(self):
+        self.actor = MixedActor(
+            self.obs_dim,
+            continuous_action_dim=self.continuous_action_dim,
+            discrete_action_dims=self.discrete_action_dims,
+            max_actions=self.max_actions,
+            min_actions=self.min_actions,
+            device=self.device,
+            hidden_dims=self.hidden_dims,
+            encoder=None,
+            tau=self.gumbel_tau,
+            hard=False,
+        ).float()
+        self.actor_target = MixedActor(
+            self.obs_dim,
+            continuous_action_dim=self.continuous_action_dim,
+            discrete_action_dims=self.discrete_action_dims,
+            max_actions=self.max_actions,
+            min_actions=self.min_actions,
+            device=self.device,
+            hidden_dims=self.hidden_dims,
+            encoder=None,
+            tau=self.gumbel_tau,
+            hard=False,
+        ).float()
+
         self.actor_target.load_state_dict(self.actor.state_dict())
 
-        self.actor.to(device)
-        self.actor_target.to(device)
+        self.actor.to(self.device)
+        self.actor_target.to(self.device)
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters())
 
         self.critic1 = ValueSA(
-            obs_dim, self.total_action_dim, hidden_dim=hidden_dims[-1], device=device
+            self.obs_dim,
+            self.total_action_dim,
+            hidden_dim=self.hidden_dims[-1],
+            device=self.device,
         ).float()
         self.critic2 = ValueSA(
-            obs_dim, self.total_action_dim, hidden_dim=hidden_dims[-1], device=device
+            self.obs_dim,
+            self.total_action_dim,
+            hidden_dim=self.hidden_dims[-1],
+            device=self.device,
         ).float()
         self.critic1_target = ValueSA(
-            obs_dim, self.total_action_dim, hidden_dim=hidden_dims[-1], device=device
+            self.obs_dim,
+            self.total_action_dim,
+            hidden_dim=self.hidden_dims[-1],
+            device=self.device,
         ).float()
         self.critic2_target = ValueSA(
-            obs_dim, self.total_action_dim, hidden_dim=hidden_dims[-1], device=device
+            self.obs_dim,
+            self.total_action_dim,
+            hidden_dim=self.hidden_dims[-1],
+            device=self.device,
         ).float()
         self.critic1_target.load_state_dict(self.critic1.state_dict())
         self.critic2_target.load_state_dict(self.critic2.state_dict())
         # self.critic2.load_state_dict(self.critic1.state_dict())
-        self.critic1.to(device)
-        self.critic2.to(device)
-        self.critic1_target.to(device)
-        self.critic2_target.to(device)
+        self.critic1.to(self.device)
+        self.critic2.to(self.device)
+        self.critic1_target.to(self.device)
+        self.critic2_target.to(self.device)
         self.critic_optimizer = torch.optim.Adam(
             list(self.critic1.parameters()) + list(self.critic2.parameters())
         )
@@ -424,6 +470,17 @@ class TD3(Agent):
 
         return qtot / 5.0
 
+    def _dump_attr(self, attr, path):
+        f = open(path, "wb")
+        pickle.dump(attr, f)
+        f.close()
+
+    def _load_attr(self, path):
+        f = open(path, "rb")
+        d = pickle.load(f)
+        f.close()
+        return d
+
     def save(self, checkpoint_path):
         if self.eval_mode:
             print("Not saving because model in eval mode")
@@ -443,9 +500,32 @@ class TD3(Agent):
         torch.save(self.actor.state_dict(), checkpoint_path + "/actor")
         torch.save(self.actor_target.state_dict(), checkpoint_path + "/actor_target")
 
+        for i in range(len(self.attrs)):
+            self._dump_attr(
+                self.__dict__[self.attrs[i]], checkpoint_path + f"/{self.attrs[i]}"
+            )
+
     def load(self, checkpoint_path):
         if checkpoint_path is None:
             checkpoint_path = "./" + self.name + "/"
+
+        for i in range(len(self.attrs)):
+            self.__dict__[self.attrs[i]] = self._load_attr(
+                checkpoint_path + f"/{self.attrs[i]}"
+            )
+        self.total_action_dim = self.continuous_action_dim + np.sum(
+            np.array(self.discrete_action_dims)
+        )
+        if self.continuous_action_dim > 0:
+            self.min_actions = torch.from_numpy(np.array(self.min_actions)).to(
+                self.device
+            )
+            self.max_actions = torch.from_numpy(np.array(self.max_actions)).to(
+                self.device
+            )
+
+        self._get_torch_params()
+
         self.actor.load_state_dict(torch.load(checkpoint_path + "/actor"))
         self.actor_target.load_state_dict(torch.load(checkpoint_path + "/actor_target"))
         self.critic1.load_state_dict(torch.load(checkpoint_path + "/critic1"))

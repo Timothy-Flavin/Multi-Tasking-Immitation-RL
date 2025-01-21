@@ -4,6 +4,8 @@ import torch
 from torch.distributions import Categorical
 from flexibuddiesrl.Agent import QS
 from flexibuff import FlexiBatch
+import os
+import pickle
 
 from enum import Enum
 
@@ -17,7 +19,7 @@ class dqntype(Enum):
 class DQN(nn.Module):
     def __init__(
         self,
-        obs_dim,
+        obs_dim=10,
         discrete_action_dims=None,  # np.array([2]),
         continuous_action_dims=None,  # 2,
         min_actions=None,  # np.array([-1,-1]),
@@ -31,11 +33,18 @@ class DQN(nn.Module):
         entropy=0,  # turns it into soft-dqn
         activation="relu",
         orthogonal=False,
-        action_epsilon=0.9,
+        init_eps=0.9,
         eps_decay_half_life=10000,
         device="cpu",
+        eval_mode=False,
+        name="DQN",
+        load_from_checkpoint_path=None,
     ):
         super(DQN, self).__init__()
+        if load_from_checkpoint_path is not None:
+            self.load(load_from_checkpoint_path)
+            return
+        self.eval_mode = eval_mode
         self.entropy_loss_coef = entropy  # use soft Q learning entropy loss or not H(Q)
         self.dqn_type = dqntype.EGreedy
         if self.entropy_loss_coef > 0:
@@ -50,6 +59,7 @@ class DQN(nn.Module):
         self.continuous_action_dims = continuous_action_dims
         # number of continuous actions
 
+        self.name = name
         self.min_actions = min_actions  # min continuous action value
         self.max_actions = max_actions  # max continuous action value
         if max_actions is not None:
@@ -65,10 +75,15 @@ class DQN(nn.Module):
         self.n_c_action_bins = n_c_action_bins  # number of discrete action bins to discretize continuous actions
         self.munchausen = munchausen  # use munchausen loss or not
         self.twin = False  # min(double q) to reduce bias
-        self.init_eps = action_epsilon  # starting eps_greedy epsilon
+        self.init_eps = init_eps  # starting eps_greedy epsilon
         self.eps = self.init_eps
-        self.half_life = eps_decay_half_life  # eps cut in half every 'half_life' frames
+        self.eps_decay_half_life = (
+            eps_decay_half_life  # eps cut in half every 'half_life' frames
+        )
         self.step = 0
+        self.hidden_dims = hidden_dims
+        self.activation = activation
+        self.orthogonal = orthogonal
         self.Q1 = QS(
             obs_dim=obs_dim,
             continuous_action_dim=continuous_action_dims,
@@ -86,6 +101,27 @@ class DQN(nn.Module):
         self.device = device
         self.optimizer = torch.optim.Adam(self.Q1.parameters(), lr=lr)
         self.to(device)
+
+        # These can be saved to remake the same DQN
+        self.attrs = [
+            "step",
+            "entropy_loss_coef",
+            "munchausen",
+            "discrete_action_dims",
+            "continuous_action_dims",
+            "min_actions",
+            "max_actions",
+            "gamma",
+            "lr",
+            "dueling",
+            "n_c_action_bins",
+            "init_eps",
+            "eps_decay_half_life",
+            "device",
+            "eval_mode",
+            "hidden_dims",
+            "activation",
+        ]
 
     def _cont_from_q(self, cont_act):
         return (
@@ -115,7 +151,9 @@ class DQN(nn.Module):
     ):
         disc_act, cont_act = None, None
         if self.init_eps > 0.0:
-            self.eps = self.init_eps * (1 - self.step / (self.step + self.half_life))
+            self.eps = self.init_eps * (
+                1 - self.step / (self.step + self.eps_decay_half_life)
+            )
         value = 0
         if self.init_eps > 0.0 and np.random.rand() < self.eps:
             if len(self.discrete_action_dims) > 0:
@@ -263,6 +301,8 @@ class DQN(nn.Module):
     def reinforcement_learn(
         self, batch: FlexiBatch, agent_num=0, critic_only=False, debug=False
     ):
+        if self.eval_mode:
+            return 0, 0
         if debug:
             print("\nDoing Reinforcement learn \n")
         dqloss = 0
@@ -464,11 +504,75 @@ class DQN(nn.Module):
             cqloss.item() if torch.is_tensor(cqloss) else cqloss,
         )  # actor loss, critic loss
 
+    def _dump_attr(self, attr, path):
+        f = open(path, "wb")
+        pickle.dump(attr, f)
+        f.close()
+
+    def _load_attr(self, path):
+        f = open(path, "rb")
+        d = pickle.load(f)
+        f.close()
+        return d
+
     def save(self, checkpoint_path):
-        print("Save not implemeted")
+        if self.eval_mode:
+            print("Not saving because model in eval mode")
+            return
+        if checkpoint_path is None:
+            checkpoint_path = "./" + self.name + "/"
+        if not os.path.exists(checkpoint_path):
+            os.makedirs(checkpoint_path)
+        torch.save(self.Q1.state_dict(), checkpoint_path + "/Q1")
+        for i in range(len(self.attrs)):
+            self._dump_attr(
+                self.__dict__[self.attrs[i]], checkpoint_path + f"/{self.attrs[i]}"
+            )
 
     def load(self, checkpoint_path):
-        print("Load not implemented")
+        if checkpoint_path is None:
+            checkpoint_path = "./" + self.name + "/"
+
+        for i in range(len(self.attrs)):
+            self.__dict__[self.attrs[i]] = self._load_attr(
+                checkpoint_path + f"/{self.attrs[i]}"
+            )
+
+        self.dqn_type = dqntype.EGreedy
+        if self.entropy_loss_coef > 0:
+            self.dqn_type = dqntype.Soft
+        if self.entropy_loss_coef > 0 and self.munchausen > 0:
+            self.dqn_type = dqntype.Munchausen
+        if self.max_actions is not None:
+            self.np_action_ranges = self.max_actions - self.min_actions
+            self.action_ranges = torch.from_numpy(self.np_action_ranges).to(self.device)
+            self.np_action_means = (self.max_actions + self.min_actions) / 2
+            self.action_means = torch.from_numpy(self.np_action_means).to(self.device)
+
+        self.Q1 = QS(
+            obs_dim=obs_dim,
+            continuous_action_dim=self.continuous_action_dims,
+            discrete_action_dims=self.discrete_action_dims,
+            hidden_dims=self.hidden_dims,
+            activation=self.activation,
+            orthogonal=self.orthogonal,
+            dueling=self.dueling,
+            n_c_action_bins=self.n_c_action_bins,
+            device=self.device,
+        )
+        self.Q1.load_state_dict(torch.load(checkpoint_path + "/Q1"))
+        self.Q1.to(self.device)
+
+        self.optimizer = torch.optim.Adam(self.Q1.parameters(), lr=self.lr)
+        self.to(self.device)
+
+    def __str__(self):
+        st = ""
+
+        for i in self.__dict__.keys():
+            st += f"i: {self.__dict__[i]}"
+
+        return st
 
 
 if __name__ == "__main__":

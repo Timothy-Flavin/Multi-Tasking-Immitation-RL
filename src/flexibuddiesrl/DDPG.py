@@ -384,6 +384,12 @@ class DDPG(Agent):
         pickle.dump(attr, f)
         f.close()
 
+    def _load_attr(self, path):
+        f = open(path, "rb")
+        d = pickle.load(f)
+        f.close()
+        return d
+
     def save(self, checkpoint_path):
         if self.eval_mode:
             print("Not saving because model in eval mode")
