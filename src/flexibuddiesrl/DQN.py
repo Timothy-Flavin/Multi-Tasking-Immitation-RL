@@ -178,7 +178,7 @@ class DQN(nn.Module):
 
     def train_actions(self, observations, action_mask=None, step=False, debug=False):
 
-        if self.dqn_type == dqntype.EGreedy:
+        if self.dqn_type == dqntype.EGreedy or self.dqn_type == dqntype.Munchausen:
             disc_act, cont_act = self._e_greedy_train_action(
                 observations, action_mask, step, debug
             )
@@ -274,7 +274,7 @@ class DQN(nn.Module):
             dnv_ = 0
             cnv_ = 0
             if self.dueling:
-                dnv_ = next_values.squeeze(-1)
+                dnv_ = next_values
                 cnv_ = (  # Reshaping this to match the shape of next_cont_adv
                     next_values.expand(-1, self.continuous_action_dims)
                     .unsqueeze(-1)
@@ -297,7 +297,9 @@ class DQN(nn.Module):
                 ).to(self.device)
                 for i in range(len(self.discrete_action_dims)):
                     if self.dqn_type == dqntype.EGreedy:
-                        dQ_[:, i] = torch.max(next_disc_adv[i], dim=-1).values + dnv_
+                        dQ_[:, i] = torch.max(
+                            next_disc_adv[i], dim=-1
+                        ).values + dnv_.unsqueeze(-1)
                     elif self.dqn_type == dqntype.Soft:
                         dQ_[:, i] = torch.sum(
                             torch.softmax(next_disc_adv[i], dim=-1)
@@ -327,7 +329,7 @@ class DQN(nn.Module):
         cnv = 0
         if self.dueling:
             dnv = values.squeeze(-1)
-            cnv = values.expand(-1, self.continuous_action_dims)
+            cnv = values.expand(-1, self.continuous_action_dims).unsqueeze(-1)
 
         if self.discrete_action_dims is not None and len(self.discrete_action_dims) > 0:
             dQ = torch.zeros(
@@ -366,26 +368,29 @@ class DQN(nn.Module):
             else:
                 dqloss = 0
                 for h in range(len(disc_adv)):
-                    next_probs = torch.softmax(next_disc_adv[h], dim=-1)
-                    a_prob = torch.softmax(disc_adv[h], dim=-1)
-                    a_prob = torch.gather(
-                        a_prob,
-                        dim=-1,
-                        index=batch.discrete_actions[agent_num, :, h].unsqueeze(-1),
-                    ).squeeze(-1)
-                    dqloss += (
-                        batch.global_rewards
-                        + self.munchausen * self.entropy_loss_coef * torch.log(a_prob)
-                        + self.gamma
-                        * torch.sum(
+                    with torch.no_grad():
+                        next_probs = torch.softmax(next_disc_adv[h], dim=-1)
+                        lnprobs = torch.log(
+                            torch.softmax(disc_adv[h], dim=-1).gather(
+                                index=batch.discrete_actions[agent_num, :, h].unsqueeze(
+                                    -1
+                                ),
+                                dim=-1,
+                            )
+                        ).squeeze(-1)
+                        dQ_ = torch.sum(
                             next_probs
                             * (
-                                next_disc_adv[h]
+                                (next_disc_adv[h] + dnv_ if self.dueling else 0)
                                 - self.entropy_loss_coef * torch.log(next_probs)
                             ),
                             dim=-1,
                         )
-                        - dQ[:, h]
+                    dqloss += (
+                        dQ[:, h]
+                        - batch.global_rewards
+                        - (self.munchausen * self.entropy_loss_coef * lnprobs)
+                        - (self.gamma * (1 - batch.terminated)) * dQ_
                     ) ** 2
             dqloss = dqloss.mean()
 
@@ -421,30 +426,32 @@ class DQN(nn.Module):
                 cqloss += torch.sum(cprob * torch.log(cprob), dim=-1)
             else:
                 cqloss = 0
-                probs = torch.softmax(torch.stack(cont_adv, dim=1), dim=-1)
-
-                next_ca = torch.stack(next_cont_adv, dim=1)
-                next_probs = torch.softmax(next_ca, dim=-1)
-                a_prob = torch.log(
-                    torch.gather(
-                        probs,
-                        dim=-1,
-                        index=self._discretize_actions(
-                            batch.continuous_actions[agent_num]
-                        ).unsqueeze(-1),
-                    ).squeeze(-1)
-                )
-
-                cqloss = (
-                    batch.global_rewards.unsqueeze(-1)
-                    + self.munchausen * self.entropy_loss_coef * a_prob
-                    + self.gamma
-                    * torch.sum(
+                with torch.no_grad():
+                    stacknc = torch.stack(next_cont_adv, dim=1)
+                    next_probs = torch.softmax(stacknc, dim=-1)
+                    lnprobs = torch.log(
+                        torch.softmax(torch.stack(cont_adv, dim=1), dim=-1)
+                        .gather(
+                            index=self._discretize_actions(
+                                batch.continuous_actions[agent_num]
+                            ).unsqueeze(-1),
+                            dim=-1,
+                        )
+                        .squeeze(-1)
+                    )
+                    cQ_ = torch.sum(
                         next_probs
-                        * (next_ca - self.entropy_loss_coef * torch.log(next_probs)),
+                        * (
+                            (stacknc + cnv_ if self.dueling else 0)
+                            - self.entropy_loss_coef * torch.log(next_probs)
+                        ),
                         dim=-1,
                     )
-                    - cQ
+                cqloss = (
+                    cQ
+                    - batch.global_rewards.unsqueeze(-1)
+                    - (self.munchausen * self.entropy_loss_coef * lnprobs)
+                    - (self.gamma * (1 - batch.terminated).unsqueeze(-1)) * cQ_
                 ) ** 2
             cqloss = cqloss.mean()
         loss = dqloss + cqloss
@@ -452,10 +459,6 @@ class DQN(nn.Module):
         loss.backward()
         self.optimizer.step()
 
-        print(f" loss: {loss}")
-        print(f" dqloss: {dqloss}")
-        print(f" cqloss: {cqloss}")
-        input()
         return (
             dqloss.item() if torch.is_tensor(dqloss) else dqloss,
             cqloss.item() if torch.is_tensor(cqloss) else cqloss,
