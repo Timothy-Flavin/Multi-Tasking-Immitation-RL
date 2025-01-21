@@ -286,7 +286,7 @@ if __name__ == "__main__":
                 discrete_action_dims=[discrete_env.action_space.n],
                 hidden_dims=[64, 64],
                 device="cuda:0",
-                lr=3e-5,
+                lr=3e-4,
                 activation="relu",
                 dueling=True,
                 n_c_action_bins=5,
@@ -375,7 +375,29 @@ if __name__ == "__main__":
         results[n] = []
 
     for n in range(len(names)):
+
+        print("Testing Model ", names[n])
         mem_buffer.reset()
+        print("Testing Discrete Environment")
+        rewards, aloss, closs = test_single_env(
+            env=discrete_env,
+            agent=models[n],
+            buffer=mem_buffer,
+            n_episodes=5000 if names[n] == "PG" else 1000,
+            discrete=True,
+            joint_obs_dim=joint_obs_dim,
+            online=names[n] in ["PPO", "PG"],
+        )
+        print(rewards)
+        plt.plot(rewards)
+        plt.show()
+        am = np.abs(aloss).max()
+        cm = np.abs(closs).max()
+        plt.plot(aloss / am)
+        plt.plot(closs / cm)
+        plt.legend([f"actor {am}", f"critic {cm}"])
+        plt.show()
+        models[n].save(f"../../TestModels/{names[n]}_Discrete")
 
         mem_buffer.reset()
         print("Testing Continuous Environment")
@@ -400,29 +422,6 @@ if __name__ == "__main__":
         models[n].save(f"../../TestModels/{names[n]}_Continuous")
 
         models, names = make_models()
-
-        print("Testing Model ", names[n])
-        mem_buffer.reset()
-        print("Testing Discrete Environment")
-        rewards, aloss, closs = test_single_env(
-            env=discrete_env,
-            agent=models[n],
-            buffer=mem_buffer,
-            n_episodes=5000 if names[n] == "PG" else 1000,
-            discrete=True,
-            joint_obs_dim=joint_obs_dim,
-            online=names[n] in ["PPO", "PG"],
-        )
-        print(rewards)
-        plt.plot(rewards)
-        plt.show()
-        am = np.abs(aloss).max()
-        cm = np.abs(closs).max()
-        plt.plot(aloss / am)
-        plt.plot(closs / cm)
-        plt.legend([f"actor {am}", f"critic {cm}"])
-        plt.show()
-        models[n].save(f"../../TestModels/{names[n]}_Discrete")
 
         continue
 

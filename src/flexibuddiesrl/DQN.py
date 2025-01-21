@@ -4,6 +4,14 @@ import torch
 from flexibuddiesrl.Agent import QS
 from flexibuff import FlexiBatch
 
+from enum import Enum
+
+
+class dqntype(Enum):
+    EGreedy = 0
+    Soft = 1
+    Munchausen = 2
+
 
 class DQN(nn.Module):
     def __init__(
@@ -18,10 +26,8 @@ class DQN(nn.Module):
         lr=3e-5,
         dueling=False,
         n_c_action_bins=10,
-        munchausen=0,
-        entropy=0,
-        twin=False,
-        delayed=False,
+        munchausen=0,  # turns it into munchausen dqn
+        entropy=0,  # turns it into soft-dqn
         activation="relu",
         orthogonal=False,
         action_epsilon=0.9,
@@ -29,6 +35,13 @@ class DQN(nn.Module):
         device="cpu",
     ):
         super(DQN, self).__init__()
+
+        self.dqn_type = dqntype.EGreedy
+        if self.entropy_loss_coef > 0:
+            self.dqn_type = dqntype.Soft
+        if self.entropy_loss_coef > 0 and munchausen > 0:
+            self.dqn_type = dqntype.Munchausen
+
         self.obs_dim = obs_dim  # size of observation
         self.discrete_action_dims = discrete_action_dims
         # cardonality for each discrete action
@@ -67,25 +80,11 @@ class DQN(nn.Module):
             n_c_action_bins=n_c_action_bins,
             device=device,
         )
-        # used for dual q learning
-        self.Q2 = QS(
-            obs_dim=obs_dim,
-            continuous_action_dim=continuous_action_dims,
-            discrete_action_dims=discrete_action_dims,
-            hidden_dims=hidden_dims,
-            activation=activation,
-            orthogonal=orthogonal,
-            dueling=dueling,
-            n_c_action_bins=n_c_action_bins,
-            device=device,
-        )
+        
         self.Q1.to(device)
-        self.Q2.to(device)
 
         self.device = device
-        self.optimizer = torch.optim.Adam(
-            list(self.Q1.parameters()) + list(self.Q2.parameters()), lr=lr
-        )
+        self.optimizer = torch.optim.Adam(self.Q1.parameters(), lr=lr)
         self.to(device)
 
     def _cont_from_q(self, cont_act):
@@ -105,12 +104,11 @@ class DQN(nn.Module):
             self.n_c_action_bins - 1,
         )
 
-    def train_actions(self, observations, action_mask=None, step=False, debug=False):
+    def _e_greedy_train_action(self, observations, action_mask=None, step=False, debug=False)
         disc_act, cont_act = None, None
         if self.init_eps > 0.0:
             self.eps = self.init_eps * (1 - self.step / (self.step + self.half_life))
         value = 0
-
         if self.init_eps > 0.0 and np.random.rand() < self.eps:
             if len(self.discrete_action_dims) > 0:
                 disc_act = np.zeros(
@@ -122,13 +120,7 @@ class DQN(nn.Module):
             if self.continuous_action_dims > 0:
                 cont_act = (
                     np.random.rand(self.continuous_action_dims) - 0.5
-                ) * self.np_action_ranges - self.np_action_means  # np.zeros(shape=self.continuous_action_dims, dtype=np.int32)
-                # for i in range(self.continuous_action_dims):
-                #    cont_act[i] = np.random.random()#
-                #
-                # cont_act = (
-                #    cont_act * 1.0 / (self.n_c_action_bins - 1)
-                # ) * self.np_action_ranges - self.np_action_means
+                ) * self.np_action_ranges - self.np_action_means  
 
         else:
             with torch.no_grad():
@@ -137,12 +129,9 @@ class DQN(nn.Module):
                 # print(value, disc_act, cont_act)
                 if len(self.discrete_action_dims) > 0:
                     d_act = np.zeros(len(disc_act), dtype=np.int32)
-                    if len(self.discrete_action_dims) > 0:
-                        for i, da in enumerate(disc_act):
-                            d_act[i] = torch.argmax(da).detach().cpu().item()
-
+                    for i, da in enumerate(disc_act):
+                        d_act[i] = torch.argmax(da).detach().cpu().item()
                     disc_act = d_act
-
                 if self.continuous_action_dims > 0:
                     if debug:
                         print(
@@ -152,6 +141,33 @@ class DQN(nn.Module):
                             f"  Trying to store this in actions {((torch.argmax(torch.stack(cont_act,dim=0),dim=-1)/ (self.n_c_action_bins - 1) -0.5)* self.action_ranges+ self.action_means)} calculated from da: {cont_act} with ranges: {self.action_ranges} and means: {self.action_means}"
                         )
                     cont_act = self._cont_from_q(cont_act).cpu().numpy()
+        return disc_act,cont_act
+
+    def _soft_train_action(self,observations,action_mask,step,debug):
+        disc_act, cont_act = None, None
+        with torch.no_grad():
+            value, disc_act, cont_act = self.Q1(observations, action_mask)
+            if len(self.discrete_action_dims) > 0:
+                d_act = np.zeros(len(disc_act), dtype=np.int32)
+                for i, da in enumerate(disc_act):
+                    d_act[i] = torch.argmax(da).detach().cpu().item()
+                disc_act = d_act
+
+            if self.continuous_action_dims > 0:
+                if debug:
+                    print(
+                        f"  cont act {cont_act}, argmax: {torch.argmax(torch.stack(cont_act,dim=0),dim=-1).detach().cpu()}"
+                    )
+                    print(
+                        f"  Trying to store this in actions {((torch.argmax(torch.stack(cont_act,dim=0),dim=-1)/ (self.n_c_action_bins - 1) -0.5)* self.action_ranges+ self.action_means)} calculated from da: {cont_act} with ranges: {self.action_ranges} and means: {self.action_means}"
+                    )
+                cont_act = self._cont_from_q(cont_act).cpu().numpy()
+    def train_actions(self, observations, action_mask=None, step=False, debug=False):
+        
+        if self.dqn_type == dqntype.EGreedy:
+            disc_act,cont_act = self._e_greedy_train_action(observations,action_mask,step,debug)
+        else:
+            disc_act,cont_act = self._soft_train_action(observations,action_mask,step,debug)
 
         self.step += int(step)
         return disc_act, cont_act, 0, 0, 0
@@ -320,11 +336,48 @@ class DQN(nn.Module):
                     + dnv
                 )
 
-            dqloss = (
-                dQ
-                - batch.global_rewards.unsqueeze(-1)
-                - (self.gamma * (1 - batch.terminated)).unsqueeze(-1) * dQ_
-            ) ** 2
+            if self.entropy_loss_coef <= 0 and self.munchausen <= 0:
+                dqloss = (
+                    dQ
+                    - batch.global_rewards.unsqueeze(-1)
+                    - (self.gamma * (1 - batch.terminated)).unsqueeze(-1) * dQ_
+                ) ** 2
+
+            elif self.entropy_loss_coef > 0 and self.munchausen <= 0:
+                dqloss = (
+                    dQ
+                    - batch.global_rewards.unsqueeze(-1)
+                    - (self.gamma * (1 - batch.terminated)).unsqueeze(-1) * dQ_
+                ) ** 2
+                for h in range(len(disc_adv)):
+                    probs = torch.softmax(disc_adv[h], dim=-1)
+                    dqloss += self.entropy_loss_coef * torch.sum(
+                        probs * torch.log(probs), dim=-1
+                    )
+            else:
+                dqloss = 0
+                for h in range(len(disc_adv)):
+                    probs = torch.softmax(next_disc_adv[h], dim=-1)
+                    a_prob = torch.log(disc_adv)
+                    a_prob = torch.gather(
+                        a_prob,
+                        dim=-1,
+                        index=batch.discrete_actions[agent_num, :, i].unsqueeze(-1),
+                    ).squeeze(-1)
+                    dqloss += (
+                        batch.global_rewards.unsqueeze(-1)
+                        + self.munchausen * self.entropy_loss_coef * torch.log(a_prob)
+                        + self.gamma
+                        * torch.sum(
+                            probs
+                            * (
+                                next_disc_adv[h]
+                                - self.entropy_loss_coef * torch.log(probs)
+                            ),
+                            dim=-1,
+                        )
+                        - disc_adv
+                    ) ** 2
 
         if self.continuous_action_dims is not None and self.continuous_action_dims > 0:
             if debug:
