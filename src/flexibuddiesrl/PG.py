@@ -99,7 +99,7 @@ class PG(nn.Module, Agent):
         self.activation = activation
         self.norm_advantages = norm_advantages
 
-        self.policy_loss = 5.0
+        self.policy_loss = 1.0
         self.critic_loss_coef = value_loss_coef
         self.entropy_loss = entropy_loss
 

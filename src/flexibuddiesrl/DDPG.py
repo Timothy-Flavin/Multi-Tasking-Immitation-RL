@@ -173,17 +173,17 @@ class DDPG(Agent):
                 )
                 print("DDPG noise: ", self.__noise__(continuous_actions))
 
-            value = self.critic(
-                x=observations,
-                u=torch.cat(
-                    (
-                        continuous_actions + self.__noise__(continuous_actions),
-                        discrete_action_activations[0],
-                    ),  # TODO: Cat all discrete actions
-                    dim=-1,
-                ),
-                debug=debug,
-            )
+            # value = self.critic(
+            #     x=observations,
+            #     u=torch.cat(
+            #         (
+            #             continuous_actions + self.__noise__(continuous_actions),
+            #             discrete_action_activations[0],
+            #         ),  # TODO: Cat all discrete actions
+            #         dim=-1,
+            #     ),
+            #     debug=debug,
+            # )
             if len(observations.shape) > 1:
                 discrete_actions = torch.zeros(
                     (observations.shape[0], len(discrete_action_activations)),
@@ -216,7 +216,7 @@ class DDPG(Agent):
                 continuous_actions,
                 discrete_logprobs,
                 continuous_logprobs,
-                value.detach().cpu().numpy(),
+                0,
             )
 
     def reinforcement_learn(

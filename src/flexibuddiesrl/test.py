@@ -10,8 +10,8 @@ from DQN import DQN
 import torch
 
 
-gym_disc_env = "LunarLander-v2"  # "CartPole-v1"  #
-gym_cont_env = "LunarLander-v2"  # "Pendulum-v1"  # "HalfCheetah-v4"
+gym_disc_env = "CartPole-v1"  # "LunarLander-v2"  # "CartPole-v1"  #
+gym_cont_env = "LunarLander-v2"  # "LunarLander-v2"  # "Pendulum-v1"  # "HalfCheetah-v4"
 
 
 def test_single_env(
@@ -152,17 +152,35 @@ def test_single_env(
             # print(agent.eps)
             if episode % (er * 5) == 0:
                 print("human animating")
-                env = gym.make(
-                    gym_disc_env if discrete else gym_cont_env,
-                    render_mode="human",
-                    continuous=not discrete,
-                )
+                if (
+                    gym_disc_env == "LunarLander-v2"
+                    and discrete
+                    or (gym_cont_env == "LunarLander-v2" and not discrete)
+                ):
+                    env = gym.make(
+                        gym_disc_env if discrete else gym_cont_env,
+                        render_mode="human",
+                        continuous=not discrete,
+                    )
+                else:
+                    env = gym.make(
+                        gym_disc_env if discrete else gym_cont_env,
+                        render_mode="human",
+                    )
         if episode % er == 1 and episode > 1:
             print("no more human")
             env.close()
-            env = gym.make(
-                id=(gym_disc_env if discrete else gym_cont_env), continuous=not discrete
-            )
+            if (
+                gym_disc_env == "LunarLander-v2"
+                and discrete
+                or (gym_cont_env == "LunarLander-v2" and not discrete)
+            ):
+                env = gym.make(
+                    id=(gym_disc_env if discrete else gym_cont_env),
+                    continuous=not discrete,
+                )
+            else:
+                env = gym.make(id=(gym_disc_env if discrete else gym_cont_env))
         episode += 1
         # env = gym.make("CartPole-v1")
 
@@ -257,10 +275,18 @@ def test_dual_env(
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
 
-    discrete_env = gym.make(
-        gym_disc_env, continuous=False
-    )  # """MountainCar-v0")  # )   # , render_mode="human")
-    continuous_env = gym.make(gym_cont_env, continuous=True)
+    if gym_disc_env == "LunarLander-v2":
+        discrete_env = gym.make(
+            gym_disc_env, continuous=False
+        )  # """MountainCar-v0")  # )   # , render_mode="human")
+    else:
+        discrete_env = gym.make(gym_disc_env)
+
+    if gym_cont_env == "LunarLander-v2":
+        continuous_env = gym.make(gym_cont_env, continuous=True)
+    else:
+        continuous_env = gym.make(gym_cont_env)
+
     joint_obs_dim = (
         discrete_env.observation_space.shape[0]
         + continuous_env.observation_space.shape[0]
@@ -269,10 +295,10 @@ if __name__ == "__main__":
     def make_models():
         print("Making Model")
         names = [
-            "DQN",
             "PG",
             "TD3",
             "DDPG",
+            "DQN",
         ]
         print(
             continuous_env.action_space.low,
@@ -281,21 +307,6 @@ if __name__ == "__main__":
             continuous_env.action_space.shape[0],
         )
         models = [
-            DQN(
-                obs_dim=joint_obs_dim,
-                continuous_action_dims=continuous_env.action_space.shape[0],
-                max_actions=continuous_env.action_space.high,
-                min_actions=continuous_env.action_space.low,
-                discrete_action_dims=[discrete_env.action_space.n],
-                hidden_dims=[64, 64],
-                device="cuda:0",
-                lr=3e-4,
-                activation="relu",
-                dueling=True,
-                n_c_action_bins=5,
-                entropy=0.03,
-                munchausen=0.9,
-            ),
             PG(
                 obs_dim=joint_obs_dim,
                 discrete_action_dims=[discrete_env.action_space.n],
@@ -306,17 +317,17 @@ if __name__ == "__main__":
                 gamma=0.999,
                 device="cuda",
                 entropy_loss=0.01,
-                mini_batch_size=32,
+                mini_batch_size=64,
                 n_epochs=4,
                 lr=3e-4,
                 advantage_type="gae",
-                norm_advantages=True,
+                norm_advantages=False,
                 anneal_lr=2000000,
-                # value_loss_coef=0.5,  # 5,
+                value_loss_coef=0.5,  # 5,
                 ppo_clip=0.2,
                 value_clip=0.5,
                 orthogonal=True,
-                activation="relu",
+                activation="tanh",
                 starting_actorlogstd=0,
                 gae_lambda=0.98,
             ),
@@ -332,7 +343,7 @@ if __name__ == "__main__":
                 name="TD3_cd_test",
                 device="cuda",
                 eval_mode=False,
-                rand_steps=10000,
+                rand_steps=5000,
             ),
             DDPG(
                 obs_dim=joint_obs_dim,
@@ -346,7 +357,22 @@ if __name__ == "__main__":
                 name="TD3_cd_test",
                 device="cuda",
                 eval_mode=False,
-                rand_steps=10000,
+                rand_steps=5000,
+            ),
+            DQN(
+                obs_dim=joint_obs_dim,
+                continuous_action_dims=continuous_env.action_space.shape[0],
+                max_actions=continuous_env.action_space.high,
+                min_actions=continuous_env.action_space.low,
+                discrete_action_dims=[discrete_env.action_space.n],
+                hidden_dims=[64, 64],
+                device="cuda:0",
+                lr=3e-4,
+                activation="relu",
+                dueling=True,
+                n_c_action_bins=5,
+                entropy=0.03,
+                # munchausen=0.9,
             ),
         ]
         return models, names
@@ -391,14 +417,15 @@ if __name__ == "__main__":
             env=discrete_env,
             agent=models[n],
             buffer=mem_buffer,
-            n_episodes=200 if names[n] == "PG" else 100,
-            n_steps=15000,
+            n_episodes=300 if names[n] == "PG" else 300,
+            n_steps=30000 if names[n] == "PG" else 15000,
             discrete=True,
             joint_obs_dim=joint_obs_dim,
             online=names[n] in ["PPO", "PG"],
         )
         print(rewards)
         plt.plot(rewards)
+        plt.title("rewards")
         plt.show()
         am = np.abs(aloss).max()
         cm = np.abs(closs).max()
@@ -408,20 +435,23 @@ if __name__ == "__main__":
         plt.show()
         models[n].save(f"../../TestModels/{names[n]}_Discrete")
 
+        models, names = make_models()
+
         mem_buffer.reset()
         print("Testing Continuous Environment")
         rewards, aloss, closs = test_single_env(
             continuous_env,
             agent=models[n],
             buffer=mem_buffer,
-            n_episodes=200 if names[n] == "PG" else 100,
-            n_steps=15000,  # if names[n] == "PG" else 100,
+            n_episodes=1000 if names[n] == "PG" else 150,
+            n_steps=300000 if names[n] == "PG" else 15000,
             discrete=False,
             joint_obs_dim=joint_obs_dim,
             online=names[n] in ["PPO", "PG"],
         )
         print(rewards)
         plt.plot(rewards)
+        plt.title("rewards")
         plt.show()
 
         plt.plot(aloss)
@@ -429,8 +459,6 @@ if __name__ == "__main__":
         plt.legend(["actor", "critic"])
         plt.show()
         models[n].save(f"../../TestModels/{names[n]}_Continuous")
-
-        models, names = make_models()
 
         continue
 
