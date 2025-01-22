@@ -339,7 +339,7 @@ class DQN(nn.Module):
                     if self.dqn_type == dqntype.EGreedy:
                         dQ_[:, i] = torch.max(
                             next_disc_adv[i], dim=-1
-                        ).values + dnv_.unsqueeze(-1)
+                        ).values + dnv_.squeeze(-1)
                     elif self.dqn_type == dqntype.Soft:
                         dQ_[:, i] = torch.sum(
                             torch.softmax(next_disc_adv[i], dim=-1)

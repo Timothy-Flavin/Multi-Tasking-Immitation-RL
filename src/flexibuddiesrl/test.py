@@ -295,10 +295,10 @@ if __name__ == "__main__":
     def make_models():
         print("Making Model")
         names = [
+            "DQN",
             "TD3",
             "PG",
             "DDPG",
-            "DQN",
         ]
         print(
             continuous_env.action_space.low,
@@ -307,6 +307,21 @@ if __name__ == "__main__":
             continuous_env.action_space.shape[0],
         )
         models = [
+            DQN(
+                obs_dim=joint_obs_dim,
+                continuous_action_dims=continuous_env.action_space.shape[0],
+                max_actions=continuous_env.action_space.high,
+                min_actions=continuous_env.action_space.low,
+                discrete_action_dims=[discrete_env.action_space.n],
+                hidden_dims=[64, 64],
+                device="cuda:0",
+                lr=3e-4,
+                activation="relu",
+                dueling=True,
+                n_c_action_bins=5,
+                # entropy=0.03,
+                # munchausen=0.9,
+            ),
             TD3(
                 obs_dim=joint_obs_dim,
                 discrete_action_dims=[discrete_env.action_space.n],
@@ -358,21 +373,6 @@ if __name__ == "__main__":
                 device="cuda",
                 eval_mode=False,
                 rand_steps=5000,
-            ),
-            DQN(
-                obs_dim=joint_obs_dim,
-                continuous_action_dims=continuous_env.action_space.shape[0],
-                max_actions=continuous_env.action_space.high,
-                min_actions=continuous_env.action_space.low,
-                discrete_action_dims=[discrete_env.action_space.n],
-                hidden_dims=[64, 64],
-                device="cuda:0",
-                lr=3e-4,
-                activation="relu",
-                dueling=True,
-                n_c_action_bins=5,
-                entropy=0.03,
-                # munchausen=0.9,
             ),
         ]
         return models, names
