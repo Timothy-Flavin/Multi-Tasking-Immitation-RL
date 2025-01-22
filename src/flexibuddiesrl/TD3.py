@@ -331,10 +331,10 @@ class TD3(Agent):
                 batch.obs_[agent_num], mask_, gumbel=True
             )
             daa_ = discrete_action_activations_
-            # if len(discrete_action_activations_) == 1:
-            #     daa_ = discrete_action_activations_[0]
-            # else:
-            #     daa_ = torch.cat(discrete_action_activations_, dim=-1)
+            if len(discrete_action_activations_) == 1:
+                daa_ = discrete_action_activations_[0]
+            else:
+                daa_ = torch.cat(discrete_action_activations_, dim=-1)
 
             if debug:
                 print(
@@ -347,7 +347,7 @@ class TD3(Agent):
                 )
                 print("TD3 reinforcement_learn daa_: ", daa_)
                 # input()
-            u_ = torch.cat([self._add_noise(continuous_actions_)] + daa_, dim=-1)
+            u_ = torch.cat([self._add_noise(continuous_actions_), daa_], dim=-1)
 
             if debug:
                 print("u_: ", u_, "shape: ", u_.shape)
