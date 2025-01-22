@@ -139,10 +139,11 @@ class MixedActor(nn.Module):
         assert not (
             continuous_action_dim is None and discrete_action_dims is None
         ), "At least one action dim should be provided"
-        assert (
-            len(max_actions) == continuous_action_dim
-            and len(min_actions) == continuous_action_dim
-        ), f"max_actions should be provided for each continuous action dim {len(max_actions)},{continuous_action_dim}"
+        if continuous_action_dim is not None and continuous_action_dim > 0:
+            assert (
+                len(max_actions) == continuous_action_dim
+                and len(min_actions) == continuous_action_dim
+            ), f"max_actions should be provided for each continuous action dim {len(max_actions)},{continuous_action_dim}"
 
         # print(
         #    f"Min actions: {min_actions}, max actions: {max_actions}, torch {torch.from_numpy(max_actions - min_actions)}"
