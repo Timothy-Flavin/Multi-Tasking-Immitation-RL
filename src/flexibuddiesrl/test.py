@@ -11,7 +11,7 @@ import torch
 
 
 gym_disc_env = "CartPole-v1"  # "LunarLander-v2"  # "CartPole-v1"  #
-gym_cont_env = "LunarLander-v2"  # "LunarLander-v2"  # "Pendulum-v1"  # "HalfCheetah-v4"
+gym_cont_env = "LunarLander-v3"  # "LunarLander-v2"  # "Pendulum-v1"  # "HalfCheetah-v4"
 
 
 def test_single_env(
@@ -153,9 +153,9 @@ def test_single_env(
             if episode % (er * 5) == 0:
                 print("human animating")
                 if (
-                    gym_disc_env == "LunarLander-v2"
+                    gym_disc_env == "LunarLander-v3"
                     and discrete
-                    or (gym_cont_env == "LunarLander-v2" and not discrete)
+                    or (gym_cont_env == "LunarLander-v3" and not discrete)
                 ):
                     env = gym.make(
                         gym_disc_env if discrete else gym_cont_env,
@@ -171,9 +171,9 @@ def test_single_env(
             print("no more human")
             env.close()
             if (
-                gym_disc_env == "LunarLander-v2"
+                gym_disc_env == "LunarLander-v3"
                 and discrete
-                or (gym_cont_env == "LunarLander-v2" and not discrete)
+                or (gym_cont_env == "LunarLander-v3" and not discrete)
             ):
                 env = gym.make(
                     id=(gym_disc_env if discrete else gym_cont_env),
@@ -282,7 +282,7 @@ if __name__ == "__main__":
     else:
         discrete_env = gym.make(gym_disc_env)
 
-    if gym_cont_env == "LunarLander-v2":
+    if gym_cont_env == "LunarLander-v3":
         continuous_env = gym.make(gym_cont_env, continuous=True)
     else:
         continuous_env = gym.make(gym_cont_env)
@@ -295,8 +295,8 @@ if __name__ == "__main__":
     def make_models():
         print("Making Model")
         names = [
-            "PG",
             "TD3",
+            "PG",
             "DDPG",
             "DQN",
         ]
@@ -307,6 +307,20 @@ if __name__ == "__main__":
             continuous_env.action_space.shape[0],
         )
         models = [
+            TD3(
+                obs_dim=joint_obs_dim,
+                discrete_action_dims=[discrete_env.action_space.n],
+                continuous_action_dim=continuous_env.action_space.shape[0],
+                min_actions=continuous_env.action_space.low,
+                max_actions=continuous_env.action_space.high,
+                hidden_dims=np.array([64, 64]),
+                gamma=0.99,
+                policy_frequency=2,
+                name="TD3_cd_test",
+                device="cuda",
+                eval_mode=False,
+                rand_steps=5000,
+            ),
             PG(
                 obs_dim=joint_obs_dim,
                 discrete_action_dims=[discrete_env.action_space.n],
@@ -330,20 +344,6 @@ if __name__ == "__main__":
                 activation="tanh",
                 starting_actorlogstd=0,
                 gae_lambda=0.98,
-            ),
-            TD3(
-                obs_dim=joint_obs_dim,
-                discrete_action_dims=[discrete_env.action_space.n],
-                continuous_action_dim=continuous_env.action_space.shape[0],
-                min_actions=continuous_env.action_space.low,
-                max_actions=continuous_env.action_space.high,
-                hidden_dims=np.array([64, 64]),
-                gamma=0.99,
-                policy_frequency=2,
-                name="TD3_cd_test",
-                device="cuda",
-                eval_mode=False,
-                rand_steps=5000,
             ),
             DDPG(
                 obs_dim=joint_obs_dim,
@@ -378,7 +378,7 @@ if __name__ == "__main__":
         return models, names
 
     print("Making Discrete Flexible Buffers")
-
+    print(continuous_env.action_space.shape)
     mem_buffer = FlexibleBuffer(
         num_steps=50000,
         track_action_mask=False,

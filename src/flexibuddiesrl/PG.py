@@ -116,6 +116,9 @@ class PG(nn.Module, Agent):
 
         self._get_torch_params(starting_actorlogstd)
 
+        self.min_actions = torch.from_numpy(min_actions).to(self.device)
+        self.max_actions = torch.from_numpy(max_actions).to(self.device)
+
     def _get_torch_params(self, starting_actorlogstd):
         self.actor = MixedActor(
             obs_dim=self.obs_dim,
