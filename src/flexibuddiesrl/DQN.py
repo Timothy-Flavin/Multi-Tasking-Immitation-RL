@@ -196,12 +196,16 @@ class DQN(nn.Module):
             if len(self.discrete_action_dims) > 0:
                 dact = np.zeros(len(disc_act), dtype=np.int64)
                 for i, da in enumerate(disc_act):
+                    if self.step > 10000:
+                        print(torch.softmax(da, dim=-1))
                     dact[i] = (
                         Categorical(probs=torch.softmax(da, dim=-1))
                         .sample()
                         .cpu()
                         .item()
                     )
+                    if self.step > 10000:
+                        print(dact)
                 disc_act = dact  # had to store da temporarily to keep using disc_act
             if self.continuous_action_dims > 0:
                 if debug:
@@ -215,15 +219,15 @@ class DQN(nn.Module):
         return disc_act, cont_act
 
     def train_actions(self, observations, action_mask=None, step=False, debug=False):
+        disc_act, cont_act = self._e_greedy_train_action(
+            observations, action_mask, step, debug
+        )
+        # if self.dqn_type == dqntype.EGreedy or self.dqn_type == dqntype.Munchausen:
 
-        if self.dqn_type == dqntype.EGreedy or self.dqn_type == dqntype.Munchausen:
-            disc_act, cont_act = self._e_greedy_train_action(
-                observations, action_mask, step, debug
-            )
-        else:
-            disc_act, cont_act = self._soft_train_action(
-                observations, action_mask, step, debug
-            )
+        # else:
+        #    disc_act, cont_act = self._soft_train_action(
+        #        observations, action_mask, step, debug
+        #    )
 
         self.step += int(step)
         return disc_act, cont_act, 0, 0, 0
