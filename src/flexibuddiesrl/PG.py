@@ -708,6 +708,9 @@ class PG(nn.Module, Agent):
             )
         self._get_torch_params(self.starting_actorlogstd)
         self.policy_loss = 5.0
+        self.actor.load_state_dict(torch.load(checkpoint_path + "/PI"))
+        self.critic.load_state_dict(torch.load(checkpoint_path + "/V"))
+        self.actor_logstd = torch.load(checkpoint_path + "/actor_logstd")
 
     def __str__(self):
         st = ""
