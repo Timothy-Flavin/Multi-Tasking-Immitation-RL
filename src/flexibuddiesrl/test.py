@@ -10,7 +10,7 @@ from DQN import DQN
 import torch
 
 
-gym_disc_env = "CartPole-v1"  # "LunarLander-v2"  # "CartPole-v1"  #
+gym_disc_env = "LunarLander-v3"  # "CartPole-v1"  # "LunarLander-v2"  # "CartPole-v1"  #
 gym_cont_env = "LunarLander-v3"  # "LunarLander-v2"  # "Pendulum-v1"  # "HalfCheetah-v4"
 
 
@@ -319,7 +319,7 @@ if __name__ == "__main__":
                 activation="relu",
                 dueling=True,
                 n_c_action_bins=5,
-                # entropy=0.03,
+                entropy=0.03,
                 # munchausen=0.9,
             ),
             TD3(

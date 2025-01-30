@@ -550,7 +550,7 @@ class DQN(nn.Module):
             self.action_means = torch.from_numpy(self.np_action_means).to(self.device)
 
         self.Q1 = QS(
-            obs_dim=obs_dim,
+            obs_dim=self.obs_dim,
             continuous_action_dim=self.continuous_action_dims,
             discrete_action_dims=self.discrete_action_dims,
             hidden_dims=self.hidden_dims,
