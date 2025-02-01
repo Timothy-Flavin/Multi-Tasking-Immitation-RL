@@ -96,14 +96,14 @@ class ffEncoder(nn.Module):
         for layer in self.encoder:
             if layer == self.encoder[0] and self.drop > 0:
                 x = self.activation(self.dropout(layer(x)))
-
             else:
                 x = self.activation(layer(x))
             if debug:
                 interlist.append(x)
         # if x contains nan, print the intermediate list and encoder weights
         if torch.isnan(x).any():
-            print(f"Intermediate list: {interlist}")
+            if debug:
+                print(f"Intermediate list: {interlist}")
             for layer in self.encoder:
                 print(f"Layer {layer.weight}")
         return x

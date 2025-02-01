@@ -281,16 +281,20 @@ class DDPG(Agent):
         closs_item = qf1_loss.item()
 
         if self.rl_step % self.policy_frequency == 0 and not critic_only:
-            c_act, d_act = self.actor(batch.obs[agent_num], mask)
-
+            c_act, d_act = self.actor(
+                x=batch.obs[agent_num], action_mask=mask, gumbel=True
+            )
+            # print(c_act.shape)
+            # print(f"dact shape: [{len(d_act)}],{d_act[0].shape}")
             # TODO Check and make sure that the discrete actions are concatenated correctly
             if len(d_act) == 1:
                 d_act = d_act[0]
             else:
                 d_act = torch.cat(d_act, dim=-1)
             actor_loss = -self.critic(
-                batch.obs[agent_num], torch.cat([c_act, d_act], dim=-1)
+                x=batch.obs[agent_num], u=torch.cat([c_act, d_act], dim=-1)
             ).mean()
+            # print(torch.cat([c_act, d_act], dim=-1).shape)
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
             self.actor_optimizer.step()

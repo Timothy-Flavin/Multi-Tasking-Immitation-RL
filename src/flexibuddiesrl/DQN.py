@@ -38,9 +38,11 @@ class DQN(nn.Module):
         device="cpu",
         eval_mode=False,
         name="DQN",
+        clip_grad=1.0,
         load_from_checkpoint_path=None,
     ):
         super(DQN, self).__init__()
+        self.clip_grad = clip_grad
         if load_from_checkpoint_path is not None:
             self.load(load_from_checkpoint_path)
             return
@@ -406,9 +408,20 @@ class DQN(nn.Module):
                 ) ** 2
                 for h in range(len(disc_adv)):
                     probs = torch.softmax(disc_adv[h], dim=-1)
-                    dqloss[:, h] += self.entropy_loss_coef * torch.sum(
-                        probs * torch.log(probs), dim=-1
+                    enloss = (
+                        Categorical(probs=probs).entropy()
+                        * 0.1
+                        * self.entropy_loss_coef
                     )
+                    # print(dqloss[:, h].shape, enloss.shape)
+                    if torch.isnan(enloss).any():
+                        print("NAN in entropy")
+                        print(probs)
+                        print(enloss)
+                    if torch.isnan(dqloss).any():
+                        print("NAN in dqloss")
+                        print(dqloss)
+                    dqloss[:, h] -= enloss
             else:
                 dqloss = 0
                 for h in range(len(disc_adv)):
@@ -467,7 +480,9 @@ class DQN(nn.Module):
                     )
                 ) ** 2
                 cprob = torch.softmax(torch.stack(cont_adv, dim=1), dim=-1)
-                cqloss += torch.sum(cprob * torch.log(cprob), dim=-1)
+                cqloss -= (
+                    Categorical(probs=cprob).entropy() * self.entropy_loss_coef
+                )  # torch.sum(cprob * torch.log(cprob), dim=-1)
             else:
                 cqloss = 0
                 with torch.no_grad():
@@ -501,6 +516,13 @@ class DQN(nn.Module):
         loss = dqloss + cqloss
         self.optimizer.zero_grad()
         loss.backward()
+        if self.clip_grad is not None and self.clip_grad > 0:
+            torch.nn.utils.clip_grad_norm_(
+                self.parameters(),
+                self.clip_grad,
+                error_if_nonfinite=True,
+                foreach=True,
+            )
         self.optimizer.step()
 
         return (

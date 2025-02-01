@@ -389,10 +389,8 @@ class TD3(Agent):
         self.critic_optimizer.step()
 
         if self.rl_step % self.policy_frequency == 0 and not critic_only:
-            # print("   TD3 reinforcement_learn actor update")
-            c_act, d_act = self.actor(batch.obs[agent_num], mask)
+            c_act, d_act = self.actor(x=batch.obs[agent_num], action_mask=mask)
 
-            # TODO Check and make sure that the discrete actions are concatenated correctly
             if len(d_act) == 1:
                 d_act = d_act[0]
             else:
