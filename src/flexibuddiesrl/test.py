@@ -8,10 +8,14 @@ from typing import List
 from PG import PG
 from DQN import DQN
 import torch
-
+from fasttttsandbox import TTTNvN
 
 gym_disc_env = "CartPole-v1"  # "LunarLander-v2"  # "CartPole-v1"  #
-gym_cont_env = "LunarLander-v3"  # "LunarLander-v2"  # "Pendulum-v1"  # "HalfCheetah-v4"
+gym_cont_env = "LunarLander-v2"  # "LunarLander-v2"  # "Pendulum-v1"  # "HalfCheetah-v4"
+
+
+def __close():
+    return 0
 
 
 def test_single_env(
@@ -47,9 +51,11 @@ def test_single_env(
             discrete_actions, continuous_actions, disc_lp, cont_lp, value = (
                 agent.train_actions(obs, step=True, debug=debug)
             )
+
+            # dac, cac, _, __, ___ = agent.train_actions(obs, step=True, debug=debug)
             # print(discrete_actions, continuous_actions)
             if discrete:
-                actions = int(discrete_actions[0])
+                actions = discrete_actions[0]  # [int(discrete_actions[0]), int(dac[0])]
             else:
                 actions = continuous_actions
 
@@ -82,7 +88,11 @@ def test_single_env(
                     "continuous_log_probs": cont_lp,
                 },
             )
-            # env.render()
+
+            if env.render_mode == "human":
+                # env.display_board(env.board)
+                if terminated or truncated:
+                    print(terminated or truncated)
             # print(abs(obs[1]) * 50)
             ep_reward += reward  # + abs(obs[1]) * 100
             obs = obs_
@@ -153,9 +163,9 @@ def test_single_env(
             if episode % (er * 5) == 0:
                 print("human animating")
                 if (
-                    gym_disc_env == "LunarLander-v3"
+                    gym_disc_env == "LunarLander-v2"
                     and discrete
-                    or (gym_cont_env == "LunarLander-v3" and not discrete)
+                    or (gym_cont_env == "LunarLander-v2" and not discrete)
                 ):
                     env = gym.make(
                         gym_disc_env if discrete else gym_cont_env,
@@ -167,13 +177,15 @@ def test_single_env(
                         gym_disc_env if discrete else gym_cont_env,
                         render_mode="human",
                     )
+                # env = TTTNvN(2, 2, "human", True, True)
+                # env.__dict__["close"] = __close
         if episode % er == 1 and episode > 1:
             print("no more human")
             env.close()
             if (
-                gym_disc_env == "LunarLander-v3"
+                gym_disc_env == "LunarLander-v2"
                 and discrete
-                or (gym_cont_env == "LunarLander-v3" and not discrete)
+                or (gym_cont_env == "LunarLander-v2" and not discrete)
             ):
                 env = gym.make(
                     id=(gym_disc_env if discrete else gym_cont_env),
@@ -181,6 +193,9 @@ def test_single_env(
                 )
             else:
                 env = gym.make(id=(gym_disc_env if discrete else gym_cont_env))
+            # env = TTTNvN(2, 2, "", True, True)
+            # env.__dict__["close"] = __close
+
         episode += 1
         # env = gym.make("CartPole-v1")
 
@@ -273,16 +288,27 @@ def test_dual_env(
 
 
 if __name__ == "__main__":
+
+    class aspace:
+        def __init__(self, n):
+            self.n = n
+
     import matplotlib.pyplot as plt
 
     if gym_disc_env == "LunarLander-v2":
         discrete_env = gym.make(
             gym_disc_env, continuous=False
         )  # """MountainCar-v0")  # )   # , render_mode="human")
+
     else:
         discrete_env = gym.make(gym_disc_env)
 
-    if gym_cont_env == "LunarLander-v3":
+    # discrete_env = TTTNvN(2, 2, "", True, True)
+    # discrete_env.__dict__["observation_space"] = np.zeros(18)
+    # discrete_env.__dict__["action_space"] = aspace(9)
+    # discrete_env.__dict__["close"] = __close
+
+    if gym_cont_env == "LunarLander-v2":
         continuous_env = gym.make(gym_cont_env, continuous=True)
     else:
         continuous_env = gym.make(gym_cont_env)
@@ -295,8 +321,8 @@ if __name__ == "__main__":
     def make_models():
         print("Making Model")
         names = [
-            "DQN",
             "TD3",
+            "DQN",
             "PG",
             "DDPG",
         ]
@@ -307,21 +333,6 @@ if __name__ == "__main__":
             continuous_env.action_space.shape[0],
         )
         models = [
-            DQN(
-                obs_dim=joint_obs_dim,
-                continuous_action_dims=continuous_env.action_space.shape[0],
-                max_actions=continuous_env.action_space.high,
-                min_actions=continuous_env.action_space.low,
-                discrete_action_dims=[discrete_env.action_space.n],
-                hidden_dims=[64, 64],
-                device="cuda:0",
-                lr=3e-4,
-                activation="relu",
-                dueling=True,
-                n_c_action_bins=5,
-                # entropy=0.03,
-                # munchausen=0.9,
-            ),
             TD3(
                 obs_dim=joint_obs_dim,
                 discrete_action_dims=[discrete_env.action_space.n],
@@ -334,7 +345,22 @@ if __name__ == "__main__":
                 name="TD3_cd_test",
                 device="cuda",
                 eval_mode=False,
-                rand_steps=5000,
+                rand_steps=2500,
+            ),
+            DQN(
+                obs_dim=joint_obs_dim,
+                continuous_action_dims=continuous_env.action_space.shape[0],
+                max_actions=continuous_env.action_space.high,
+                min_actions=continuous_env.action_space.low,
+                discrete_action_dims=[discrete_env.action_space.n],
+                hidden_dims=[64, 64],
+                device="cuda:0",
+                lr=3e-4,
+                activation="relu",
+                dueling=True,
+                n_c_action_bins=5,
+                entropy=0.03,
+                # munchausen=0.9,
             ),
             PG(
                 obs_dim=joint_obs_dim,
@@ -417,7 +443,7 @@ if __name__ == "__main__":
             env=discrete_env,
             agent=models[n],
             buffer=mem_buffer,
-            n_episodes=300 if names[n] == "PG" else 300,
+            n_episodes=30000 if names[n] == "PG" else 30000,
             n_steps=30000 if names[n] == "PG" else 15000,
             discrete=True,
             joint_obs_dim=joint_obs_dim,
