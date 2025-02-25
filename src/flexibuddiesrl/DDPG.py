@@ -284,9 +284,6 @@ class DDPG(Agent):
             c_act, d_act = self.actor(
                 x=batch.obs[agent_num], action_mask=mask, gumbel=True
             )
-            # print(c_act.shape)
-            # print(f"dact shape: [{len(d_act)}],{d_act[0].shape}")
-            # TODO Check and make sure that the discrete actions are concatenated correctly
             if len(d_act) == 1:
                 d_act = d_act[0]
             else:
@@ -294,7 +291,6 @@ class DDPG(Agent):
             actor_loss = -self.critic(
                 x=batch.obs[agent_num], u=torch.cat([c_act, d_act], dim=-1)
             ).mean()
-            # print(torch.cat([c_act, d_act], dim=-1).shape)
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
             self.actor_optimizer.step()

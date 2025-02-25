@@ -250,7 +250,7 @@ class DQN(nn.Module):
             if debug:
                 print(f"value: {value}, dac: {dac}, cac: {cac}, eps: {self.eps}")
             if self.dueling:
-                return value.cpu().item()
+                return value.cpu()  # TODO make sure this doesnt need to be item()
 
             dq = 0
             n = 0
