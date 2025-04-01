@@ -407,11 +407,17 @@ class DDPG(Agent):
     def load(self, checkpoint_path):
         if checkpoint_path is None:
             checkpoint_path = "./" + self.name + "/"
-        self.actor.load_state_dict(torch.load(checkpoint_path + "/actor"))
-        self.actor_target.load_state_dict(torch.load(checkpoint_path + "/actor_target"))
-        self.critic.load_state_dict(torch.load(checkpoint_path + "/critic"))
+        self.actor.load_state_dict(
+            torch.load(checkpoint_path + "/actor", weights_only=True)
+        )
+        self.actor_target.load_state_dict(
+            torch.load(checkpoint_path + "/actor_target", weights_only=True)
+        )
+        self.critic.load_state_dict(
+            torch.load(checkpoint_path + "/critic", weights_only=True)
+        )
         self.critic_target.load_state_dict(
-            torch.load(checkpoint_path + "/critic_target")
+            torch.load(checkpoint_path + "/critic_target", weights_only=True)
         )
         f = open(checkpoint_path + "/step", "rb")
         self.step = pickle.load(f)
