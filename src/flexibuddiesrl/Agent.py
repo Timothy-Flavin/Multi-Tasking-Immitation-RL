@@ -381,7 +381,7 @@ class QS(nn.Module):
                 self.discrete_advantage_heads.append(nn.Linear(hidden_dims[-1], dim))
 
         self.continuous_advantage_heads = nn.ModuleList()
-        if continuous_action_dim > 0:
+        if continuous_action_dim is not None and continuous_action_dim > 0:
             for dim in range(continuous_action_dim):
                 self.continuous_advantage_heads.append(
                     nn.Linear(hidden_dims[-1], n_c_action_bins)
