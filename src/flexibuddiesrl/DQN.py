@@ -24,7 +24,7 @@ class DQN(nn.Module):
         continuous_action_dims=None,  # 2,
         min_actions=None,  # np.array([-1,-1]),
         max_actions=None,  # ,np.array([1,1]),
-        hidden_dims=[64, 64],
+        hidden_dims=[64, 64],  # first is obs dim if encoder provded
         gamma=0.99,
         lr=3e-5,
         dueling=False,
@@ -40,6 +40,7 @@ class DQN(nn.Module):
         name="DQN",
         clip_grad=1.0,
         load_from_checkpoint_path=None,
+        encoder=None,
     ):
         super(DQN, self).__init__()
         self.clip_grad = clip_grad
@@ -96,6 +97,7 @@ class DQN(nn.Module):
             dueling=dueling,
             n_c_action_bins=n_c_action_bins,
             device=device,
+            encoder=encoder,  # pass encoder if using one for observations (like in visual DQN)
         )
 
         self.Q1.to(device)
