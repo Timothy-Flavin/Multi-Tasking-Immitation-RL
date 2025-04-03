@@ -284,9 +284,6 @@ class DDPG(Agent):
             c_act, d_act = self.actor(
                 x=batch.obs[agent_num], action_mask=mask, gumbel=True
             )
-            # print(c_act.shape)
-            # print(f"dact shape: [{len(d_act)}],{d_act[0].shape}")
-            # TODO Check and make sure that the discrete actions are concatenated correctly
             if len(d_act) == 1:
                 d_act = d_act[0]
             else:
@@ -294,7 +291,6 @@ class DDPG(Agent):
             actor_loss = -self.critic(
                 x=batch.obs[agent_num], u=torch.cat([c_act, d_act], dim=-1)
             ).mean()
-            # print(torch.cat([c_act, d_act], dim=-1).shape)
             self.actor_optimizer.zero_grad()
             actor_loss.backward()
             self.actor_optimizer.step()
@@ -411,11 +407,17 @@ class DDPG(Agent):
     def load(self, checkpoint_path):
         if checkpoint_path is None:
             checkpoint_path = "./" + self.name + "/"
-        self.actor.load_state_dict(torch.load(checkpoint_path + "/actor"))
-        self.actor_target.load_state_dict(torch.load(checkpoint_path + "/actor_target"))
-        self.critic.load_state_dict(torch.load(checkpoint_path + "/critic"))
+        self.actor.load_state_dict(
+            torch.load(checkpoint_path + "/actor", weights_only=True)
+        )
+        self.actor_target.load_state_dict(
+            torch.load(checkpoint_path + "/actor_target", weights_only=True)
+        )
+        self.critic.load_state_dict(
+            torch.load(checkpoint_path + "/critic", weights_only=True)
+        )
         self.critic_target.load_state_dict(
-            torch.load(checkpoint_path + "/critic_target")
+            torch.load(checkpoint_path + "/critic_target", weights_only=True)
         )
         f = open(checkpoint_path + "/step", "rb")
         self.step = pickle.load(f)

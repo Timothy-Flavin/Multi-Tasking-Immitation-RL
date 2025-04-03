@@ -250,7 +250,7 @@ class DQN(nn.Module):
             if debug:
                 print(f"value: {value}, dac: {dac}, cac: {cac}, eps: {self.eps}")
             if self.dueling:
-                return value.cpu().item()
+                return value  # TODO make sure this doesnt need to be item()
 
             dq = 0
             n = 0
@@ -302,7 +302,7 @@ class DQN(nn.Module):
                     cq += (1 - self.eps) * bestq + self.eps * otherq
                 cq = cq / self.continuous_action_dims
 
-            return (value + (cq + dq) / (max(n, 1))).cpu().item()
+            return value + (cq + dq) / (max(n, 1))
 
     def reinforcement_learn(
         self, batch: FlexiBatch, agent_num=0, critic_only=False, debug=False
