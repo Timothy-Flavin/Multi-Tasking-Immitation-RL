@@ -171,10 +171,12 @@ class DQN(nn.Module):
                 cont_act = (
                     np.random.rand(self.continuous_action_dims) - 0.5
                 ) * self.np_action_ranges + self.np_action_means
-
+            #print(disc_act)
         else:
             with torch.no_grad():
+                #print("Getting value from Q1 for soft action selection")
                 value, disc_act, cont_act = self.Q1(observations, action_mask)
+                #print("done with that")
                 # select actions from q function
                 # print(value, disc_act, cont_act)
                 if len(self.discrete_action_dims) > 0:
@@ -197,6 +199,7 @@ class DQN(nn.Module):
         disc_act, cont_act = None, None
         with torch.no_grad():
             value, disc_act, cont_act = self.Q1(observations, action_mask)
+            #print("Done with that")
             if len(self.discrete_action_dims) > 0:
                 dact = np.zeros(len(disc_act), dtype=np.int64)
                 for i, da in enumerate(disc_act):
@@ -240,7 +243,33 @@ class DQN(nn.Module):
         return 0
 
     def imitation_learn(self, observations, actions):
-        return 0  # loss
+        next_values, next_disc_adv, next_cont_adv = self.Q1(observations)
+        
+        # minmax norm next disc_adv to prevent it from being too large in magnitude for imitation learning
+        for i in range(len(next_disc_adv)):
+            next_disc_adv[i] = (next_disc_adv[i] - next_disc_adv[i].min()) / (next_disc_adv[i].max() - next_disc_adv[i].min() + 1e-8)  # normalize to [0,1]
+        
+        if self.eval_mode:
+            return 0, 0
+        else:
+            loss1 = nn.CrossEntropyLoss()(next_disc_adv[0], actions[:, 0])  # for discrete action 1
+            loss2 = nn.CrossEntropyLoss()(next_disc_adv[1], actions[:, 1])  # for discrete action 2
+            loss = loss1+ loss2  
+            loss = loss/5
+            self.optimizer.zero_grad()
+            loss.backward()
+            if self.clip_grad is not None and self.clip_grad > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    self.parameters(),
+                    self.clip_grad,
+                    error_if_nonfinite=True,
+                    foreach=True,
+                )
+            self.optimizer.step()
+            return loss.item(), 0
+
+        #print("imitation learning")
+        return 0 , 0 # loss
 
     def utility_function(self, observations, actions=None):
         return 0  # Returns the single-agent critic for a single action.
@@ -319,6 +348,7 @@ class DQN(nn.Module):
             dQ_ = 0
             cQ_ = 0
             next_values, next_disc_adv, next_cont_adv = self.Q1(batch.obs_[agent_num])
+            #print(next_values)
             dnv_ = 0
             cnv_ = 0
             if self.dueling:
@@ -560,7 +590,8 @@ class DQN(nn.Module):
     def load(self, checkpoint_path):
         if checkpoint_path is None:
             checkpoint_path = "./" + self.name + "/"
-
+        if not os.path.exists(checkpoint_path):
+            return 0
         for i in range(len(self.attrs)):
             self.__dict__[self.attrs[i]] = self._load_attr(
                 checkpoint_path + f"/{self.attrs[i]}"
@@ -577,18 +608,19 @@ class DQN(nn.Module):
             self.np_action_means = (self.max_actions + self.min_actions) / 2
             self.action_means = torch.from_numpy(self.np_action_means).to(self.device)
 
-        self.Q1 = QS(
-            obs_dim=self.obs_dim,
-            continuous_action_dim=self.continuous_action_dims,
-            discrete_action_dims=self.discrete_action_dims,
-            hidden_dims=self.hidden_dims,
-            activation=self.activation,
-            orthogonal=self.orthogonal,
-            dueling=self.dueling,
-            n_c_action_bins=self.n_c_action_bins,
-            device=self.device,
-        )
-        self.Q1.load_state_dict(torch.load(checkpoint_path + "/Q1"))
+        if self.Q1 is None:
+            self.Q1 = QS(
+                obs_dim=self.obs_dim,
+                continuous_action_dim=self.continuous_action_dims,
+                discrete_action_dims=self.discrete_action_dims,
+                hidden_dims=self.hidden_dims,
+                activation=self.activation,
+                orthogonal=self.orthogonal,
+                dueling=self.dueling,
+                n_c_action_bins=self.n_c_action_bins,
+                device=self.device,
+            )
+        self.Q1.load_state_dict(torch.load(checkpoint_path + "/Q1",weights_only=True))
         self.Q1.to(self.device)
 
         self.optimizer = torch.optim.Adam(self.Q1.parameters(), lr=self.lr)
@@ -654,9 +686,9 @@ if __name__ == "__main__":
         max_actions=np.array([1, 2]),
         min_actions=np.array([0, 0]),
         discrete_action_dims=[4, 5],
-        hidden_dims=[32, 32],
+        hidden_dims=[64, 64],
         device="cuda:0",
-        lr=0.001,
+        lr=3e-4,
         activation="relu",
         entropy=0.1,
     )
