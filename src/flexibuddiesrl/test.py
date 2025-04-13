@@ -8,10 +8,18 @@ from typing import List
 from PG import PG
 from DQN import DQN
 import torch
+import pygame
 
+gym_disc_env = "LunarLander-v3"  # "CartPole-v1"  #   # "LunarLander-v3"
+gym_cont_env = "LunarLander-v3"  # "LunarLander-v3"  # "Pendulum-v1"  # "HalfCheetah-v4"
 
-gym_disc_env = "CartPole-v1"  # "LunarLander-v2"  # "LunarLander-v2"  # "CartPole-v1"  #
-gym_cont_env = "LunarLander-v2"  # "LunarLander-v2"  # "Pendulum-v1"  # "HalfCheetah-v4"
+key_states = {
+    "w": False,
+    "a": False,
+    "s": False,
+    "d": False,
+    "q": False,
+}
 
 
 def test_single_env(
@@ -38,6 +46,7 @@ def test_single_env(
 
         ep_reward = 0
         obs, info = env.reset()
+        pygame.init()
 
         obs = np.pad(obs, (0, joint_obs_dim - len(obs)), "constant")
 
@@ -63,6 +72,20 @@ def test_single_env(
             #     f"c_a: {continuous_actions}, d_a: {discrete_actions}, actions: {actions}"
             # )
 
+            for event in pygame.event.get():
+                if event.type == pygame.KEYDOWN:
+                    key_states[event.unicode] = True
+                if event.type == pygame.KEYUP:
+                    key_states[event.unicode] = False
+                if event.type == pygame.QUIT:
+                    key_states["q"] = True
+            if key_states["q"]:
+                break
+
+            if episode % 2 == 0:
+                actions = key_to_discrete_action(key_states)
+                discrete_actions = [actions]
+
             obs_, reward, terminated, truncated, _ = env.step(actions)
             obs_ = np.pad(obs_, (0, joint_obs_dim - len(obs_)), "constant")
 
@@ -70,18 +93,19 @@ def test_single_env(
             #    f"obs: {obs}, obs_:{obs_}, continuous: {continuous_actions}, discrete: {discrete_actions}, reward: {reward}, dlp: {disc_lp},clp: {cont_lp}"
             # )
             # print(disc_lp, cont_lp)
-            buffer.save_transition(
-                terminated=terminated or truncated,
-                registered_vals={
-                    "obs": obs,
-                    "obs_": obs_,
-                    "continuous_actions": continuous_actions,
-                    "discrete_actions": discrete_actions,
-                    "global_rewards": reward,  # + abs(obs[1]) * 100,
-                    "discrete_log_probs": disc_lp,
-                    "continuous_log_probs": cont_lp,
-                },
-            )
+            if episode % 2 == 0:  # only save human data for offline learning
+                buffer.save_transition(
+                    terminated=terminated or truncated,
+                    registered_vals={
+                        "obs": obs,
+                        "obs_": obs_,
+                        "continuous_actions": continuous_actions,
+                        "discrete_actions": discrete_actions,
+                        "global_rewards": reward,  # + abs(obs[1]) * 100,
+                        "discrete_log_probs": disc_lp,
+                        "continuous_log_probs": cont_lp,
+                    },
+                )
             # env.render()
             # print(abs(obs[1]) * 50)
             ep_reward += reward  # + abs(obs[1]) * 100
@@ -117,7 +141,10 @@ def test_single_env(
                 aloss, closs = agent.reinforcement_learn(
                     batch, agent_num=0, debug=debug
                 )
-                # print(aloss, closs)
+                aloss, closs = agent.imitation_learn(
+                    batch.obs[0], batch.continuous_actions[0], batch.discrete_actions[0]
+                )
+                # print(aloss, closs)w
                 m_aloss += aloss
                 m_closs += closs
                 n_updates += 1
@@ -125,13 +152,14 @@ def test_single_env(
                     buffer.reset()
             step += 1
         # print(aloss, closs)
-        aloss_return.append(m_aloss / max(n_updates, 1))
-        closs_return.append(m_closs / max(n_updates, 1))
-        rewards.append(ep_reward)
-        rlen = min(len(rewards), 20)
-        smooth_rewards.append(sum(rewards[-rlen:]) / rlen)
+        if episode % 2 == 1:
+            aloss_return.append(m_aloss / max(n_updates, 1))
+            closs_return.append(m_closs / max(n_updates, 1))
+            rewards.append(ep_reward)
+            rlen = min(len(rewards), 20)
+            smooth_rewards.append(sum(rewards[-rlen:]) / rlen)
         # print(smooth_rewards[-1])
-        er = 10
+        er = 1
 
         if episode % er == 0 and episode > 1:
 
@@ -153,9 +181,9 @@ def test_single_env(
             if episode % (er * 5) == 0:
                 print("human animating")
                 if (
-                    gym_disc_env == "LunarLander-v2"
+                    gym_disc_env == "LunarLander-v3"
                     and discrete
-                    or (gym_cont_env == "LunarLander-v2" and not discrete)
+                    or (gym_cont_env == "LunarLander-v3" and not discrete)
                 ):
                     env = gym.make(
                         gym_disc_env if discrete else gym_cont_env,
@@ -171,9 +199,9 @@ def test_single_env(
             print("no more human")
             env.close()
             if (
-                gym_disc_env == "LunarLander-v2"
+                gym_disc_env == "LunarLander-v3"
                 and discrete
-                or (gym_cont_env == "LunarLander-v2" and not discrete)
+                or (gym_cont_env == "LunarLander-v3" and not discrete)
             ):
                 env = gym.make(
                     id=(gym_disc_env if discrete else gym_cont_env),
@@ -272,17 +300,43 @@ def test_dual_env(
     return rewards
 
 
+def key_to_discrete_action(key_states):
+    if key_states["a"]:
+        return 1
+    elif key_states["d"]:
+        return 3
+    elif key_states["w"]:
+        return 2
+    elif key_states["s"]:
+        return 0
+    else:
+        return 0
+
+
+def key_to_continuous_action(key_states):
+    if key_states["a"]:
+        return 1
+    elif key_states["d"]:
+        return 3
+    elif key_states["w"]:
+        return 2
+    elif key_states["s"]:
+        return 0
+    else:
+        return 0
+
+
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
 
-    if gym_disc_env == "LunarLander-v2":
+    if gym_disc_env == "LunarLander-v3":
         discrete_env = gym.make(
             gym_disc_env, continuous=False
         )  # """MountainCar-v0")  # )   # , render_mode="human")
     else:
         discrete_env = gym.make(gym_disc_env)
 
-    if gym_cont_env == "LunarLander-v2":
+    if gym_cont_env == "LunarLander-v3":
         continuous_env = gym.make(gym_cont_env, continuous=True)
     else:
         continuous_env = gym.make(gym_cont_env)
@@ -295,9 +349,9 @@ if __name__ == "__main__":
     def make_models():
         print("Making Model")
         names = [
+            "DQN",
             "TD3",
             "DDPG",
-            "DQN",
             "PG",
         ]
         print(
@@ -307,6 +361,22 @@ if __name__ == "__main__":
             continuous_env.action_space.shape[0],
         )
         models = [
+            DQN(
+                obs_dim=joint_obs_dim,
+                continuous_action_dims=continuous_env.action_space.shape[0],
+                max_actions=continuous_env.action_space.high,
+                min_actions=continuous_env.action_space.low,
+                discrete_action_dims=[discrete_env.action_space.n],
+                hidden_dims=[64, 64],
+                device="cuda:0",
+                lr=3e-4,
+                activation="relu",
+                dueling=True,
+                n_c_action_bins=5,
+                entropy=0.03,
+                eps_decay_half_life=10,
+                # munchausen=0.9,
+            ),
             TD3(
                 obs_dim=joint_obs_dim,
                 discrete_action_dims=[discrete_env.action_space.n],
@@ -334,21 +404,6 @@ if __name__ == "__main__":
                 device="cuda",
                 eval_mode=False,
                 rand_steps=5000,
-            ),
-            DQN(
-                obs_dim=joint_obs_dim,
-                continuous_action_dims=continuous_env.action_space.shape[0],
-                max_actions=continuous_env.action_space.high,
-                min_actions=continuous_env.action_space.low,
-                discrete_action_dims=[discrete_env.action_space.n],
-                hidden_dims=[64, 64],
-                device="cuda:0",
-                lr=3e-4,
-                activation="relu",
-                dueling=True,
-                n_c_action_bins=5,
-                entropy=0.03,
-                # munchausen=0.9,
             ),
             PG(
                 obs_dim=joint_obs_dim,
@@ -417,7 +472,7 @@ if __name__ == "__main__":
             env=discrete_env,
             agent=models[n],
             buffer=mem_buffer,
-            n_episodes=1000 if names[n] == "PG" else 1000,
+            n_episodes=200 if names[n] == "PG" else 200,
             n_steps=30000 if names[n] == "PG" else 30000,
             discrete=True,
             joint_obs_dim=joint_obs_dim,
