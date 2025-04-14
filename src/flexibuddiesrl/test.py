@@ -82,9 +82,15 @@ def test_single_env(
             if key_states["q"]:
                 break
 
-            if episode % 2 == 0:
-                actions = key_to_discrete_action(key_states)
-                discrete_actions = [actions]
+            if False:  # episode % 2 == 0:
+                if discrete:
+                    actions = key_to_discrete_action(key_states)
+                    discrete_actions = actions
+                else:
+                    actions = key_to_continuous_action(key_states)
+                    continuous_actions = actions
+                discrete_actions = np.reshape(discrete_actions, (1, -1))
+                continuous_actions = np.reshape(continuous_actions, (1, -1))
 
             obs_, reward, terminated, truncated, _ = env.step(actions)
             obs_ = np.pad(obs_, (0, joint_obs_dim - len(obs_)), "constant")
@@ -93,7 +99,7 @@ def test_single_env(
             #    f"obs: {obs}, obs_:{obs_}, continuous: {continuous_actions}, discrete: {discrete_actions}, reward: {reward}, dlp: {disc_lp},clp: {cont_lp}"
             # )
             # print(disc_lp, cont_lp)
-            if episode % 2 == 0:  # only save human data for offline learning
+            if False:  # episode % 2 == 0:  # only save human data for offline learning
                 buffer.save_transition(
                     terminated=terminated or truncated,
                     registered_vals={
@@ -137,11 +143,12 @@ def test_single_env(
                 else:
                     batch = buffer.sample_transitions(batch_size=256, as_torch=True)
 
+                # FlexibleBuffer.save(buffer)
                 # for ep in episodes:
                 aloss, closs = agent.reinforcement_learn(
                     batch, agent_num=0, debug=debug
                 )
-                aloss, closs = agent.imitation_learn(
+                closs, __ = agent.imitation_learn(
                     batch.obs[0], batch.continuous_actions[0], batch.discrete_actions[0]
                 )
                 # print(aloss, closs)w
@@ -152,7 +159,7 @@ def test_single_env(
                     buffer.reset()
             step += 1
         # print(aloss, closs)
-        if episode % 2 == 1:
+        if True:  # episode % 2 == 1:
             aloss_return.append(m_aloss / max(n_updates, 1))
             closs_return.append(m_closs / max(n_updates, 1))
             rewards.append(ep_reward)
@@ -180,21 +187,20 @@ def test_single_env(
             # print(agent.eps)
             if episode % (er * 5) == 0:
                 print("human animating")
-                if (
-                    gym_disc_env == "LunarLander-v3"
-                    and discrete
-                    or (gym_cont_env == "LunarLander-v3" and not discrete)
+                if (gym_disc_env == "LunarLander-v3" and discrete) or (
+                    gym_cont_env == "LunarLander-v3" and not discrete
                 ):
                     env = gym.make(
                         gym_disc_env if discrete else gym_cont_env,
                         render_mode="human",
                         continuous=not discrete,
                     )
-                else:
-                    env = gym.make(
-                        gym_disc_env if discrete else gym_cont_env,
-                        render_mode="human",
-                    )
+            else:
+                env = gym.make(
+                    gym_disc_env if discrete else gym_cont_env,
+                    # render_mode="human",
+                    continuous=not discrete,
+                )
         if episode % er == 1 and episode > 1:
             print("no more human")
             env.close()
@@ -314,16 +320,16 @@ def key_to_discrete_action(key_states):
 
 
 def key_to_continuous_action(key_states):
+    action = np.zeros(2)
+    if key_states["s"]:
+        action[0] += -1.0
+    if key_states["w"]:
+        action[0] += 1.0
+    if key_states["d"]:
+        action[1] += 1.0
     if key_states["a"]:
-        return 1
-    elif key_states["d"]:
-        return 3
-    elif key_states["w"]:
-        return 2
-    elif key_states["s"]:
-        return 0
-    else:
-        return 0
+        action[1] -= 1.0
+    return action
 
 
 if __name__ == "__main__":
@@ -370,6 +376,7 @@ if __name__ == "__main__":
                 hidden_dims=[64, 64],
                 device="cuda:0",
                 lr=3e-4,
+                imitation_lr=0.0003,
                 activation="relu",
                 dueling=True,
                 n_c_action_bins=5,
@@ -438,7 +445,7 @@ if __name__ == "__main__":
         num_steps=50000,
         track_action_mask=False,
         discrete_action_cardinalities=[discrete_env.action_space.n],
-        path="./test_mem_buffer/",
+        path="./human_buffer/",
         name="joint_buffer",
         n_agents=1,
         global_registered_vars={
@@ -457,6 +464,13 @@ if __name__ == "__main__":
         },
     )
 
+    b2 = FlexibleBuffer.load("./human_buffer/", "joint_buffer")
+
+    print(mem_buffer)
+    print(b2)
+
+    # input(continuous_env.action_space.shape[0])
+
     models, names = make_models()
 
     results = {}
@@ -464,6 +478,29 @@ if __name__ == "__main__":
         results[n] = []
 
     for n in range(len(names)):
+        models, names = make_models()
+        mem_buffer.reset()
+        print("Testing Continuous Environment")
+        rewards, aloss, closs = test_single_env(
+            continuous_env,
+            agent=models[n],
+            buffer=b2,
+            n_episodes=1000 if names[n] == "PG" else 150,
+            n_steps=300000 if names[n] == "PG" else 15000,
+            discrete=False,
+            joint_obs_dim=joint_obs_dim,
+            online=names[n] in ["PPO", "PG"],
+        )
+        print(rewards)
+        plt.plot(rewards)
+        plt.title("rewards")
+        plt.show()
+
+        plt.plot(aloss)
+        plt.plot(closs)
+        plt.legend(["actor", "critic"])
+        plt.show()
+        models[n].save(f"../../TestModels/{names[n]}_Continuous")
 
         print("Testing Model ", names[n])
         mem_buffer.reset()
@@ -489,31 +526,6 @@ if __name__ == "__main__":
         plt.legend([f"actor {am}", f"critic {cm}"])
         plt.show()
         models[n].save(f"../../TestModels/{names[n]}_Discrete")
-
-        models, names = make_models()
-
-        mem_buffer.reset()
-        print("Testing Continuous Environment")
-        rewards, aloss, closs = test_single_env(
-            continuous_env,
-            agent=models[n],
-            buffer=mem_buffer,
-            n_episodes=1000 if names[n] == "PG" else 150,
-            n_steps=300000 if names[n] == "PG" else 15000,
-            discrete=False,
-            joint_obs_dim=joint_obs_dim,
-            online=names[n] in ["PPO", "PG"],
-        )
-        print(rewards)
-        plt.plot(rewards)
-        plt.title("rewards")
-        plt.show()
-
-        plt.plot(aloss)
-        plt.plot(closs)
-        plt.legend(["actor", "critic"])
-        plt.show()
-        models[n].save(f"../../TestModels/{names[n]}_Continuous")
 
         continue
 
