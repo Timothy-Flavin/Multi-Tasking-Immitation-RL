@@ -27,6 +27,7 @@ class DQN(nn.Module):
         hidden_dims=[64, 64],  # first is obs dim if encoder provded
         gamma=0.99,
         lr=3e-5,
+        imitation_lr=1e-5,
         dueling=False,
         n_c_action_bins=10,
         munchausen=0,  # turns it into munchausen dqn
@@ -41,6 +42,8 @@ class DQN(nn.Module):
         clip_grad=1.0,
         load_from_checkpoint_path=None,
         encoder=None,
+        action_softmax_clamp=10.0,  # when softmaxing the action logits, minmax normalize the input values to this scale
+        conservative=False,
     ):
         super(DQN, self).__init__()
         self.clip_grad = clip_grad
@@ -48,6 +51,7 @@ class DQN(nn.Module):
             self.load(load_from_checkpoint_path)
             return
         self.eval_mode = eval_mode
+        self.action_softmax_clamp = action_softmax_clamp
         self.entropy_loss_coef = entropy  # use soft Q learning entropy loss or not H(Q)
         self.dqn_type = dqntype.EGreedy
         if self.entropy_loss_coef > 0:
@@ -57,6 +61,7 @@ class DQN(nn.Module):
 
         self.obs_dim = obs_dim  # size of observation
         self.discrete_action_dims = discrete_action_dims
+        self.imitation_lr = imitation_lr
         # cardonality for each discrete action
 
         self.continuous_action_dims = continuous_action_dims
@@ -102,6 +107,7 @@ class DQN(nn.Module):
 
         self.Q1.to(device)
 
+        self.conservative = conservative
         self.device = device
         self.optimizer = torch.optim.Adam(self.Q1.parameters(), lr=lr)
         self.to(device)
@@ -141,6 +147,7 @@ class DQN(nn.Module):
         ) * self.action_ranges + self.action_means
 
     def _discretize_actions(self, continuous_actions):
+        # print(continuous_actions.shape)
         return torch.clamp(  # inverse of _cont_from_q
             torch.round(
                 ((continuous_actions - self.action_means) / self.action_ranges + 0.5)
@@ -171,12 +178,12 @@ class DQN(nn.Module):
                 cont_act = (
                     np.random.rand(self.continuous_action_dims) - 0.5
                 ) * self.np_action_ranges + self.np_action_means
-            #print(disc_act)
+            # print(disc_act)
         else:
             with torch.no_grad():
-                #print("Getting value from Q1 for soft action selection")
+                # print("Getting value from Q1 for soft action selection")
                 value, disc_act, cont_act = self.Q1(observations, action_mask)
-                #print("done with that")
+                # print("done with that")
                 # select actions from q function
                 # print(value, disc_act, cont_act)
                 if len(self.discrete_action_dims) > 0:
@@ -199,7 +206,7 @@ class DQN(nn.Module):
         disc_act, cont_act = None, None
         with torch.no_grad():
             value, disc_act, cont_act = self.Q1(observations, action_mask)
-            #print("Done with that")
+            # print("Done with that")
             if len(self.discrete_action_dims) > 0:
                 dact = np.zeros(len(disc_act), dtype=np.int64)
                 for i, da in enumerate(disc_act):
@@ -242,20 +249,55 @@ class DQN(nn.Module):
     def ego_actions(self, observations, action_mask=None):
         return 0
 
-    def imitation_learn(self, observations, actions):
+    def imitation_learn(self, observations, continuous_actions, discrete_actions):
         next_values, next_disc_adv, next_cont_adv = self.Q1(observations)
-        
-        # minmax norm next disc_adv to prevent it from being too large in magnitude for imitation learning
+
+        # minmax norm then softmax the discrete action values
         for i in range(len(next_disc_adv)):
-            next_disc_adv[i] = (next_disc_adv[i] - next_disc_adv[i].min()) / (next_disc_adv[i].max() - next_disc_adv[i].min() + 1e-8)  # normalize to [0,1]
-        
+            next_disc_adv[i] = (
+                (next_disc_adv[i] - next_disc_adv[i].min())
+                / (next_disc_adv[i].max() - next_disc_adv[i].min() + 1e-8)
+                * self.action_softmax_clamp
+            )  # minmax normalize to [0,self.action_softmax_clamp]
+            next_disc_adv[i] = torch.softmax(
+                next_disc_adv[i], dim=-1
+            )  # softmax for cross entropy loss later
+        for i in range(len(next_cont_adv)):
+            next_cont_adv[i] = (
+                (next_cont_adv[i] - next_cont_adv[i].min())
+                / (next_cont_adv[i].max() - next_cont_adv[i].min() + 1e-8)
+                * self.action_softmax_clamp
+            )  # minmax normalize to [0,self.action_softmax_clamp]
+            next_cont_adv[i] = torch.softmax(next_cont_adv[i], dim=-1)
+
         if self.eval_mode:
             return 0, 0
         else:
-            loss1 = nn.CrossEntropyLoss()(next_disc_adv[0], actions[:, 0])  # for discrete action 1
-            loss2 = nn.CrossEntropyLoss()(next_disc_adv[1], actions[:, 1])  # for discrete action 2
-            loss = loss1+ loss2  
-            loss = loss/5
+            discrete_loss = 0
+
+            for i in range(len(self.discrete_action_dims)):
+                # print(next_disc_adv[i])
+                # print(discrete_actions[:, i])
+                # input()
+                discrete_loss += nn.CrossEntropyLoss()(
+                    next_disc_adv[i], discrete_actions[:, i]
+                )  # for discrete action 1
+
+            continuous_loss = 0
+            continuous_actions = self._discretize_actions(continuous_actions)
+            # print(continuous_actions)
+            for i in range(self.continuous_action_dims):
+                # print(next_cont_adv[i])
+                # print(continuous_actions[:, i])
+                # input()
+
+                continuous_loss += nn.CrossEntropyLoss()(
+                    next_cont_adv[i], continuous_actions[:, i]
+                )
+
+            loss = (
+                (discrete_loss + continuous_loss) * self.imitation_lr / self.lr
+            )  # change weight of imitation loss
             self.optimizer.zero_grad()
             loss.backward()
             if self.clip_grad is not None and self.clip_grad > 0:
@@ -266,10 +308,11 @@ class DQN(nn.Module):
                     foreach=True,
                 )
             self.optimizer.step()
+            # print(loss.item())
             return loss.item(), 0
 
-        #print("imitation learning")
-        return 0 , 0 # loss
+        # print("imitation learning")
+        return 0, 0  # loss
 
     def utility_function(self, observations, actions=None):
         return 0  # Returns the single-agent critic for a single action.
@@ -335,6 +378,20 @@ class DQN(nn.Module):
 
             return value + (cq + dq) / (max(n, 1))
 
+    def cql_loss(self, disc_adv, cont_adv, disc_act, cont_act):
+        """Computes the CQL loss for a batch of Q-values and actions."""
+        cql_loss = 0
+        for i in range(len(self.discrete_action_dims)):
+            logsumexp = torch.logsumexp(disc_adv[i], dim=-1, keepdim=True)
+            q_a = disc_adv[i].gather(1, disc_act[:, i].unsqueeze(-1))
+            cql_loss += (logsumexp - q_a).mean()
+        for i in range(self.continuous_action_dims):
+            logsumexp = torch.logsumexp(cont_adv[i], dim=-1, keepdim=True)
+            q_a = cont_adv[i].gather(1, cont_act[:, i])
+            cql_loss += (logsumexp - q_a).mean()
+
+        return cql_loss
+
     def reinforcement_learn(
         self, batch: FlexiBatch, agent_num=0, critic_only=False, debug=False
     ):
@@ -348,7 +405,7 @@ class DQN(nn.Module):
             dQ_ = 0
             cQ_ = 0
             next_values, next_disc_adv, next_cont_adv = self.Q1(batch.obs_[agent_num])
-            #print(next_values)
+            # print(next_values)
             dnv_ = 0
             cnv_ = 0
             if self.dueling:
@@ -403,6 +460,9 @@ class DQN(nn.Module):
                     cQ_ = torch.sum(next_probs * (scq + cnv_), dim=-1)
 
         values, disc_adv, cont_adv = self.Q1(batch.obs[agent_num])
+
+        discretized_actions = None
+        discrete_actions = None
         dnv = 0
         cnv = 0
         if self.dueling:
@@ -410,6 +470,7 @@ class DQN(nn.Module):
             cnv = values.expand(-1, self.continuous_action_dims).unsqueeze(-1)
 
         if self.discrete_action_dims is not None and len(self.discrete_action_dims) > 0:
+            discrete_actions = batch.discrete_actions[agent_num]
             dQ = torch.zeros(
                 (batch.global_rewards.shape[0], len(self.discrete_action_dims)),
                 dtype=torch.float32,
@@ -484,13 +545,15 @@ class DQN(nn.Module):
             dqloss = dqloss.mean()
 
         if self.continuous_action_dims is not None and self.continuous_action_dims > 0:
+            discretized_actions = self._discretize_actions(
+                batch.continuous_actions[agent_num]
+            ).unsqueeze(-1)
+
             cQ = (
                 torch.gather(
                     torch.stack(cont_adv, dim=1),
                     dim=-1,
-                    index=self._discretize_actions(
-                        batch.continuous_actions[agent_num]
-                    ).unsqueeze(-1),
+                    index=discretized_actions,
                 )
                 + (cnv if self.dueling else 0)
             ).squeeze(-1)
@@ -503,6 +566,7 @@ class DQN(nn.Module):
                         + (self.gamma * (1 - batch.terminated)).unsqueeze(-1) * cQ_
                     )
                 ) ** 2
+
             elif self.dqn_type == dqntype.Soft:
                 cqloss = (
                     cQ
@@ -515,6 +579,7 @@ class DQN(nn.Module):
                 cqloss -= (
                     Categorical(probs=cprob).entropy() * self.entropy_loss_coef
                 )  # torch.sum(cprob * torch.log(cprob), dim=-1)
+
             else:
                 cqloss = 0
                 with torch.no_grad():
@@ -523,9 +588,7 @@ class DQN(nn.Module):
                     lnprobs = torch.log(
                         torch.softmax(torch.stack(cont_adv, dim=1), dim=-1)
                         .gather(
-                            index=self._discretize_actions(
-                                batch.continuous_actions[agent_num]
-                            ).unsqueeze(-1),
+                            index=discretized_actions,
                             dim=-1,
                         )
                         .squeeze(-1)
@@ -544,8 +607,19 @@ class DQN(nn.Module):
                     - (self.munchausen * self.entropy_loss_coef * lnprobs)
                     - (self.gamma * (1 - batch.terminated).unsqueeze(-1)) * cQ_
                 ) ** 2
+
             cqloss = cqloss.mean()
-        loss = dqloss + cqloss
+
+        conservative_loss = 0
+        if self.conservative:
+            # print(discretized_actions.shape)
+            conservative_loss = self.cql_loss(
+                disc_adv,
+                cont_adv,
+                discrete_actions,
+                discretized_actions,
+            )
+        loss = dqloss + cqloss + conservative_loss
         self.optimizer.zero_grad()
         loss.backward()
         if self.clip_grad is not None and self.clip_grad > 0:
@@ -620,7 +694,7 @@ class DQN(nn.Module):
                 n_c_action_bins=self.n_c_action_bins,
                 device=self.device,
             )
-        self.Q1.load_state_dict(torch.load(checkpoint_path + "/Q1",weights_only=True))
+        self.Q1.load_state_dict(torch.load(checkpoint_path + "/Q1", weights_only=True))
         self.Q1.to(self.device)
 
         self.optimizer = torch.optim.Adam(self.Q1.parameters(), lr=self.lr)
