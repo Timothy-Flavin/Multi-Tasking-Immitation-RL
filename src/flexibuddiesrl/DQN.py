@@ -1,3 +1,4 @@
+# %%
 import numpy as np
 import torch.nn as nn
 import torch
@@ -14,6 +15,9 @@ class dqntype(Enum):
     EGreedy = 0
     Soft = 1
     Munchausen = 2
+
+
+# %%
 
 
 class DQN(nn.Module):
@@ -42,8 +46,8 @@ class DQN(nn.Module):
         clip_grad=1.0,
         load_from_checkpoint_path=None,
         encoder=None,
-        action_softmax_clamp=10.0,  # when softmaxing the action logits, minmax normalize the input values to this scale
         conservative=False,
+        immitation_type="cross_entropy",  # or "reward"
     ):
         super(DQN, self).__init__()
         self.clip_grad = clip_grad
@@ -51,7 +55,7 @@ class DQN(nn.Module):
             self.load(load_from_checkpoint_path)
             return
         self.eval_mode = eval_mode
-        self.action_softmax_clamp = action_softmax_clamp
+        self.imitation_type = immitation_type
         self.entropy_loss_coef = entropy  # use soft Q learning entropy loss or not H(Q)
         self.dqn_type = dqntype.EGreedy
         if self.entropy_loss_coef > 0:
@@ -81,7 +85,7 @@ class DQN(nn.Module):
             dueling  # whether or not to learn True: V+Adv = Q or False: Adv = Q
         )
         self.n_c_action_bins = n_c_action_bins  # number of discrete action bins to discretize continuous actions
-        self.munchausen = munchausen  # use munchausen loss or not
+        self.munchausen = munchausen  # munchausen amount
         self.twin = False  # min(double q) to reduce bias
         self.init_eps = init_eps  # starting eps_greedy epsilon
         self.eps = self.init_eps
@@ -113,6 +117,7 @@ class DQN(nn.Module):
         self.to(device)
 
         # These can be saved to remake the same DQN
+        # TODO: check that this is suffucuent
         self.attrs = [
             "step",
             "entropy_loss_coef",
@@ -141,9 +146,9 @@ class DQN(nn.Module):
         ) * self.action_ranges + self.action_means
 
     def _cont_from_soft_q(self, cont_act):
-        pb = torch.softmax(torch.stack(cont_act, dim=0), dim=-1)
+        logits = torch.stack(cont_act, dim=0)
         return (
-            Categorical(probs=pb).sample() / (self.n_c_action_bins - 1) - 0.5
+            Categorical(logits=logits).sample() / (self.n_c_action_bins - 1) - 0.5
         ) * self.action_ranges + self.action_means
 
     def _discretize_actions(self, continuous_actions):
@@ -210,16 +215,7 @@ class DQN(nn.Module):
             if len(self.discrete_action_dims) > 0:
                 dact = np.zeros(len(disc_act), dtype=np.int64)
                 for i, da in enumerate(disc_act):
-                    if self.step > 10000:
-                        print(torch.softmax(da, dim=-1))
-                    dact[i] = (
-                        Categorical(probs=torch.softmax(da, dim=-1))
-                        .sample()
-                        .cpu()
-                        .item()
-                    )
-                    if self.step > 10000:
-                        print(dact)
+                    dact[i] = Categorical(logits=da).sample().cpu().item()
                 disc_act = dact  # had to store da temporarily to keep using disc_act
             if self.continuous_action_dims > 0:
                 if debug:
@@ -236,68 +232,66 @@ class DQN(nn.Module):
         disc_act, cont_act = self._e_greedy_train_action(
             observations, action_mask, step, debug
         )
-        # if self.dqn_type == dqntype.EGreedy or self.dqn_type == dqntype.Munchausen:
-
-        # else:
-        #    disc_act, cont_act = self._soft_train_action(
-        #        observations, action_mask, step, debug
-        #    )
-
         self.step += int(step)
         return disc_act, cont_act, 0, 0, 0
 
     def ego_actions(self, observations, action_mask=None):
         return 0
 
+    def _bc_cross_entropy_loss(self, disc_adv, cont_adv, disc_act, cont_act):
+        discrete_loss = 0
+        continuous_loss = 0
+        if self.discrete_action_dims is not None and len(self.discrete_action_dims) > 0:
+            for i in range(len(self.discrete_action_dims)):
+                discrete_loss += nn.CrossEntropyLoss()(
+                    disc_adv[i], disc_act[:, i]
+                )  # for discrete action 1
+
+        if self.continuous_action_dims is not None and self.continuous_action_dims > 0:
+            continuous_actions = self._discretize_actions(cont_act)
+            # print(continuous_actions)
+            for i in range(self.continuous_action_dims):
+                continuous_loss += nn.CrossEntropyLoss()(
+                    cont_adv[i], continuous_actions[:, i]
+                )
+
+        return discrete_loss, continuous_loss
+
+    def _reward_imitation_loss(self, disc_adv, cont_adv, disc_act, cont_act):
+        discrete_loss = 0
+        continuous_loss = 0
+        if self.discrete_action_dims is not None and len(self.discrete_action_dims) > 0:
+            for i in range(len(self.discrete_action_dims)):
+                best_q, best_a = torch.max(disc_adv[i], -1)
+                mask = best_a != disc_act[:, i]
+                discrete_loss += nn.MSELoss(reduction="none")(
+                    best_q + mask, best_q.detach()
+                ).mean()
+
+        if self.continuous_action_dims is not None and self.continuous_action_dims > 0:
+            continuous_actions = self._discretize_actions(cont_act)
+            # print(continuous_actions)
+            for i in range(len(self.discrete_action_dims)):
+                best_q, best_a = torch.max(cont_adv[i], -1)
+                mask = best_a != cont_act[:, i]
+                continuous_loss += nn.MSELoss(reduction="none")(
+                    best_q + mask, best_q.detach()
+                ).mean()
+        return discrete_loss, continuous_loss
+
     def imitation_learn(self, observations, continuous_actions, discrete_actions):
-        next_values, next_disc_adv, next_cont_adv = self.Q1(observations)
-
-        # minmax norm then softmax the discrete action values
-        for i in range(len(next_disc_adv)):
-            next_disc_adv[i] = (
-                (next_disc_adv[i] - next_disc_adv[i].min())
-                / (next_disc_adv[i].max() - next_disc_adv[i].min() + 1e-8)
-                * self.action_softmax_clamp
-            )  # minmax normalize to [0,self.action_softmax_clamp]
-            next_disc_adv[i] = torch.softmax(
-                next_disc_adv[i], dim=-1
-            )  # softmax for cross entropy loss later
-        for i in range(len(next_cont_adv)):
-            next_cont_adv[i] = (
-                (next_cont_adv[i] - next_cont_adv[i].min())
-                / (next_cont_adv[i].max() - next_cont_adv[i].min() + 1e-8)
-                * self.action_softmax_clamp
-            )  # minmax normalize to [0,self.action_softmax_clamp]
-            next_cont_adv[i] = torch.softmax(next_cont_adv[i], dim=-1)
-
+        values, disc_adv, cont_adv = self.Q1(observations)
         if self.eval_mode:
             return 0, 0
         else:
-            discrete_loss = 0
-
-            for i in range(len(self.discrete_action_dims)):
-                # print(next_disc_adv[i])
-                # print(discrete_actions[:, i])
-                # input()
-                discrete_loss += nn.CrossEntropyLoss()(
-                    next_disc_adv[i], discrete_actions[:, i]
-                )  # for discrete action 1
-
-            continuous_loss = 0
-            continuous_actions = self._discretize_actions(continuous_actions)
-            # print(continuous_actions)
-            for i in range(self.continuous_action_dims):
-                # print(next_cont_adv[i])
-                # print(continuous_actions[:, i])
-                # input()
-
-                continuous_loss += nn.CrossEntropyLoss()(
-                    next_cont_adv[i], continuous_actions[:, i]
+            dloss, closs = 0, 0
+            if self.imitation_type == "cross_entropy":
+                dloss, closs = self._bc_cross_entropy_loss(
+                    disc_adv, cont_adv, discrete_actions, continuous_actions
                 )
-
-            loss = (
-                (discrete_loss + continuous_loss) * self.imitation_lr / self.lr
-            )  # change weight of imitation loss
+            else:
+                dloss, closs = self._reward_imitation_loss()
+            loss = dloss + closs
             self.optimizer.zero_grad()
             loss.backward()
             if self.clip_grad is not None and self.clip_grad > 0:
@@ -308,11 +302,7 @@ class DQN(nn.Module):
                     foreach=True,
                 )
             self.optimizer.step()
-            # print(loss.item())
-            return loss.item(), 0
-
-        # print("imitation learning")
-        return 0, 0  # loss
+            return dloss.item(), closs.item()
 
     def utility_function(self, observations, actions=None):
         return 0  # Returns the single-agent critic for a single action.
@@ -709,7 +699,12 @@ class DQN(nn.Module):
         return st
 
 
+# %%
+
+
 if __name__ == "__main__":
+
+    # %%
     obs_dim = 3
     continuous_action_dim = 2
 
@@ -749,6 +744,10 @@ if __name__ == "__main__":
         lr=0.001,
         activation="relu",
     )
+
+    # %%
+
+    # %%
     d_acts, c_acts, d_log, c_log, _ = agent.train_actions(obs, step=True, debug=True)
     print(f"Training actions: c: {c_acts}, d: {d_acts}, d_log: {d_log}, c_log: {c_log}")
     aloss, closs = agent.reinforcement_learn(mem, 0, critic_only=False, debug=True)
@@ -788,3 +787,5 @@ if __name__ == "__main__":
     print(f"Training actions: c: {c_acts}, d: {d_acts}, d_log: {d_log}, c_log: {c_log}")
     aloss, closs = agent.reinforcement_learn(mem, 0, critic_only=False, debug=True)
     print("Finished Testing")
+
+# %%
