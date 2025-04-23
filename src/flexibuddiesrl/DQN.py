@@ -3,7 +3,7 @@ import numpy as np
 import torch.nn as nn
 import torch
 from torch.distributions import Categorical
-from flexibuddiesrl.Agent import QS
+from Agent import QS
 from flexibuff import FlexiBatch
 import os
 import pickle
@@ -748,6 +748,7 @@ class DQN(nn.Module):
                     jagged=True,
                 )
                 if self.dqn_type == dqntype.Munchausen:
+                    print(cont_adv)
                     temp_cont_adv = cont_adv.detach()
                     continuous_target = (
                         continuous_target

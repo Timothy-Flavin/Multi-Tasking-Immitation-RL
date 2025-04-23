@@ -31,8 +31,9 @@ def QS_test():
                     if duel:
                         print("  Value shape:", v.shape)
                     if dis is not None:
+                        print("  Discrete action dimensions:", len(d))
                         for dim in d:
-                            print("  Discrete action dim shape:", dim.shape)
+                            print("    Discrete action dim shape:", dim.shape)
                     if con > 0:
                         print("  Continuous action shape:", c.shape)
 

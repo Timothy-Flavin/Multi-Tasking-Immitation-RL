@@ -420,24 +420,19 @@ class QS(nn.Module):
 
     def forward(self, x, action_mask=None):
         # TODO: action mask implementation
-        print(f"  start: {x.shape}")
         x = T(x, self.device)
         x = self.encoder(x)
-        print(f"  after encoder: {x.shape}")
         values = 0
 
         # If the heads have their own hidden layer for a 2 layer dueling network
         if self.joint_heads_hidden_layer is not None:
             x = F.relu(self.joint_heads_hidden_layer(x))
-            print(f"  joint head hidden: {x.shape}")
         if self.dueling:
-            print(f"  head hidden dim: {self.last_hidden_dim}")
             values = self.value_head(x[:, : self.last_hidden_dim])
-            print(f"  values: {values.shape}")
 
         if self.advantage_heads is not None:
             advantages = self.advantage_heads(x[:, -self.last_hidden_dim :])
-            print(f"  advantages: {advantages.shape}")
+
         tot_disc_dims = 0
         disc_advantages = None
         cont_advantages = None
@@ -451,8 +446,10 @@ class QS(nn.Module):
                 start = end
 
         if self.cont_action_dims > 0:
-            cont_advantages = advantages[:, tot_disc_dims:].view(
-                advantages.shape[0], self.cont_action_dims, -1
+            cont_advantages = (
+                advantages[:, tot_disc_dims:]
+                .view(advantages.shape[0], self.cont_action_dims, -1)
+                .transpose(0, 1)
             )
 
         return values, disc_advantages, cont_advantages
