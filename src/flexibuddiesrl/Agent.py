@@ -443,6 +443,12 @@ class QS(nn.Module):
             for i, dim in enumerate(self.disc_action_dims):
                 end = start + dim
                 disc_advantages.append(advantages[:, start:end])
+                if (
+                    self.dueling
+                ):  # These are mean zero when dueling or Q values when not
+                    disc_advantages[-1] = disc_advantages[-1] - disc_advantages[
+                        -1
+                    ].mean(dim=-1, keepdim=True)
                 start = end
 
         if self.cont_action_dims > 0:
@@ -451,6 +457,10 @@ class QS(nn.Module):
                 .view(advantages.shape[0], self.cont_action_dims, -1)
                 .transpose(0, 1)
             )
+            if self.dueling:  # These are mean zero when dueling or Q values when not
+                cont_advantages = cont_advantages - cont_advantages.mean(
+                    dim=-1, keepdim=True
+                )
 
         return values, disc_advantages, cont_advantages
 
