@@ -140,15 +140,12 @@ class DQN(nn.Module):
 
     def _cont_from_q(self, cont_act):
         return (
-            torch.argmax(torch.stack(cont_act, dim=0), dim=-1)
-            / (self.n_c_action_bins - 1)
-            - 0.5
+            torch.argmax(cont_act, dim=-1) / (self.n_c_action_bins - 1) - 0.5
         ) * self.action_ranges + self.action_means
 
     def _cont_from_soft_q(self, cont_act):
-        logits = torch.stack(cont_act, dim=0)
         return (
-            Categorical(logits=logits).sample() / (self.n_c_action_bins - 1) - 0.5
+            Categorical(logits=cont_act).sample() / (self.n_c_action_bins - 1) - 0.5
         ) * self.action_ranges + self.action_means
 
     def _discretize_actions(self, continuous_actions):
@@ -199,10 +196,10 @@ class DQN(nn.Module):
                 if self.continuous_action_dims > 0:
                     if debug:
                         print(
-                            f"  cont act {cont_act}, argmax: {torch.argmax(torch.stack(cont_act,dim=0),dim=-1).detach().cpu()}"
+                            f"  cont act {cont_act}, argmax: {torch.argmax(cont_act,dim=-1).detach().cpu()}"
                         )
                         print(
-                            f"  Trying to store this in actions {((torch.argmax(torch.stack(cont_act,dim=0),dim=-1)/ (self.n_c_action_bins - 1) -0.5)* self.action_ranges+ self.action_means)} calculated from da: {cont_act} with ranges: {self.action_ranges} and means: {self.action_means}"
+                            f"  Trying to store this in actions {((torch.argmax(cont_act,dim=-1)/ (self.n_c_action_bins - 1) -0.5)* self.action_ranges+ self.action_means)} calculated from da: {cont_act} with ranges: {self.action_ranges} and means: {self.action_means}"
                         )
                     cont_act = self._cont_from_q(cont_act).cpu().numpy()
         return disc_act, cont_act
@@ -220,10 +217,10 @@ class DQN(nn.Module):
             if self.continuous_action_dims > 0:
                 if debug:
                     print(
-                        f"  cont act {cont_act}, argmax: {torch.argmax(torch.stack(cont_act,dim=0),dim=-1).detach().cpu()}"
+                        f"  cont act {cont_act}, argmax: {torch.argmax(cont_act,dim=-1).detach().cpu()}"
                     )
                     print(
-                        f"  Trying to store this in actions {((torch.argmax(torch.stack(cont_act,dim=0),dim=-1)/ (self.n_c_action_bins - 1) -0.5)* self.action_ranges+ self.action_means)} calculated from da: {cont_act} with ranges: {self.action_ranges} and means: {self.action_means}"
+                        f"  Trying to store this in actions {((torch.argmax(cont_act,dim=-1)/ (self.n_c_action_bins - 1) -0.5)* self.action_ranges+ self.action_means)} calculated from da: {cont_act} with ranges: {self.action_ranges} and means: {self.action_means}"
                     )
                 cont_act = self._cont_from_soft_q(cont_act).cpu().numpy()
         return disc_act, cont_act
@@ -395,6 +392,7 @@ class DQN(nn.Module):
             dQ_ = 0
             cQ_ = 0
             next_values, next_disc_adv, next_cont_adv = self.Q1(batch.obs_[agent_num])
+            print(next_cont_adv.shape)
             # print(next_values)
             dnv_ = 0
             cnv_ = 0
@@ -632,7 +630,6 @@ class DQN(nn.Module):
         debug=True,
     ):
         if jagged:  # discrete action bins are jagget
-            print(f"  target obs: {advantages[0].shape[0]}")
             vals = values.squeeze(-1) if self.dueling else 0  # make it a column vector
             # action_dim = len(self.discrete_action_dims)
             Q_ = torch.zeros(
@@ -641,7 +638,7 @@ class DQN(nn.Module):
                 dtype=torch.float32,
             )
             if debug:
-                print("target() q shape, adv shape, and value shape")
+                print("Jagged target() q shape, adv shape, and value shape")
                 print(Q_.shape, vals)
                 for i in range(len(action_dim)):
                     print(advantages[i].shape)
@@ -671,6 +668,44 @@ class DQN(nn.Module):
                             f"  Standard DQN: adv(max_a): {torch.max(advantages[i], dim=-1).values.shape}, vals: {vals.shape if self.dueling else values}"
                         )
                     Q_[:, i] = torch.max(advantages[i], dim=-1).values + vals
+
+        else:  # continuous bins are not jagged
+            if debug:
+                print(f"  Not Jagget target advantages: {advantages[0].shape[0]}")
+            # Treat actions as probabalistic if using soft Q or m-dqn
+            if self.dqn_type == dqntype.Munchausen or self.dqn_type == dqntype.Soft:
+                lprobs = torch.log_softmax(advantages / self.entropy_loss_coef, dim=-1)
+                probs = torch.exp(lprobs)
+                if debug:
+                    print(
+                        f"  M-DQN or Soft DQN: adv(max_a): {torch.max(advantages, dim=-1).values.shape}, vals: {values.shape if self.dueling else values}"
+                    )
+                if self.dueling:
+                    vals = values.unsqueeze(0).expand(
+                        advantages.shape
+                    )  # make it a column vector
+                else:
+                    vals = 0
+                q_vals = vals + advantages
+                Q_ = torch.sum(
+                    probs * (q_vals - self.entropy_loss_coef * lprobs), dim=-1
+                )
+                if debug:
+                    print(
+                        f"  vals shape: {vals.shape if self.dueling else 0} Q_: {Q_.shape}, rewards: {rewards.unsqueeze(-1).shape}, terminated: {terminated.unsqueeze(-1).shape}"
+                    )
+            else:
+                if self.dueling:
+                    vals = values.transpose(0, 1).expand(
+                        self.continuous_action_dims, advantages.shape[1]
+                    )
+                else:
+                    vals = 0
+                if debug:
+                    print(
+                        f"  Standard DQN: adv(max_a): {torch.max(advantages[i], dim=-1).values.shape}, vals: {vals.shape if self.dueling else values}"
+                    )
+                Q_ = torch.max(advantages, dim=-1).values + vals
 
         if debug:
             print(
@@ -744,8 +779,7 @@ class DQN(nn.Module):
                     advantages=next_cont_adv,
                     rewards=batch.global_rewards,
                     terminated=batch.terminated,
-                    action_dim=[self.n_c_action_bins] * self.continuous_action_dims,
-                    jagged=True,
+                    jagged=False,
                 )
                 if self.dqn_type == dqntype.Munchausen:
                     print(cont_adv)
