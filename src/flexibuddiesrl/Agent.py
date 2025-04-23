@@ -395,7 +395,7 @@ class QS(nn.Module):
         self.advantage_heads = None
         self.tot_adv_size = continuous_action_dim * n_c_action_bins
         if discrete_action_dims is not None:
-            self.tot_adv_size = sum(discrete_action_dims)
+            self.tot_adv_size += sum(discrete_action_dims)
 
         # set up hidden layer for the adv and V heads
         if head_hidden_dim != 0:

@@ -9,7 +9,7 @@ def QS_test():
     duel_tests = [True, False]
     dis_tests = [None, [2, 3, 4]]
     con_tests = [0, 5]
-    head_hidden_tests = [None, 32]
+    head_hidden_tests = [None, 64]
 
     for duel in duel_tests:
         for dis in dis_tests:
