@@ -356,65 +356,109 @@ class QS(nn.Module):
         dropout=0.0,
         dueling=False,
         device="cpu",
-        n_c_action_bins=10,
+        n_c_action_bins=11,
+        head_hidden_dim=64,  # adding a layer size gives hidden layers to heads
     ):
-
         super(QS, self).__init__()
-        self.disc_action_dims = discrete_action_dims
-        self.cont_action_dims = continuous_action_dim
+
+        # guard code
+        if head_hidden_dim is None:
+            head_hidden_dim = 0
+        if continuous_action_dim is None:
+            continuous_action_dim = 0
         if encoder is not None:
             self.encoder = encoder
         else:
             self.encoder = ffEncoder(
                 obs_dim, hidden_dims, activation, device, orthogonal, dropout
             )
+        if discrete_action_dims is not None:
+            if isinstance(discrete_action_dims, int):
+                discrete_action_dims = [discrete_action_dims]
+            if len(discrete_action_dims) == 0:
+                ValueError(
+                    "discrete_action_dims should not be empty, use [x] for a single discrete action with cardonality 'x'"
+                )
+            if min(discrete_action_dims) < 1:
+                ValueError(
+                    "discrete_action_dims should not contain values less than 1, use [x] for a single discrete action with cardonality 'x'"
+                )
+        # setting needed self variables
+        self.disc_action_dims = discrete_action_dims
+        self.cont_action_dims = continuous_action_dim
         self.device = device
         self.dueling = dueling
-        if self.dueling:
-            self.value_head = nn.Linear(hidden_dims[-1], 1)
-        else:
-            self.value_head = None
+        self.last_hidden_dim = head_hidden_dim
+        if head_hidden_dim == 0:
+            self.last_hidden_dim = hidden_dims[-1]
+        self.joint_heads_hidden_layer = None
+        self.advantage_heads = None
+        self.tot_adv_size = continuous_action_dim * n_c_action_bins
+        if discrete_action_dims is not None:
+            self.tot_adv_size = sum(discrete_action_dims)
 
-        self.discrete_advantage_heads = nn.ModuleList()
-        if discrete_action_dims is not None and len(discrete_action_dims) > 0:
-            for dim in discrete_action_dims:
-                self.discrete_advantage_heads.append(nn.Linear(hidden_dims[-1], dim))
+        # set up hidden layer for the adv and V heads
+        if head_hidden_dim != 0:
+            self.joint_heads_hidden_layer = nn.Linear(
+                hidden_dims[-1], head_hidden_dim * (2 if self.dueling else 1)
+            )
+            if orthogonal:
+                _orthogonal_init(self.joint_heads_hidden_layer)
+        # set up the adv heads if this isn't just a V network
+        if self.cont_action_dims > 0 or self.disc_action_dims is not None:
+            self.advantage_heads = nn.Linear(
+                self.last_hidden_dim,
+                self.tot_adv_size,
+            )
 
-        self.continuous_advantage_heads = nn.ModuleList()
-        if continuous_action_dim is not None and continuous_action_dim > 0:
-            for dim in range(continuous_action_dim):
-                self.continuous_advantage_heads.append(
-                    nn.Linear(hidden_dims[-1], n_c_action_bins)
-                )
-
+        # set up the value head if dueling is True
+        self.value_head = nn.Linear(self.last_hidden_dim, 1) if self.dueling else None
+        print(
+            f"initialized QS with: {self.joint_heads_hidden_layer}, {self.value_head}, {self.advantage_heads}"
+        )
         self.to(device)
 
     def forward(self, x, action_mask=None):
         # TODO: action mask implementation
+        print(f"  start: {x.shape}")
         x = T(x, self.device)
         x = self.encoder(x)
+        print(f"  after encoder: {x.shape}")
         values = 0
+
+        # If the heads have their own hidden layer for a 2 layer dueling network
+        if self.joint_heads_hidden_layer is not None:
+            x = F.relu(self.joint_heads_hidden_layer(x))
+            print(f"  joint head hidden: {x.shape}")
         if self.dueling:
-            values = self.value_head(x)
-        disc_advantages = []
-        if len(self.disc_action_dims) > 0:
-            for i, head in enumerate(self.discrete_advantage_heads):
-                Adv = head(x)
-                if self.dueling:
-                    Adv = Adv - Adv.mean(dim=-1, keepdim=True)
-                disc_advantages.append(Adv)
-        cont_advantages = []
+            print(f"  head hidden dim: {self.last_hidden_dim}")
+            values = self.value_head(x[:, : self.last_hidden_dim])
+            print(f"  values: {values.shape}")
+
+        if self.advantage_heads is not None:
+            advantages = self.advantage_heads(x[:, -self.last_hidden_dim :])
+            print(f"  advantages: {advantages.shape}")
+        tot_disc_dims = 0
+        disc_advantages = None
+        cont_advantages = None
+        if self.disc_action_dims is not None:
+            tot_disc_dims = sum(self.disc_action_dims)
+            disc_advantages = []
+            start = 0
+            for i, dim in enumerate(self.disc_action_dims):
+                end = start + dim
+                disc_advantages.append(advantages[:, start:end])
+                start = end
+
         if self.cont_action_dims > 0:
-            for i, head in enumerate(self.continuous_advantage_heads):
-                Adv = head(x)
-                if self.dueling:
-                    Adv = Adv - Adv.mean(dim=-1, keepdim=True)
-                cont_advantages.append(Adv)
+            cont_advantages = advantages[:, tot_disc_dims:].view(
+                advantages.shape[0], self.cont_action_dims, -1
+            )
+
         return values, disc_advantages, cont_advantages
 
 
 # TODO: Try Dueling heads 2 layers and add activation functions for nonlinearities
-# TODO: Add V and A into one output to make consistent. Make sure V applies to all A in dim -1
 
 
 class DuelingQSCA(nn.Module):
