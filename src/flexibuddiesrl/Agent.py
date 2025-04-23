@@ -455,8 +455,8 @@ class QS(nn.Module):
             cont_advantages = (
                 advantages[:, tot_disc_dims:]
                 .view(advantages.shape[0], self.cont_action_dims, -1)
-                .transpose(0, 1)
-            )
+                .transpose(0, 1)  # TODO: figure out if it is worth it to transpose
+            )  # transposed because then discrete and continuous output same dim order
             if self.dueling:  # These are mean zero when dueling or Q values when not
                 cont_advantages = cont_advantages - cont_advantages.mean(
                     dim=-1, keepdim=True
