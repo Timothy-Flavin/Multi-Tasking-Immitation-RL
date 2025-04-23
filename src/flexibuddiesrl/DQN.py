@@ -632,17 +632,22 @@ class DQN(nn.Module):
         debug=True,
     ):
         if jagged:  # discrete action bins are jagget
+            print(f"  target obs: {advantages[0].shape[0]}")
+            vals = values.squeeze(-1) if self.dueling else 0  # make it a column vector
             # action_dim = len(self.discrete_action_dims)
             Q_ = torch.zeros(
-                size=(obs.shape[0], action_dim), device=self.device, dtype=torch.float32
+                size=(advantages[0].shape[0], len(action_dim)),
+                device=self.device,
+                dtype=torch.float32,
             )
             if debug:
                 print("target() q shape, adv shape, and value shape")
-                print(Q_.shape, values)
-                for i in action_dim:
+                print(Q_.shape, vals)
+                for i in range(len(action_dim)):
                     print(advantages[i].shape)
+                # print(advantages)
 
-            for i in range(action_dim):
+            for i in range(len(action_dim)):
                 # Treat actions as probabalistic if using soft Q or m-dqn
                 if self.dqn_type == dqntype.Munchausen or self.dqn_type == dqntype.Soft:
                     lprobs = torch.log_softmax(
@@ -652,25 +657,20 @@ class DQN(nn.Module):
 
                     if debug:
                         print(
-                            f"  M-DQN or Soft DQN: adv(max_a): {torch.max(advantages[i], dim=-1).values.shape}, vals: {val.shape}"
+                            f"  M-DQN or Soft DQN: adv(max_a): {torch.max(advantages[i], dim=-1).values.shape}, vals: {vals.shape if self.dueling else values}"
                         )
 
-                    q_vals = values + advantages[i]
+                    q_vals = vals + advantages[i]
 
                     Q_[:, i] = torch.sum(
                         probs * (q_vals - self.entropy_loss_coef * lprobs), dim=-1
                     )
                 else:
-                    if self.dueling:
-                        val = values.squeeze(-1)
-                    else:
-                        val = 0
                     if debug:
                         print(
-                            f"  Standard DQN: adv(max_a): {torch.max(advantages[i], dim=-1).values.shape}, vals: {val.shape}"
+                            f"  Standard DQN: adv(max_a): {torch.max(advantages[i], dim=-1).values.shape}, vals: {vals.shape if self.dueling else values}"
                         )
-
-                    Q_[:, i] = torch.max(advantages[i], dim=-1).values + val
+                    Q_[:, i] = torch.max(advantages[i], dim=-1).values + vals
 
         if debug:
             print(
@@ -681,7 +681,7 @@ class DQN(nn.Module):
             rewards.unsqueeze(-1) + (self.gamma * (1 - terminated)).unsqueeze(-1) * Q_
         )
         if debug:
-            print(f" targets: {targets.shape}")
+            print(f"  targets: {targets.shape}")
         return targets
 
     def reinforcement_learn(
@@ -698,6 +698,9 @@ class DQN(nn.Module):
         if debug:
             print(
                 f"Discrete actions: {discrete_actions.shape}, Continuous actions: {continuous_actions.shape}"
+            )
+            print(
+                f"Batch obs: {batch.obs[agent_num].shape}, Batch obs_: {batch.obs_[agent_num].shape}"
             )
         discrete_target = 0
         continuous_target = 0
@@ -716,18 +719,18 @@ class DQN(nn.Module):
                     advantages=next_disc_adv,
                     rewards=batch.global_rewards,
                     terminated=batch.terminated,
-                    action_dim=len(self.discrete_action_dims),
+                    action_dim=self.discrete_action_dims,
                     jagged=True,
                 )
                 if self.dqn_type == dqntype.Munchausen:
-                    temp_disc_adv = disc_adv.detach()
                     for i in range(len(self.discrete_action_dims)):
+                        temp_disc_adv = disc_adv[i].detach()
                         # if munchausen add tau*alpha*lp(a|s) to target
                         discrete_target[:, i] = discrete_target[
                             :, i
                         ] + self.entropy_loss_coef * self.munchausen * (
                             Categorical(
-                                logits=temp_disc_adv[i] / self.entropy_loss_coef
+                                logits=temp_disc_adv / self.entropy_loss_coef
                             ).log_prob(discrete_actions[:, i])
                         )
             if (
@@ -741,7 +744,7 @@ class DQN(nn.Module):
                     advantages=next_cont_adv,
                     rewards=batch.global_rewards,
                     terminated=batch.terminated,
-                    action_dim=self.continuous_action_dims,
+                    action_dim=[self.n_c_action_bins] * self.continuous_action_dims,
                     jagged=True,
                 )
                 if self.dqn_type == dqntype.Munchausen:
@@ -758,16 +761,13 @@ class DQN(nn.Module):
         if self.continuous_action_dims is not None and self.continuous_action_dims > 0:
             if debug:
                 print(
-                    f"Calculating cQ: cont_advs.shape: {torch.stack(cont_adv, dim=1)}, continuous_actions: {continuous_actions.shape}"
+                    f"Calculating cQ: cont_advs.shape: {torch.stack(cont_adv, dim=1).shape}, continuous_actions: {continuous_actions.unsqueeze(-1).shape}, vals: {values.shape if self.dueling else 0}"
                 )
-            cQ = (
-                torch.gather(
-                    torch.stack(cont_adv, dim=1),
-                    dim=-1,
-                    index=continuous_actions,
-                )
-                + (values if self.dueling else 0)
-            ).squeeze(-1)
+            cQ = torch.gather(
+                input=torch.stack(cont_adv, dim=1),
+                dim=-1,
+                index=continuous_actions.unsqueeze(-1),
+            ).squeeze(-1) + (values if self.dueling else 0)
 
             if debug:
                 print(f"cQ: {cQ.shape}, continuous_target: {continuous_target.shape}")
@@ -788,10 +788,10 @@ class DQN(nn.Module):
                     torch.gather(
                         disc_adv[d],
                         dim=-1,
-                        index=batch.discrete_actions[agent_num, :, d].unsqueeze(-1),
-                    ).squeeze(-1)
+                        index=discrete_actions[:, d].unsqueeze(-1),
+                    )
                     + values
-                )
+                ).squeeze(-1)
 
         dqloss = (dQ - discrete_target) ** 2
         dqloss = dqloss.mean()
@@ -800,6 +800,7 @@ class DQN(nn.Module):
 
         loss = dqloss + cqloss
         self.optimizer.zero_grad()
+        loss.backward()
         if self.clip_grad is not None and self.clip_grad > 0:
             torch.nn.utils.clip_grad_norm_(
                 self.parameters(),
@@ -807,7 +808,8 @@ class DQN(nn.Module):
                 error_if_nonfinite=True,
                 foreach=True,
             )
-        loss.backward()
+        self.optimizer.step()
+        return dqloss.item(), cqloss.item()  # actor loss, critic loss
 
     def _dump_attr(self, attr, path):
         f = open(path, "wb")
@@ -927,6 +929,7 @@ if __name__ == "__main__":
         device="cuda:0",
         lr=0.001,
         activation="relu",
+        dueling=True,
     )
 
     # %%
