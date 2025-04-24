@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from flexibuddiesrl.Util import T
+from .Util import T
 
 
 class Agent(ABC):

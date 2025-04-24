@@ -1,8 +1,8 @@
 import torch
 import torch.nn.functional as F
 import numpy as np
-from flexibuddiesrl.Agent import Agent, MixedActor, ValueSA
-from flexibuddiesrl.Util import T, get_multi_discrete_one_hot
+from .Agent import Agent, MixedActor, ValueSA
+from .Util import T, get_multi_discrete_one_hot
 from flexibuff import FlexiBatch
 import os
 import pickle

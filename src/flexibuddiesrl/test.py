@@ -1,12 +1,12 @@
 from flexibuff import FlexibleBuffer
-from DDPG import DDPG
-from TD3 import TD3
+from flexibuddiesrl.DDPG import DDPG
+from flexibuddiesrl.TD3 import TD3
+from flexibuddiesrl.PG import PG
+from flexibuddiesrl.DQN import DQN
+from flexibuddiesrl.Agent import Agent
 import gymnasium as gym
 import numpy as np
-from Agent import Agent
 from typing import List
-from PG import PG
-from DQN import DQN
 import torch
 import pygame
 

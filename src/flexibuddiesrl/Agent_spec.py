@@ -1,6 +1,6 @@
 import numpy as np
 import torch
-from Agent import QS
+from .Agent import QS
 
 
 def QS_test():

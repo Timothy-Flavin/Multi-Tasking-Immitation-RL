@@ -3,7 +3,8 @@ import numpy as np
 import torch.nn as nn
 import torch
 from torch.distributions import Categorical
-from Agent import QS
+from .Agent import Agent
+from .Agent import QS
 from flexibuff import FlexiBatch
 import os
 import pickle
@@ -20,7 +21,7 @@ class dqntype(Enum):
 # %%
 
 
-class DQN(nn.Module):
+class DQN(nn.Module, Agent):
     def __init__(
         self,
         obs_dim=10,
