@@ -8,6 +8,7 @@ from .Agent import QS
 from flexibuff import FlexiBatch
 import os
 import pickle
+import warnings
 
 from enum import Enum
 
@@ -26,7 +27,7 @@ class DQN(nn.Module, Agent):
         self,
         obs_dim=10,
         discrete_action_dims=None,  # np.array([2]),
-        continuous_action_dims=None,  # 2,
+        continuous_action_dims: int = None,  # 2,
         min_actions=None,  # np.array([-1,-1]),
         max_actions=None,  # ,np.array([1,1]),
         hidden_dims=[64, 64],  # first is obs dim if encoder provded
@@ -172,7 +173,10 @@ class DQN(nn.Module, Agent):
             )
         value = 0
         if self.init_eps > 0.0 and np.random.rand() < self.eps:
-            if len(self.discrete_action_dims) > 0:
+            if (
+                self.discrete_action_dims is not None
+                and len(self.discrete_action_dims) > 0
+            ):
                 disc_act = np.zeros(
                     shape=len(self.discrete_action_dims), dtype=np.int32
                 )
@@ -191,7 +195,10 @@ class DQN(nn.Module, Agent):
                 # print("done with that")
                 # select actions from q function
                 # print(value, disc_act, cont_act)
-                if len(self.discrete_action_dims) > 0:
+                if (
+                    self.discrete_action_dims is not None
+                    and len(self.discrete_action_dims) > 0
+                ):
                     d_act = np.zeros(len(disc_act), dtype=np.int32)
                     for i, da in enumerate(disc_act):
                         d_act[i] = torch.argmax(da).detach().cpu().item()
@@ -295,6 +302,11 @@ class DQN(nn.Module, Agent):
             else:
                 dloss, closs = self._reward_imitation_loss()
             loss = dloss + closs
+            if loss == 0:
+                warnings.warn(
+                    "Loss is 0, not updating. Most likely due to continuous and discrete actions being None,0 respectively"
+                )
+                return 0, 0
             self.optimizer.zero_grad()
             loss.backward()
             if self.clip_grad is not None and self.clip_grad > 0:
@@ -305,7 +317,11 @@ class DQN(nn.Module, Agent):
                     foreach=True,
                 )
             self.optimizer.step()
-            return dloss.item(), closs.item()
+            if dloss != 0:
+                dloss = dloss.item()
+            if closs != 0:
+                closs = closs.item()
+            return dloss, closs
 
     def utility_function(self, observations, actions=None):
         return 0  # Returns the single-agent critic for a single action.
@@ -745,7 +761,8 @@ class DQN(nn.Module, Agent):
         discrete_target = 0
         continuous_target = 0
         values, disc_adv, cont_adv = self.Q1(batch.obs[agent_num])
-        cont_adv = cont_adv.transpose(0, 1)
+        if cont_adv is not None:
+            cont_adv = cont_adv.transpose(0, 1)
         with torch.no_grad():
             next_values, next_disc_adv, next_cont_adv = self.Q1(batch.obs_[agent_num])
             if (
@@ -835,23 +852,38 @@ class DQN(nn.Module, Agent):
                     + values
                 ).squeeze(-1)
 
-        dqloss = (dQ - discrete_target) ** 2
-        dqloss = dqloss.mean()
-        cqloss = (cQ - continuous_target) ** 2
-        cqloss = cqloss.mean()
+        dqloss, cqloss = 0, 0
+        trainable = False
+        if self.discrete_action_dims is not None and len(self.discrete_action_dims) > 0:
+            dqloss = (dQ - discrete_target) ** 2
+            dqloss = dqloss.mean()
+            trainable = True
 
-        loss = dqloss + cqloss
-        self.optimizer.zero_grad()
-        loss.backward()
-        if self.clip_grad is not None and self.clip_grad > 0:
-            torch.nn.utils.clip_grad_norm_(
-                self.parameters(),
-                self.clip_grad,
-                error_if_nonfinite=True,
-                foreach=True,
+        if self.continuous_action_dims is not None and self.continuous_action_dims > 0:
+            cqloss = (cQ - continuous_target) ** 2
+            cqloss = cqloss.mean()
+            trainable = True
+        if trainable:
+            loss = dqloss + cqloss
+            self.optimizer.zero_grad()
+            loss.backward()
+            if self.clip_grad is not None and self.clip_grad > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    self.parameters(),
+                    self.clip_grad,
+                    error_if_nonfinite=True,
+                    foreach=True,
+                )
+            self.optimizer.step()
+        else:
+            warnings.warn(
+                "Action dims both zero so there is nothing to train. Not updating the model."
             )
-        self.optimizer.step()
-        return dqloss.item(), cqloss.item()  # actor loss, critic loss
+        if dqloss != 0:
+            dqloss = dqloss.item()
+        if cqloss != 0:
+            cqloss = cqloss.item()
+        return dqloss, cqloss  # actor loss, critic loss
 
     def _dump_attr(self, attr, path):
         f = open(path, "wb")

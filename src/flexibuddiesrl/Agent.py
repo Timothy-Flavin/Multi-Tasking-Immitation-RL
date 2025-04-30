@@ -414,7 +414,7 @@ class QS(nn.Module):
         # set up the value head if dueling is True
         self.value_head = nn.Linear(self.last_hidden_dim, 1) if self.dueling else None
         print(
-            f"initialized QS with: {self.joint_heads_hidden_layer}, {self.value_head}, {self.advantage_heads}"
+            f"initialized QS with: {self.joint_heads_hidden_layer}, {self.value_head}, {self.advantage_heads}\n  d_dim: {discrete_action_dims}, c_dim: {continuous_action_dim}, h_dim: {hidden_dims}, head_hidden_dim: {head_hidden_dim}"
         )
         self.to(device)
 

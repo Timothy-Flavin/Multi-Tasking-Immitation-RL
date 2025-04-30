@@ -3,18 +3,21 @@ from flexibuddiesrl.PG import PG
 from flexibuddiesrl.DDPG import DDPG
 from flexibuddiesrl.TD3 import TD3
 from flexibuddiesrl.Agent import QS
+from flexibuddiesrl.Agent import Agent
 
 from flexibuff import FlexibleBuffer, FlexiBatch
 import matplotlib.pyplot as plt
 import numpy as np
 
 
-def test_imitation_learn(agent, batch: FlexiBatch):
+def test_imitation_learn(agent: Agent, batch: FlexiBatch):
     dlosses, alosses = [], []
     for i in range(10):
-        dloss, closs = agent.imitation_learn(batch)
-        dlosses.append(dloss.item())
-        alosses.append(closs.item())
+        dloss, closs = agent.imitation_learn(
+            batch.obs[0], batch.continuous_actions[0], batch.discrete_actions[0]
+        )
+        dlosses.append(dloss)
+        alosses.append(closs)
     return dlosses, alosses
 
 
@@ -44,7 +47,7 @@ def set_up_memory_buffer(
             "obs_": ([obs_dim], np.float32),
             "discrete_log_probs": ([len(discrete_action_dims)], np.float32),
             "continuous_log_probs": ([continuous_action_dim], np.float32),
-            "discrete_actions": ([len(discrete_action_dims)], np.int32),
+            "discrete_actions": ([len(discrete_action_dims)], np.int64),
             "continuous_actions": ([continuous_action_dim], np.float32),
         },
     )
@@ -101,10 +104,10 @@ def dqn_agents(obs_dim, continuous_action_dim, discrete_action_dims):
                             )
                             agent = DQN(
                                 obs_dim=obs_dim,
-                                continuous_action_dim=continuous_action_dim,
+                                continuous_action_dims=con,
                                 max_actions=np.array([1, 2]),
                                 min_actions=np.array([0, 0]),
-                                discrete_action_dims=discrete_action_dims,
+                                discrete_action_dims=dis,
                                 hidden_dims=[32, 32],
                                 device="cuda:0",
                                 lr=0.001,
@@ -113,6 +116,7 @@ def dqn_agents(obs_dim, continuous_action_dim, discrete_action_dims):
                                 n_c_action_bins=5,
                                 head_hidden_dim=head_hidden,
                                 conservative=cql,
+                                init_eps=eps,
                             )
                             agents.append(agent)
 
@@ -158,11 +162,17 @@ if __name__ == "__main__":
             f"Training actions: c: {c_acts}, d: {d_acts}, d_log: {d_log}, c_log: {c_log}"
         )
         aloss, closs = agents[i].reinforcement_learn(
-            mem, 0, critic_only=False, debug=False
+            mem.sample_transitions(12, as_torch=True), 0, critic_only=False, debug=False
         )
         print(f"Reinforcement learn losses: aloss: {aloss}, closs: {closs}")
 
         aloss, closs = test_imitation_learn(
             agents[i],
-            mem.sample_transitions(14, debug=False, as_torch=True, device="cuda:0"),
+            mem.sample_transitions(14, as_torch=True, device="cuda:0"),
         )
+        print(f"Imitation learn losses: aloss: {aloss}, closs: {closs}")
+        x = input(
+            f"Press enter to continue to the next agent, or type 'exit' to quit: "
+        )
+        if x.lower() == "exit":
+            break
