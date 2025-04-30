@@ -663,7 +663,7 @@ class DQN(nn.Module, Agent):
                 print("Jagged target() q shape, adv shape, and value shape")
                 print(Q_.shape, vals)
                 for i in range(len(action_dim)):
-                    print(advantages[i].shape)
+                    print("  " + str(advantages[i].shape))
                 # print(advantages)
 
             for i in range(len(action_dim)):

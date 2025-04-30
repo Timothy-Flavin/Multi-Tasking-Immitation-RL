@@ -84,6 +84,8 @@ def dqn_agents(obs_dim, continuous_action_dim, discrete_action_dims):
     head_hidden_tests = [None, 64]
     epsilon_tests = [1.0, 0.0]
     conservative_tests = [True, False]
+    entropy_tests = [0.0, 0.1]
+    munchausen_tests = [0.0, 0.9]
     agents = []
     agent_parameters = []
     for duel in duel_tests:
@@ -92,33 +94,40 @@ def dqn_agents(obs_dim, continuous_action_dim, discrete_action_dims):
                 for head_hidden in head_hidden_tests:
                     for eps in epsilon_tests:
                         for cql in conservative_tests:
-                            agent_parameters.append(
-                                {
-                                    "duel": duel,
-                                    "discrete_action_dims": dis,
-                                    "continuous_action_dim": con,
-                                    "head_hidden": head_hidden,
-                                    "epsilon": eps,
-                                    "cql": cql,
-                                }
-                            )
-                            agent = DQN(
-                                obs_dim=obs_dim,
-                                continuous_action_dims=con,
-                                max_actions=np.array([1, 2]),
-                                min_actions=np.array([0, 0]),
-                                discrete_action_dims=dis,
-                                hidden_dims=[32, 32],
-                                device="cuda:0",
-                                lr=0.001,
-                                activation="relu",
-                                dueling=duel,
-                                n_c_action_bins=5,
-                                head_hidden_dim=head_hidden,
-                                conservative=cql,
-                                init_eps=eps,
-                            )
-                            agents.append(agent)
+                            for ent in entropy_tests:
+                                for mun in munchausen_tests:
+                                    if mun > 0 and ent <= 0:
+                                        continue
+                                    agent_parameters.append(
+                                        {
+                                            "duel": duel,
+                                            "discrete_action_dims": dis,
+                                            "continuous_action_dim": con,
+                                            "head_hidden": head_hidden,
+                                            "epsilon": eps,
+                                            "cql": cql,
+                                            "entropy": ent,
+                                            "munchausen": mun,
+                                        }
+                                    )
+                                    agent = DQN(
+                                        obs_dim=obs_dim,
+                                        continuous_action_dims=con,
+                                        max_actions=np.array([1, 2]),
+                                        min_actions=np.array([0, 0]),
+                                        discrete_action_dims=dis,
+                                        hidden_dims=[32, 32],
+                                        device="cuda:0",
+                                        lr=0.001,
+                                        imitation_lr=0.001,
+                                        activation="relu",
+                                        dueling=duel,
+                                        n_c_action_bins=5,
+                                        head_hidden_dim=head_hidden,
+                                        conservative=cql,
+                                        init_eps=eps,
+                                    )
+                                    agents.append(agent)
 
     print(f"Total DQN agents created: {len(agents)}")
     return agents, agent_parameters
@@ -138,7 +147,9 @@ if __name__ == "__main__":
         f"Which model should be tested?: {testable_model_functions.keys()} \n"
     ).upper()
     while algorithm not in testable_model_functions:
-        algorithm = input("Please enter a valid model name (DQN, PG, DDPG, TD3): ")
+        algorithm = input(
+            f"Please enter a valid model name ({testable_model_functions.keys()}): "
+        )
 
     mem = set_up_memory_buffer(
         obs_dim, continuous_action_dim, discrete_action_dims, termination
@@ -153,6 +164,7 @@ if __name__ == "__main__":
     agents, agent_params = testable_model_functions[algorithm](
         obs_dim, continuous_action_dim, discrete_action_dims
     )
+    x = ""
     for i in range(len(agents)):
         print(f"Agent {i}: {agent_params[i]}")
         d_acts, c_acts, d_log, c_log, _ = agents[i].train_actions(
@@ -171,8 +183,10 @@ if __name__ == "__main__":
             mem.sample_transitions(14, as_torch=True, device="cuda:0"),
         )
         print(f"Imitation learn losses: aloss: {aloss}, closs: {closs}")
+        if x.lower() == "auto":
+            continue
         x = input(
-            f"Press enter to continue to the next agent, or type 'exit' to quit: "
+            f"Press enter to continue to the next agent, or type 'exit' to quit, or 'auto' to skip inputs: "
         )
         if x.lower() == "exit":
             break
