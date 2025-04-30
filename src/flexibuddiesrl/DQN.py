@@ -30,6 +30,7 @@ class DQN(nn.Module, Agent):
         min_actions=None,  # np.array([-1,-1]),
         max_actions=None,  # ,np.array([1,1]),
         hidden_dims=[64, 64],  # first is obs dim if encoder provded
+        head_hidden_dim=0,  # if None then no head hidden layer
         gamma=0.99,
         lr=3e-5,
         imitation_lr=1e-5,
@@ -108,6 +109,7 @@ class DQN(nn.Module, Agent):
             n_c_action_bins=n_c_action_bins,
             device=device,
             encoder=encoder,  # pass encoder if using one for observations (like in visual DQN)
+            head_hidden_dim=head_hidden_dim,  # if None then no head hidden layer
         )
 
         self.Q1.to(device)
