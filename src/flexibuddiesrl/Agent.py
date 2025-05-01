@@ -219,6 +219,117 @@ class MixedActor(nn.Module):
         return continuous_actions, discrete_actions
 
 
+class StochasticActor(nn.Module):
+    def __init__(
+        self,
+        obs_dim,
+        continuous_action_dim: int = 0,  # number of continuouis action dimensions =5
+        discrete_action_dims: (
+            list[int] | None
+        ) = None,  # list of discrete action dimensions =[2, 3, 4]
+        max_actions: np.array = np.array([1.0], dtype=np.float32),
+        min_actions: np.array = np.array([-1.0], dtype=np.float32),
+        hidden_dims: np.array = np.array([256, 256], dtype=np.int32),
+        encoder=None,  # ffEncoder if hidden dims are provided and encoder is not provided
+        device="cpu",
+        tau=1.0,  # for gumbel soft
+        hard=False,
+        orthogonal_init=False,
+        activation="relu",
+    ):
+        super(MixedActor, self).__init__()
+        self.device = device
+        self.tau = tau
+        self.hard = hard
+        print(hidden_dims)
+        if encoder is None and len(hidden_dims) > 0:
+            self.encoder = ffEncoder(
+                obs_dim, hidden_dims, device=device, activation=activation, dropout=0
+            )
+
+        assert not (
+            continuous_action_dim is None and discrete_action_dims is None
+        ), "At least one action dim should be provided"
+        if continuous_action_dim is not None and continuous_action_dim > 0:
+            assert (
+                len(max_actions) == continuous_action_dim
+                and len(min_actions) == continuous_action_dim
+            ), f"max_actions should be provided for each continuous action dim {len(max_actions)},{continuous_action_dim}"
+
+        # print(
+        #    f"Min actions: {min_actions}, max actions: {max_actions}, torch {torch.from_numpy(max_actions - min_actions)}"
+        # )
+        if max_actions is not None and min_actions is not None:
+            self.action_scales = (
+                torch.from_numpy(max_actions - min_actions).float().to(device) / 2
+            )
+            # doesn't track grad by default in from_numpy
+            self.action_biases = (
+                torch.from_numpy(max_actions + min_actions).float().to(device) / 2
+            )
+            self.max_actions = max_actions
+            self.min_actions = min_actions
+
+        self.continuous_actions_head = None
+        if continuous_action_dim is not None and continuous_action_dim > 0:
+            self.continuous_actions_head = nn.Linear(
+                hidden_dims[-1], continuous_action_dim
+            )
+            if orthogonal_init:
+                _orthogonal_init(self.continuous_actions_head)
+
+        self.discrete_action_heads = nn.ModuleList()
+        if discrete_action_dims is not None and len(discrete_action_dims) > 0:
+            for dim in discrete_action_dims:
+                self.discrete_action_heads.append(nn.Linear(hidden_dims[-1], dim))
+                if orthogonal_init:
+                    _orthogonal_init(self.discrete_action_heads[-1])
+        self.to(device)
+
+    def forward(self, x, action_mask=None, gumbel=False, debug=False):
+        ogx = x
+        if debug:
+            print(f"MixedActor: x {x}, action_mask {action_mask}, gumbel {gumbel}")
+        if self.encoder is not None:
+            x = self.encoder(x=x, debug=debug)
+        else:
+            x = T(a=x, device=self.device, debug=debug)
+
+        continuous_actions = None
+        discrete_actions = None
+        if self.continuous_actions_head is not None:
+            continuous_actions = (
+                F.tanh(self.continuous_actions_head(x)) * self.action_scales
+                + self.action_biases
+            )
+            # If continuous action contains nan, print x and the continuous actions
+            if torch.isnan(continuous_actions).any():
+                print(f"Continuous actions: {continuous_actions}")
+                print(f"X: {x}, ogx: {ogx}")
+                # raise ValueError("Continuous actions contain nan")
+
+        # TODO: Put this into it's own function and implement the ppo way of sampling
+        if self.discrete_action_heads is not None:
+            discrete_actions = []
+            for i, head in enumerate(self.discrete_action_heads):
+                logits = head(x)
+
+                if gumbel:
+                    if action_mask is not None:
+                        logits[action_mask == 0] = -1e8
+                    probs = F.gumbel_softmax(
+                        logits, dim=-1, tau=self.tau, hard=self.hard
+                    )
+                    # activations = activations / activations.sum(dim=-1, keepdim=True)
+                    discrete_actions.append(probs)
+                else:
+                    if action_mask is not None:
+                        logits[action_mask == 0] = -1e8
+                    discrete_actions.append(F.softmax(logits, dim=-1))
+
+        return continuous_actions, discrete_actions
+
+
 class ValueSA(nn.Module):
     def __init__(
         self, obs_dim, action_dim, hidden_dim=256, device="cpu", activation="relu"
