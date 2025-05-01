@@ -133,6 +133,51 @@ def dqn_agents(obs_dim, continuous_action_dim, discrete_action_dims):
     return agents, agent_parameters
 
 
+def pg_agents(obs_dim, continuous_action_dim, discrete_action_dims):
+    agents = []
+    agent_parameters = []
+
+    for dis in [None, discrete_action_dims]:
+        for cdim in [0, continuous_action_dim]:
+            for ent in [0.0, 0.1]:
+                for ppc in [0.0, 0.2]:
+                    for vclip in [0.0, 0.5]:
+                        for advt in ["gae", "gv", "a2c"]:
+                            for cg in [True, False]:
+                                agent_parameters.append(
+                                    {
+                                        "discrete_action_dims": dis,
+                                        "continuous_action_dim": continuous_action_dim,
+                                        "entropy_regularization": ent,
+                                        "ppo_clip": ppc,
+                                        "value_clip": vclip,
+                                        "advantage_type": advt,
+                                        "clip_grad": cg,
+                                    }
+                                )
+                                agent = PG(
+                                    obs_dim=obs_dim,
+                                    continuous_action_dim=cdim,
+                                    discrete_action_dims=dis,
+                                    max_actions=np.array([1, 2]),
+                                    min_actions=np.array([0, 0]),
+                                    lr=0.001,
+                                    gamma=0.99,
+                                    n_epochs=4,
+                                    device="cuda:0",
+                                    entropy_loss=ent,
+                                    ppo_clip=ppc,
+                                    value_clip=vclip,
+                                    advantage_type=advt,
+                                    mini_batch_size=4,
+                                    clip_grad=cg,
+                                )
+                                agents.append(agent)
+
+    print(f"Total PG agents created: {len(agents)}")
+    return agents, agent_parameters
+
+
 if __name__ == "__main__":
     # Deciding the dimensions to be used for the test
     obs_dim = 3
@@ -142,7 +187,7 @@ if __name__ == "__main__":
     termination[4] = 1.0  # Setting terminations for deterministic testing
     termination[10] = 1.0
 
-    testable_model_functions = {"DQN": dqn_agents}
+    testable_model_functions = {"DQN": dqn_agents, "PG": pg_agents}
     algorithm = input(
         f"Which model should be tested?: {testable_model_functions.keys()} \n"
     ).upper()
