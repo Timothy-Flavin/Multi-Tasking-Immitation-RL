@@ -356,6 +356,7 @@ class StochasticActor(nn.Module):
         self, continuous_means, continuous_log_std_logits, discrete_logits
     ):
         """
+        Produces actions from logits with gradient maintained always for continuous and if gumbel is True for discrete
         Args:
             continuous_means: (batch_size, continuous_action_dim)
             continuous_log_std_logits: (batch_size, continuous_action_dim)

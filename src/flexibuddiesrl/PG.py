@@ -192,7 +192,7 @@ class PG(nn.Module, Agent):
         if step:
             self.steps += 1
         if self.anneal_lr > 0:
-            frac = max(1.0 - (self.steps - 1.0) / self.anneal_lr, 0.001)
+            frac = max(1.0 - (self.steps - 1.0) / self.anneal_lr, 0.0001)
             lrnow = frac * self.lr
             self.optimizer.param_groups[0]["lr"] = lrnow
 
@@ -277,7 +277,8 @@ class PG(nn.Module, Agent):
         discrete_actions=None,
         action_mask=None,
     ):
-
+        print("not implemented yet")
+        return 0, 0
         dact, cact = self.actor(
             observations, action_mask=action_mask, gumbel=False, debug=False
         )
