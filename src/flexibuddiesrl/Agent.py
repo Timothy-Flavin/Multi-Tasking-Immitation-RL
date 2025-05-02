@@ -229,28 +229,43 @@ class StochasticActor(nn.Module):
         ) = None,  # list of discrete action dimensions =[2, 3, 4]
         max_actions: np.array = np.array([1.0], dtype=np.float32),
         min_actions: np.array = np.array([-1.0], dtype=np.float32),
-        hidden_dims: np.array = np.array([256, 256], dtype=np.int32),
+        hidden_dims: np.array = np.array(
+            [64, 64], dtype=np.int32
+        ),  # Last dim will be used to specify encoder output dim if one is supplied
         encoder=None,  # ffEncoder if hidden dims are provided and encoder is not provided
         device="cpu",
-        tau=1.0,  # for gumbel soft
+        gumbel_tau=1.0,  # for gumbel soft
+        gumbel_tau_decay=0.9999,
+        gumbel_tau_min=0.1,
         hard=False,
         orthogonal_init=False,
-        activation="relu",
+        activation="relu",  # activation function for the encoder
+        action_head_hidden_dims=[32],  # iterable of hidden dims for action heads
+        log_std_clamp_range=(-10, 2),
     ):
         super(MixedActor, self).__init__()
         self.device = device
-        self.tau = tau
+        self.gumbel_tau = gumbel_tau
+        self.gumbel_tau_decay = gumbel_tau_decay
+        self.gumbel_tau_min = gumbel_tau_min
         self.hard = hard
-        print(hidden_dims)
+        self.continuous_action_dim = continuous_action_dim
+        self.discrete_action_dims = discrete_action_dims
+        self.log_std_clamp_range = log_std_clamp_range
+        acts = {"relu": F.relu, "tanh": torch.tanh, "sigmoid": torch.sigmoid}
+        if activation in acts:
+            self.activation = acts[activation]
+        else:
+            self.activation = activation
         if encoder is None and len(hidden_dims) > 0:
             self.encoder = ffEncoder(
                 obs_dim, hidden_dims, device=device, activation=activation, dropout=0
             )
 
         assert not (
-            continuous_action_dim is None and discrete_action_dims is None
+            continuous_action_dim == 0 and discrete_action_dims is None
         ), "At least one action dim should be provided"
-        if continuous_action_dim is not None and continuous_action_dim > 0:
+        if continuous_action_dim > 0:
             assert (
                 len(max_actions) == continuous_action_dim
                 and len(min_actions) == continuous_action_dim
@@ -270,62 +285,127 @@ class StochasticActor(nn.Module):
             self.max_actions = max_actions
             self.min_actions = min_actions
 
-        self.continuous_actions_head = None
-        if continuous_action_dim is not None and continuous_action_dim > 0:
-            self.continuous_actions_head = nn.Linear(
-                hidden_dims[-1], continuous_action_dim
-            )
-            if orthogonal_init:
-                _orthogonal_init(self.continuous_actions_head)
-
-        self.discrete_action_heads = nn.ModuleList()
-        if discrete_action_dims is not None and len(discrete_action_dims) > 0:
-            for dim in discrete_action_dims:
-                self.discrete_action_heads.append(nn.Linear(hidden_dims[-1], dim))
-                if orthogonal_init:
-                    _orthogonal_init(self.discrete_action_heads[-1])
+        # Initialize the action head which outputs shape (continuous_action_dim * 2 + sum(discrete_action_dims))
+        self._init_action_heads(
+            hidden_dims,
+            orthogonal_init,
+            action_head_hidden_dims,
+        )
         self.to(device)
 
-    def forward(self, x, action_mask=None, gumbel=False, debug=False):
-        ogx = x
-        if debug:
-            print(f"MixedActor: x {x}, action_mask {action_mask}, gumbel {gumbel}")
-        if self.encoder is not None:
-            x = self.encoder(x=x, debug=debug)
-        else:
-            x = T(a=x, device=self.device, debug=debug)
+    def _init_action_heads(
+        self,
+        hidden_dims,
+        orthogonal_init,
+        action_head_hidden_dims,
+    ):
+        self.action_layers = nn.ModuleList()
+        last_hidden_dim = hidden_dims[-1]
+        output_dim = self.continuous_action_dim * 2
+        if self.discrete_action_dims is not None and len(self.discrete_action_dims) > 0:
+            output_dim += sum(self.discrete_action_dims)
 
-        continuous_actions = None
-        discrete_actions = None
-        if self.continuous_actions_head is not None:
-            continuous_actions = (
-                F.tanh(self.continuous_actions_head(x)) * self.action_scales
-                + self.action_biases
-            )
-            # If continuous action contains nan, print x and the continuous actions
-            if torch.isnan(continuous_actions).any():
-                print(f"Continuous actions: {continuous_actions}")
-                print(f"X: {x}, ogx: {ogx}")
-                # raise ValueError("Continuous actions contain nan")
-
-        # TODO: Put this into it's own function and implement the ppo way of sampling
-        if self.discrete_action_heads is not None:
-            discrete_actions = []
-            for i, head in enumerate(self.discrete_action_heads):
-                logits = head(x)
-
-                if gumbel:
-                    if action_mask is not None:
-                        logits[action_mask == 0] = -1e8
-                    probs = F.gumbel_softmax(
-                        logits, dim=-1, tau=self.tau, hard=self.hard
-                    )
-                    # activations = activations / activations.sum(dim=-1, keepdim=True)
-                    discrete_actions.append(probs)
+        if action_head_hidden_dims is not None and len(action_head_hidden_dims) > 0:
+            last_hidden_dim = action_head_hidden_dims[-1]
+            for i, dim in enumerate(action_head_hidden_dims):
+                if i == 0:
+                    self.action_layers.append(nn.Linear(hidden_dims[-1], dim))
                 else:
-                    if action_mask is not None:
-                        logits[action_mask == 0] = -1e8
-                    discrete_actions.append(F.softmax(logits, dim=-1))
+                    self.action_layers.append(
+                        nn.Linear(action_head_hidden_dims[i - 1], dim)
+                    )
+
+                if orthogonal_init:
+                    _orthogonal_init(self.action_layers[-1])
+            self.action_layers.append(nn.Linear(last_hidden_dim, output_dim))
+            if orthogonal_init:
+                _orthogonal_init(self.action_layers[-1])
+
+    def forward(self, x, action_mask=None, gumbel=False, debug=False):
+        embedding = self.encoder(x=x, debug=debug) if self.encoder is not None else x
+        if debug:
+            print(
+                f"  MixedActor: x shape {x.shape}, action_mask {action_mask}, gumbel {gumbel}"
+            )
+        for i, layer in self.action_layers:
+            if i != len(self.action_layers) - 1:
+                embedding = F.relu(layer(embedding))
+            else:
+                embedding = layer(embedding)
+            if debug:
+                print(f"  MixedActor: embedding shape {embedding.shape}")
+        continuous_means = None
+        continuous_log_std_logits = None
+        discrete_logits = None
+        if self.continuous_action_dim > 0:
+            continuous_means = embedding[:, : self.continuous_action_dim]
+            continuous_log_std_logits = embedding[
+                :, self.continuous_action_dim : 2 * self.continuous_action_dim
+            ]
+        if self.discrete_action_dims is not None and len(self.discrete_action_dims) > 0:
+            discrete_logits = []
+            start = 2 * self.continuous_action_dim
+            for i, dim in enumerate(self.discrete_action_dims):
+                end = start + dim
+                logits = embedding[:, start:end]
+                discrete_logits.append(logits)
+
+        return continuous_means, continuous_log_std_logits, discrete_logits
+
+    def action_from_logits(
+        self, continuous_means, continuous_log_std_logits, discrete_logits
+    ):
+        """
+        Args:
+            continuous_means: (batch_size, continuous_action_dim)
+            continuous_log_std_logits: (batch_size, continuous_action_dim)
+            discrete_logits: list of (batch_size, discrete_action_dim[i]) for each discrete action dim
+        Returns:
+            continuous_actions: (batch_size, continuous_action_dim)
+                Continuous actions are sampled from a normal distribution with means and std parameterized before
+                passing through tanh and scaled to the action space
+            discrete_actions:
+                If Gumbel: list of len n [(batch_size, discrete_action_dim[i])] for each discrete action dim 'i' in 'n'
+                Else: torch.Long shape = (batch_size, len(discrete_action_dims))
+
+                Gumbel softmax is to retain the gradient through reparameterization trick so it is like returning
+                a soft one-hot coding with a tensor for each discrete action dim
+                If not gumbel, then it is a long tensor of the sampled actions where each action is sampled from
+                the categorical distribution
+        """
+        if self.continuous_action_dim > 0:
+            if self.log_std_clamp_range is not None:
+                continuous_log_std_logits = torch.clamp(
+                    continuous_log_std_logits,
+                    min=self.log_std_clamp_range[0],
+                    max=self.log_std_clamp_range[1],
+                )
+            continuous_actions = continuous_means + torch.exp(
+                continuous_log_std_logits
+            ) * torch.randn(continuous_means.shape)
+            continuous_actions = (
+                torch.tanh(continuous_actions) * self.action_scales + self.action_biases
+            )
+        else:
+            continuous_actions = None
+
+        if self.discrete_action_dims is not None and len(self.discrete_action_dims) > 0:
+
+            if self.gumbel_tau > self.gumbel_tau_min:
+                discrete_actions = []
+                for i, logits in enumerate(discrete_logits):
+                    probs = F.gumbel_softmax(
+                        logits, dim=-1, tau=self.gumbel_tau, hard=self.hard
+                    )
+                    discrete_actions.append(probs)
+            else:
+                discrete_actions = torch.zeros(
+                    discrete_logits[0].shape[0], len(self.discrete_action_dims)
+                )
+                for i, logits in enumerate(discrete_logits):
+                    discrete_actions[:, i] = torch.distributions.Categorical(
+                        logits=logits
+                    ).sample()
 
         return continuous_actions, discrete_actions
 

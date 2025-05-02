@@ -270,21 +270,25 @@ class PG(nn.Module, Agent):
                 discrete_actions[:, i] = torch.argmax(activation, dim=1)
             return discrete_actions, continuous_actions
 
-    def imitation_learn(self, observations, actions, action_mask=None):
-        if not torch.is_tensor(actions):
-            actions = torch.tensor(actions, dtype=torch.int).to(self.device)
-        if not torch.is_tensor(observations):
-            observations = torch.tensor(observations, dtype=torch.float).to(self.device)
+    def imitation_learn(
+        self,
+        observations,
+        continuous_actions=None,
+        discrete_actions=None,
+        action_mask=None,
+    ):
 
-        act, probs, log_probs = self.actor.evaluate(
-            observations, action_mask=action_mask
+        dact, cact = self.actor(
+            observations, action_mask=action_mask, gumbel=False, debug=False
         )
-        # max_actions = act.argmax(dim=-1, keepdim=True)
-        # loss is MSE loss beteen the actions and the predicted actions
-        oh_actions = torch.nn.functional.one_hot(
-            actions.squeeze(-1), self.actor_size
-        ).float()
-        # print(oh_actions.shape, probs.shape)
+        loss = 0
+        if self.continuous_action_dim > 0:
+            loss += ((cact - continuous_actions) ** 2).mean()
+        if self.discrete_action_dims is not None:
+            for head in range(len(self.discrete_action_dims)):
+                loss += nn.CrossEntropyLoss()(
+                    dact[head], discrete_actions[:, head].long()
+                )
         loss = torch.nn.functional.cross_entropy(probs, oh_actions, reduction="mean")
         self.actor_optimizer.zero_grad()
         loss.backward()

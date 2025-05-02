@@ -144,6 +144,11 @@ def pg_agents(obs_dim, continuous_action_dim, discrete_action_dims):
                     for vclip in [0.0, 0.5]:
                         for advt in ["gae", "gv", "a2c"]:
                             for cg in [True, False]:
+                                if dis is None and cdim == 0:
+                                    print(
+                                        "Skipping agent with no discrete or continuous actions"
+                                    )
+                                    continue
                                 agent_parameters.append(
                                     {
                                         "discrete_action_dims": dis,
