@@ -22,7 +22,7 @@ def test_imitation_learn(agent: Agent, batch: FlexiBatch):
 
 
 def set_up_memory_buffer(
-    obs_dim, continuous_action_dims, discrete_action_dims, termination
+    obs_dim, continuous_action_dim, discrete_action_dims, termination
 ):
     obs_batch = np.random.rand(14, obs_dim).astype(np.float32)
     obs_batch_ = obs_batch + 0.1
@@ -178,7 +178,7 @@ def pg_agents(obs_dim, continuous_action_dim, discrete_action_dims):
     return agents, agent_parameters
 
 
-if __name__ == "__main__":
+def test_hyperparams(args, verbose=False):
     # Deciding the dimensions to be used for the test
     obs_dim = 3
     continuous_action_dim = 2
@@ -187,14 +187,7 @@ if __name__ == "__main__":
     termination[4] = 1.0  # Setting terminations for deterministic testing
     termination[10] = 1.0
 
-    testable_model_functions = {"DQN": dqn_agents, "PG": pg_agents}
-    algorithm = input(
-        f"Which model should be tested?: {testable_model_functions.keys()} \n"
-    ).upper()
-    while algorithm not in testable_model_functions:
-        algorithm = input(
-            f"Please enter a valid model name ({testable_model_functions.keys()}): "
-        )
+    algorithm = args.model
 
     mem = set_up_memory_buffer(
         obs_dim, continuous_action_dim, discrete_action_dims, termination
@@ -206,32 +199,132 @@ if __name__ == "__main__":
     obs = np.random.rand(obs_dim).astype(np.float32)
     obs_ = np.random.rand(obs_dim).astype(np.float32)
 
+    testable_model_functions = {
+        "DQN": dqn_agents,
+        "PG": pg_agents,
+        # "DDPG": DDPG.agents,
+        # "TD3": TD3.agents,
+    }
     agents, agent_params = testable_model_functions[algorithm](
         obs_dim, continuous_action_dim, discrete_action_dims
     )
     x = ""
-    for i in range(len(agents)):
-        print(f"Agent {i}: {agent_params[i]}")
-        d_acts, c_acts, d_log, c_log, _ = agents[i].train_actions(
-            obs, step=True, debug=True
-        )
-        print(
-            f"Training actions: c: {c_acts}, d: {d_acts}, d_log: {d_log}, c_log: {c_log}"
-        )
-        aloss, closs = agents[i].reinforcement_learn(
-            mem.sample_transitions(12, as_torch=True), 0, critic_only=False, debug=False
-        )
-        print(f"Reinforcement learn losses: aloss: {aloss}, closs: {closs}")
+    train_action_passes = 0
+    immitation_learn_passes = 0
+    reinforcement_learn_passes = 0
 
-        aloss, closs = test_imitation_learn(
-            agents[i],
-            mem.sample_transitions(14, as_torch=True, device="cuda:0"),
-        )
-        print(f"Imitation learn losses: aloss: {aloss}, closs: {closs}")
-        if x.lower() == "auto":
-            continue
-        x = input(
-            f"Press enter to continue to the next agent, or type 'exit' to quit, or 'auto' to skip inputs: "
-        )
-        if x.lower() == "exit":
-            break
+    failed_agents = []
+    for i in range(len(agents)):
+        if verbose:
+            print(f"Testing agent {i} with parameters: {agent_params[i]}")
+
+        try:
+            d_acts, c_acts, d_log, c_log, _ = agents[i].train_actions(
+                obs, step=True, debug=True
+            )
+            if verbose:
+                print(
+                    f"Training actions: c: {c_acts}, d: {d_acts}, d_log: {d_log}, c_log: {c_log}"
+                )
+            train_action_passes += 1
+
+        except Exception as e:
+            print(f"Agent {i} failed during train_actions: {e}")
+            failed_agents.append({str(i) + "train_actions": agent_params[i]})
+
+        try:
+            aloss, closs = agents[i].reinforcement_learn(
+                mem.sample_transitions(12, as_torch=True),
+                0,
+                critic_only=False,
+                debug=False,
+            )
+            if verbose:
+                print(f"Reinforcement learn losses: aloss: {aloss}, closs: {closs}")
+            reinforcement_learn_passes += 1
+
+        except Exception as e:
+            print(f"Agent {i} failed during reinforcement_learn: {e}")
+            failed_agents.append({str(i) + "reinforcement_learn": agent_params[i]})
+
+        try:
+            aloss, closs = test_imitation_learn(
+                agents[i],
+                mem.sample_transitions(14, as_torch=True, device="cuda:0"),
+            )
+            if verbose:
+                print(f"Imitation learn losses: aloss: {aloss}, closs: {closs}")
+            immitation_learn_passes += 1
+
+        except Exception as e:
+            print(f"Agent {i} failed during imitation_learn: {e}")
+            failed_agents.append({str(i) + "imitation_learn": agent_params[i]})
+
+        if verbose:
+            if x.lower() == "auto":
+                continue
+            x = input(
+                f"Press enter to continue to the next agent, or type 'exit' to quit, or 'auto' to skip inputs: "
+            )
+            if x.lower() == "exit":
+                break
+
+    print(f"Algorithm {algorithm} test completed.")
+    print(f"Total agent configurations tested: {len(agents)}")
+    print(
+        f"Train actions passed: {train_action_passes}, coverage: {train_action_passes / len(agents) * 100:.2f}%"
+    )
+    print(
+        f"Imitation learn passed: {immitation_learn_passes}, coverage: {immitation_learn_passes / len(agents) * 100:.2f}%"
+    )
+    print(
+        f"Reinforcement learn passed: {reinforcement_learn_passes}, coverage: {reinforcement_learn_passes / len(agents) * 100:.2f}%"
+    )
+
+    if failed_agents:
+        print("Failed agents:")
+        for failure in failed_agents:
+            print(failure)
+    print("Test completed successfully.")
+
+
+if __name__ == "__main__":
+    import time
+    import argparse
+    import os
+
+    parser = argparse.ArgumentParser(
+        description="Test the FlexiBuddyRL models with various configurations."
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug mode for detailed output.",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        choices=["DQN", "PG"],
+        default="DQN",
+        help="Specify the model to test (DQN or PG).",
+    )
+    parser.add_argument(
+        "--hyperparams",
+        action="store_true",
+        help="Run tests with hyperparameter variations to test stability of all configurations.",
+    )
+    parser.add_argument(
+        "--performance",
+        action="store_true",
+        help="Run performance tests for the specified model.",
+    )
+    args = parser.parse_args()
+
+    if args.hyperparams:
+        print("Running hyperparameter tests...")
+        test_hyperparams(args, verbose=args.debug)
+    if args.performance:
+        print("Running performance tests...")
+        # Placeholder for performance tests
+        # You can implement specific performance tests here
+        pass
