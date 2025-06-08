@@ -1,4 +1,4 @@
-from .Agent import ValueS, MixedActor, Agent
+from .Agent import ValueS, StochasticActor, Agent
 from .Util import T
 import torch
 from flexibuff import FlexiBatch
@@ -38,6 +38,8 @@ class PG(nn.Module, Agent):
         load_from_checkpoint=None,
         name="PPO",
         eval_mode=False,
+        encoder=None,
+        action_head_hidden_dims=None,
     ):
         super(PG, self).__init__()
         self.eval_mode = eval_mode
@@ -68,11 +70,13 @@ class PG(nn.Module, Agent):
             "g_mean",
             "steps",
             "eval_mode",
+            "action_head_hidden_dims",
         ]
         assert (
             continuous_action_dim > 0 or discrete_action_dims is not None
         ), "At least one action dim should be provided"
         self.name = name
+        self.encoder = encoder
         if load_from_checkpoint is not None:
             self.load(load_from_checkpoint)
             return
@@ -114,14 +118,21 @@ class PG(nn.Module, Agent):
         self.anneal_lr = anneal_lr
         self.lr = lr
 
-        self._get_torch_params(starting_actorlogstd)
+        self._get_torch_params(encoder, action_head_hidden_dims)
 
         if self.continuous_action_dim is not None and self.continuous_action_dim > 0:
-            self.min_actions = torch.from_numpy(min_actions).to(self.device)
-            self.max_actions = torch.from_numpy(max_actions).to(self.device)
+            if isinstance(self.max_actions, list):
+                self.max_actions = np.array(self.max_actions)
+            if isinstance(self.min_actions, list):
+                self.min_actions = np.array(self.min_actions)
 
-    def _get_torch_params(self, starting_actorlogstd):
-        self.actor = MixedActor(
+            if isinstance(self.min_actions, np.ndarray):
+                self.min_actions = torch.from_numpy(min_actions).to(self.device)
+            if isinstance(self.max_actions, np.ndarray):
+                self.max_actions = torch.from_numpy(max_actions).to(self.device)
+
+    def _get_torch_params(self, encoder, action_head_hidden_dims=None):
+        self.actor = StochasticActor(
             obs_dim=self.obs_dim,
             continuous_action_dim=self.continuous_action_dim,
             discrete_action_dims=self.discrete_action_dims,
@@ -131,6 +142,9 @@ class PG(nn.Module, Agent):
             device=self.device,
             orthogonal_init=self.orthogonal,
             activation=self.activation,
+            encoder=encoder,
+            gumbel_tau=0,
+            action_head_hidden_dims=action_head_hidden_dims,
         )
 
         self.critic = ValueS(
