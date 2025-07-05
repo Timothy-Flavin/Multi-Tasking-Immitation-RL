@@ -1,5 +1,5 @@
 from flexibuddiesrl.DQN import DQN
-from flexibuddiesrl.PG import PG
+from flexibuddiesrl.PG_stabalized import PG
 from flexibuddiesrl.DDPG import DDPG
 from flexibuddiesrl.TD3 import TD3
 from flexibuddiesrl.Agent import QS
@@ -8,13 +8,18 @@ from flexibuddiesrl.Agent import Agent
 from flexibuff import FlexibleBuffer, FlexiBatch
 import matplotlib.pyplot as plt
 import numpy as np
+import traceback
 
 
-def test_imitation_learn(agent: Agent, batch: FlexiBatch):
+def test_imitation_learn(agent: Agent, batch: FlexiBatch, verbose=False):
     dlosses, alosses = [], []
     for i in range(10):
         dloss, closs = agent.imitation_learn(
-            batch.obs[0], batch.continuous_actions[0], batch.discrete_actions[0]
+            batch.obs[0],  # type: ignore
+            batch.continuous_actions[0],  # type: ignore
+            batch.discrete_actions[0],  # type: ignore
+            action_mask=None,
+            debug=verbose,
         )
         dlosses.append(dloss)
         alosses.append(closs)
@@ -145,9 +150,9 @@ def pg_agents(obs_dim, continuous_action_dim, discrete_action_dims):
                         for advt in ["gae", "gv", "a2c"]:
                             for cg in [True, False]:
                                 if dis is None and cdim == 0:
-                                    print(
-                                        "Skipping agent with no discrete or continuous actions"
-                                    )
+                                    # print(
+                                    #     "Skipping agent with no discrete or continuous actions"
+                                    # )
                                     continue
                                 agent_parameters.append(
                                     {
@@ -184,6 +189,8 @@ def pg_agents(obs_dim, continuous_action_dim, discrete_action_dims):
 
 
 def test_hyperparams(args, verbose=False):
+    start_test = time.time()
+    elapsed_time = 0
     # Deciding the dimensions to be used for the test
     obs_dim = 3
     continuous_action_dim = 2
@@ -210,6 +217,7 @@ def test_hyperparams(args, verbose=False):
         # "DDPG": DDPG.agents,
         # "TD3": TD3.agents,
     }
+    agents: list[Agent]
     agents, agent_params = testable_model_functions[algorithm](
         obs_dim, continuous_action_dim, discrete_action_dims
     )
@@ -220,12 +228,19 @@ def test_hyperparams(args, verbose=False):
 
     failed_agents = []
     for i in range(len(agents)):
+        elapsed_time = time.time() - start_test
+        if elapsed_time > 2:
+            print(
+                f"{i}/{len(agents)} agents tested, {i/len(agents) * 100:.2f}% complete"
+            )
+            start_test = time.time()
+
         if verbose:
             print(f"Testing agent {i} with parameters: {agent_params[i]}")
 
         try:
             d_acts, c_acts, d_log, c_log, _ = agents[i].train_actions(
-                obs, step=True, debug=True
+                obs, step=True, debug=verbose
             )
             if verbose:
                 print(
@@ -234,7 +249,9 @@ def test_hyperparams(args, verbose=False):
             train_action_passes += 1
 
         except Exception as e:
-            print(f"Agent {i} failed during train_actions: {e}")
+            print(
+                f"Agent {i} failed during train_actions: {e} + {traceback.format_exc()}"
+            )
             failed_agents.append({str(i) + "train_actions": agent_params[i]})
 
         try:
@@ -242,20 +259,25 @@ def test_hyperparams(args, verbose=False):
                 mem.sample_transitions(12, as_torch=True),
                 0,
                 critic_only=False,
-                debug=False,
+                debug=verbose,
             )
             if verbose:
-                print(f"Reinforcement learn losses: aloss: {aloss}, closs: {closs}")
+                print(
+                    f"Reinforcement learn losses: aloss: {aloss}, closs: {closs} + {traceback.format_exc()}"
+                )
             reinforcement_learn_passes += 1
 
         except Exception as e:
-            print(f"Agent {i} failed during reinforcement_learn: {e}")
+            print(
+                f"Agent {i} failed during reinforcement_learn: {e} + {traceback.format_exc()}"
+            )
             failed_agents.append({str(i) + "reinforcement_learn": agent_params[i]})
 
         try:
             aloss, closs = test_imitation_learn(
                 agents[i],
                 mem.sample_transitions(14, as_torch=True, device="cuda:0"),
+                verbose=verbose,
             )
             if verbose:
                 print(f"Imitation learn losses: aloss: {aloss}, closs: {closs}")

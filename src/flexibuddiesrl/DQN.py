@@ -99,6 +99,7 @@ class DQN(nn.Module, Agent):
         self.hidden_dims = hidden_dims
         self.activation = activation
         self.orthogonal = orthogonal
+        # print("before qs")
         self.Q1 = QS(
             obs_dim=obs_dim,
             continuous_action_dim=continuous_action_dims,
@@ -243,7 +244,7 @@ class DQN(nn.Module, Agent):
             observations, action_mask, step, debug
         )
         self.step += int(step)
-        return disc_act, cont_act, 0, 0, 0
+        return disc_act, cont_act, 0.0, 0.0, 0.0
 
     def ego_actions(self, observations, action_mask=None):
         return 0
@@ -289,7 +290,14 @@ class DQN(nn.Module, Agent):
                 ).mean()
         return discrete_loss, continuous_loss
 
-    def imitation_learn(self, observations, continuous_actions, discrete_actions):
+    def imitation_learn(
+        self,
+        observations,
+        continuous_actions,
+        discrete_actions,
+        action_mask=None,
+        debug=False,
+    ):
         values, disc_adv, cont_adv = self.Q1(observations)
         if self.eval_mode:
             return 0, 0
@@ -744,12 +752,12 @@ class DQN(nn.Module, Agent):
         self, batch: FlexiBatch, agent_num=0, critic_only=False, debug=False
     ):
         if self.eval_mode:
-            return 0, 0
+            return float(0.0), float(0.0)
 
         dqloss, cqloss = 0, 0
-        discrete_actions = batch.discrete_actions[agent_num]
+        discrete_actions = batch.discrete_actions[agent_num]  # type: ignore
         continuous_actions = self._discretize_actions(
-            batch.continuous_actions[agent_num]
+            batch.continuous_actions[agent_num]  # type: ignore
         )
         if debug:
             print(
@@ -778,6 +786,7 @@ class DQN(nn.Module, Agent):
                     terminated=batch.terminated,
                     action_dim=self.discrete_action_dims,
                     jagged=True,
+                    debug=debug,
                 )
                 if self.dqn_type == dqntype.Munchausen:
                     for i in range(len(self.discrete_action_dims)):
@@ -802,6 +811,7 @@ class DQN(nn.Module, Agent):
                     rewards=batch.global_rewards,
                     terminated=batch.terminated,
                     jagged=False,
+                    debug=debug,
                 )
                 if self.dqn_type == dqntype.Munchausen:
                     temp_cont_adv = cont_adv.detach()
@@ -883,7 +893,7 @@ class DQN(nn.Module, Agent):
             dqloss = dqloss.item()
         if cqloss != 0:
             cqloss = cqloss.item()
-        return dqloss, cqloss  # actor loss, critic loss
+        return float(dqloss), float(cqloss)  # actor loss, critic loss
 
     def _dump_attr(self, attr, path):
         f = open(path, "wb")

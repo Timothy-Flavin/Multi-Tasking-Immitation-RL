@@ -276,8 +276,9 @@ class PG(nn.Module, Agent):
         continuous_actions=None,
         discrete_actions=None,
         action_mask=None,
+        debug=False,
     ):
-        print("not implemented yet")
+        # print("not implemented yet")
         return 0, 0
         dact, cact = self.actor(
             observations, action_mask=action_mask, gumbel=False, debug=False

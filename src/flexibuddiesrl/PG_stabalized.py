@@ -154,18 +154,18 @@ class PG(nn.Module, Agent):
             orthogonal_init=self.orthogonal,
             activation=self.activation,
         )
-        self.actor_logstd = (
-            nn.Parameter(
-                torch.zeros(1, self.continuous_action_dim), requires_grad=True
-            ).to(self.device)
-            + starting_actorlogstd
-        )
+        # self.actor_logstd = (
+        #     nn.Parameter(
+        #         torch.zeros(1, self.continuous_action_dim), requires_grad=True
+        #     ).to(self.device)
+        #     + self.starting_actorlogstd
+        # )
         # print(self.actor_logstd)
-        self.actor_logstd.retain_grad()
+        # self.actor_logstd.retain_grad()
 
-        self.optimizer = torch.optim.Adam(
-            list(self.parameters()) + [self.actor_logstd], lr=self.lr
-        )
+        # self.optimizer = torch.optim.Adam(
+        #     list(self.parameters()) + [self.actor_logstd], lr=self.lr
+        # )
 
     def _sample_multi_discrete(
         self, logits, debug=False
@@ -211,8 +211,8 @@ class PG(nn.Module, Agent):
             self.optimizer.param_groups[0]["lr"] = lrnow
 
         with torch.no_grad():
-            continuous_logits, discrete_logits = self.actor(
-                x=observations, action_mask=action_mask, gumbel=False, debug=False
+            continuous_mean_logits, continuous_std_logits, discrete_logits = self.actor(
+                x=observations, action_mask=action_mask, gumbel=False, debug=debug
             )
             if debug:
                 print(f"  After actor: clog {continuous_logits}, dlog{discrete_logits}")
@@ -290,8 +290,9 @@ class PG(nn.Module, Agent):
         continuous_actions=None,
         discrete_actions=None,
         action_mask=None,
+        debug=False,
     ):
-        print("not implemented yet")
+        # print("not implemented yet")
         return 0, 0
         dact, cact = self.actor(
             observations, action_mask=action_mask, gumbel=False, debug=False
@@ -323,8 +324,8 @@ class PG(nn.Module, Agent):
     def expected_V(self, obs, legal_action=None):
         return self.critic(obs)
 
-    def marl_learn(self, batch, agent_num, mixer, critic_only=False, debug=False):
-        return super().marl_learn(batch, agent_num, mixer, critic_only, debug)
+    # def marl_learn(self, batch, agent_num, mixer, critic_only=False, debug=False):
+    #    return super().marl_learn(batch, agent_num, mixer, critic_only, debug)
 
     def zero_grads(self):
         return 0
@@ -465,7 +466,6 @@ class PG(nn.Module, Agent):
         agent_num=0,
         critic_only=False,
         debug=False,
-        conenv=False,
     ):
         if self.eval_mode:
             return 0, 0

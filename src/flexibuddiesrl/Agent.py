@@ -9,16 +9,39 @@ from .Util import T
 class Agent(ABC):
 
     @abstractmethod
-    def train_actions(self, observations, action_mask=None, step=False):
-        return 0, 0, 0  # Action 0, log_prob 0, value
+    def train_actions(
+        self, observations, action_mask=None, step=False, debug=False
+    ) -> tuple[
+        np.ndarray | int | None,
+        np.ndarray | float | None,
+        np.ndarray | float | None,
+        np.ndarray | float | None,
+        np.ndarray | float | None,
+    ]:
+        return (
+            0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+        )  # discrete actions, continuous actions, discrete log probs, continuous log probs, value
 
     @abstractmethod
     def ego_actions(self, observations, action_mask=None):
         return 0
 
     @abstractmethod
-    def imitation_learn(self, observations, actions):
-        return 0  # loss
+    def imitation_learn(
+        self,
+        observations,
+        continuous_actions,
+        discrete_actions,
+        action_mask=None,
+        debug=False,
+    ) -> tuple[float, float]:
+        x: float = 0.0
+        y: float = 0.0
+        return float(x), float(y)  # loss
 
     @abstractmethod
     def utility_function(self, observations, actions=None):
@@ -31,8 +54,10 @@ class Agent(ABC):
         return 0
 
     @abstractmethod
-    def reinforcement_learn(self, batch, agent_num=0, critic_only=False, debug=False):
-        return 0, 0  # actor loss, critic loss
+    def reinforcement_learn(
+        self, batch, agent_num=0, critic_only=False, debug=False
+    ) -> tuple[float, float]:
+        return 0.0, 0.0  # actor loss, critic loss
 
     @abstractmethod
     def save(self, checkpoint_path):
@@ -71,7 +96,7 @@ class ffEncoder(nn.Module):
         self.drop = dropout
         self.dropout = nn.Dropout(p=dropout)
         self.encoder = nn.ModuleList()
-        print(obs_dim, hidden_dims)
+        # print(obs_dim, hidden_dims)
         for i in range(len(hidden_dims)):
             if i == 0:
                 self.encoder.append(nn.Linear(obs_dim, hidden_dims[i]))
@@ -90,7 +115,6 @@ class ffEncoder(nn.Module):
         x = T(x, self.device).float()
         if debug:
             print(f"ffEncoder after T: x {x}")
-        if debug:
             interlist = []
             interlist.append(x)
         for layer in self.encoder:
@@ -130,7 +154,7 @@ class MixedActor(nn.Module):
 
         self.tau = tau
         self.hard = hard
-        print(hidden_dims)
+        # print(hidden_dims)
         if encoder is None and len(hidden_dims) > 0:
             self.encoder = ffEncoder(
                 obs_dim, hidden_dims, device=device, activation=activation, dropout=0
@@ -223,13 +247,13 @@ class StochasticActor(nn.Module):
     def __init__(
         self,
         obs_dim,
-        continuous_action_dim: int = 0,  # number of continuouis action dimensions =5
+        continuous_action_dim: int = 0,  # number of continuous action dimensions = 4
         discrete_action_dims: (
             list[int] | None
         ) = None,  # list of discrete action dimensions =[2, 3, 4]
-        max_actions: np.array = np.array([1.0], dtype=np.float32),
-        min_actions: np.array = np.array([-1.0], dtype=np.float32),
-        hidden_dims: np.array = np.array(
+        max_actions: np.ndarray = np.array([1.0], dtype=np.float32),
+        min_actions: np.ndarray = np.array([-1.0], dtype=np.float32),
+        hidden_dims: np.ndarray = np.array(
             [64, 64], dtype=np.int32
         ),  # Last dim will be used to specify encoder output dim if one is supplied
         encoder=None,  # ffEncoder if hidden dims are provided and encoder is not provided
@@ -242,14 +266,26 @@ class StochasticActor(nn.Module):
         activation="relu",  # activation function for the encoder
         action_head_hidden_dims=[32],  # iterable of hidden dims for action heads
         log_std_clamp_range=(-10, 2),
+        std_type: str | None = None,  # full, diagonal, none
+        clamp_type: str = "tanh",  # tanh, clamp, or None
     ):
-        super(MixedActor, self).__init__()
+        super(StochasticActor, self).__init__()
         self.device = device
+        self.std_type = std_type
+        self.obs_dim = obs_dim
+        if self.std_type is not None and self.std_type.lower() == "none":
+            self.std_type = None
+        self.clamp_type = clamp_type
+        if clamp_type not in ["tanh", "clamp", None]:
+            raise ValueError("clamp_type should be one of 'tanh', 'clamp', or None")
+
         self.gumbel_tau = gumbel_tau
         self.gumbel_tau_decay = gumbel_tau_decay
         self.gumbel_tau_min = gumbel_tau_min
         self.hard = hard
         self.continuous_action_dim = continuous_action_dim
+        sizes = {None: 0, "full": continuous_action_dim, "diagonal": 1}
+        self.log_std_dim = sizes[self.std_type]
         self.discrete_action_dims = discrete_action_dims
         self.log_std_clamp_range = log_std_clamp_range
         acts = {"relu": F.relu, "tanh": torch.tanh, "sigmoid": torch.sigmoid}
@@ -257,9 +293,15 @@ class StochasticActor(nn.Module):
             self.activation = acts[activation]
         else:
             self.activation = activation
+
+        self.provided_encoder = encoder is not None
         if encoder is None and len(hidden_dims) > 0:
             self.encoder = ffEncoder(
-                obs_dim, hidden_dims, device=device, activation=activation, dropout=0
+                obs_dim,
+                hidden_dims,
+                device=device,
+                activation=activation,
+                dropout=0,
             )
 
         assert not (
@@ -282,8 +324,8 @@ class StochasticActor(nn.Module):
             self.action_biases = (
                 torch.from_numpy(max_actions + min_actions).float().to(device) / 2
             )
-            self.max_actions = max_actions
-            self.min_actions = min_actions
+            self.max_actions = torch.from_numpy(max_actions).to(device)
+            self.min_actions = torch.from_numpy(min_actions).to(device)
 
         # Initialize the action head which outputs shape (continuous_action_dim * 2 + sum(discrete_action_dims))
         self._init_action_heads(
@@ -300,16 +342,33 @@ class StochasticActor(nn.Module):
         action_head_hidden_dims,
     ):
         self.action_layers = nn.ModuleList()
-        last_hidden_dim = hidden_dims[-1]
-        output_dim = self.continuous_action_dim * 2
-        if self.discrete_action_dims is not None and len(self.discrete_action_dims) > 0:
-            output_dim += sum(self.discrete_action_dims)
 
+        if self.provided_encoder:
+            last_hidden_dim = self.obs_dim
+        else:
+            last_hidden_dim = hidden_dims[-1]
+        assert (
+            self.std_type.lower()
+            if self.std_type is not None
+            else None
+            in [
+                None,
+                "diagonal",
+                "full",
+            ]
+        ), "standard deviation type must be chosen from [None,'none','diagonal','full'] by setting std_type=..."
+
+        # Setting output dimension depending on what kind of continuous value is getting pulled
+        output_dim = 0
+        if self.discrete_action_dims is not None:
+            output_dim = sum(self.discrete_action_dims)
+        output_dim += self.continuous_action_dim + self.log_std_dim
+
+        # setting up layers for action dims. These need to be independend becaue
         if action_head_hidden_dims is not None and len(action_head_hidden_dims) > 0:
-            last_hidden_dim = action_head_hidden_dims[-1]
             for i, dim in enumerate(action_head_hidden_dims):
                 if i == 0:
-                    self.action_layers.append(nn.Linear(hidden_dims[-1], dim))
+                    self.action_layers.append(nn.Linear(last_hidden_dim, dim))
                 else:
                     self.action_layers.append(
                         nn.Linear(action_head_hidden_dims[i - 1], dim)
@@ -317,39 +376,89 @@ class StochasticActor(nn.Module):
 
                 if orthogonal_init:
                     _orthogonal_init(self.action_layers[-1])
-            self.action_layers.append(nn.Linear(last_hidden_dim, output_dim))
-            if orthogonal_init:
-                _orthogonal_init(self.action_layers[-1])
+            last_hidden_dim = action_head_hidden_dims[-1]
+        # This needs to stay outside that if so there is always an action head, just not a multilayer one
+        self.action_layers.append(nn.Linear(last_hidden_dim, output_dim))
+        if orthogonal_init:
+            _orthogonal_init(self.action_layers[-1])
 
     def forward(self, x, action_mask=None, gumbel=False, debug=False):
-        embedding = self.encoder(x=x, debug=debug) if self.encoder is not None else x
         if debug:
             print(
-                f"  MixedActor: x shape {x.shape}, action_mask {action_mask}, gumbel {gumbel}"
+                f"  MixedActor forward: x {x}, action_mask {action_mask}, gumbel {gumbel}"
             )
-        for i, layer in self.action_layers:
+
+        embedding = self.encoder(x=x, debug=debug) if self.encoder is not None else x
+        for i, layer in enumerate(self.action_layers):
             if i != len(self.action_layers) - 1:
                 embedding = F.relu(layer(embedding))
             else:
                 embedding = layer(embedding)
             if debug:
                 print(f"  MixedActor: embedding shape {embedding.shape}")
+
+        # if embedding is a single vector, unsqueeze it to make it a batch of size 1
+        single_vector = False
+        if len(embedding.shape) == 1:
+            single_vector = True
+            embedding = embedding.unsqueeze(0)
+
         continuous_means = None
         continuous_log_std_logits = None
         discrete_logits = None
+
+        # Get the continuous means and log std logits id std_type is not None
         if self.continuous_action_dim > 0:
             continuous_means = embedding[:, : self.continuous_action_dim]
-            continuous_log_std_logits = embedding[
-                :, self.continuous_action_dim : 2 * self.continuous_action_dim
-            ]
+            continuous_log_std_logits = None
+            if self.log_std_dim > 0:
+                continuous_log_std_logits = embedding[
+                    :,
+                    self.continuous_action_dim : self.continuous_action_dim
+                    + self.log_std_dim,
+                ]
+                if self.clamp_type == "tanh":
+                    continuous_log_std_logits = torch.tanh(continuous_log_std_logits)
+                    continuous_log_std_logits = self.log_std_clamp_range[0] + 0.5 * (
+                        self.log_std_clamp_range[1] - self.log_std_clamp_range[0]
+                    ) * (
+                        continuous_log_std_logits + 1
+                    )  # From CleanRL / SpinUp / Denis Yarats
+                elif self.clamp_type == "clamp":
+                    continuous_log_std_logits = torch.clamp(
+                        continuous_log_std_logits,
+                        self.log_std_clamp_range[0],
+                        self.log_std_clamp_range[1],
+                    )
+
+        if debug:
+            print(
+                f"  MixedActor: continuous_means shape {continuous_means.shape if continuous_means is not None else None}, "
+                f"  continuous_log_std_logits shape {continuous_log_std_logits.shape if continuous_log_std_logits is not None else None}"
+            )
         if self.discrete_action_dims is not None and len(self.discrete_action_dims) > 0:
-            discrete_logits = []
-            start = 2 * self.continuous_action_dim
+            discrete_logits: list[torch.Tensor] | None = []
+            start = self.continuous_action_dim + self.log_std_dim
             for i, dim in enumerate(self.discrete_action_dims):
                 end = start + dim
                 logits = embedding[:, start:end]
                 discrete_logits.append(logits)
+                # print(logits)
 
+        if single_vector:
+            continuous_means = (
+                continuous_means.squeeze(0) if continuous_means is not None else None
+            )
+            continuous_log_std_logits = (
+                continuous_log_std_logits.squeeze(0)
+                if continuous_log_std_logits is not None
+                else None
+            )
+            discrete_logits = (
+                [logits.squeeze(0) for logits in discrete_logits]
+                if discrete_logits is not None
+                else None
+            )
         return continuous_means, continuous_log_std_logits, discrete_logits
 
     def action_from_logits(
@@ -375,18 +484,26 @@ class StochasticActor(nn.Module):
                 the categorical distribution
         """
         if self.continuous_action_dim > 0:
-            if self.log_std_clamp_range is not None:
-                continuous_log_std_logits = torch.clamp(
-                    continuous_log_std_logits,
-                    min=self.log_std_clamp_range[0],
-                    max=self.log_std_clamp_range[1],
-                )
-            continuous_actions = continuous_means + torch.exp(
-                continuous_log_std_logits
-            ) * torch.randn(continuous_means.shape)
-            continuous_actions = (
-                torch.tanh(continuous_actions) * self.action_scales + self.action_biases
+            c_dist = torch.distributions.Normal(
+                continuous_means,
+                torch.exp(continuous_log_std_logits),
             )
+            continuous_activations = c_dist.rsample()  # reparameterization trick
+            if self.squash:
+                continuous_actions = (
+                    torch.tanh(continuous_activations) * self.action_scales
+                    + self.action_biases
+                )
+            elif self.clamp_actions:
+                continuous_actions = torch.clamp(
+                    continuous_activations, self.min_actions, self.max_actions
+                )
+            # continuous_actions = continuous_means + torch.exp(
+            #     continuous _log_std_logits
+            # ) * torch.randn(continuous_means.shape)
+            # continuous_actions = (
+            #     torch.tanh(continuous_actions) * self.action_scales + self.action_biases
+            # )
         else:
             continuous_actions = None
 
@@ -550,6 +667,7 @@ class QS(nn.Module):
         device="cpu",
         n_c_action_bins=11,
         head_hidden_dim=64,  # adding a layer size gives hidden layers to heads
+        verbose=False,
     ):
         super(QS, self).__init__()
 
@@ -605,9 +723,10 @@ class QS(nn.Module):
 
         # set up the value head if dueling is True
         self.value_head = nn.Linear(self.last_hidden_dim, 1) if self.dueling else None
-        print(
-            f"initialized QS with: {self.joint_heads_hidden_layer}, {self.value_head}, {self.advantage_heads}\n  d_dim: {discrete_action_dims}, c_dim: {continuous_action_dim}, h_dim: {hidden_dims}, head_hidden_dim: {head_hidden_dim}"
-        )
+        if verbose:
+            print(
+                f"initialized QS with: {self.joint_heads_hidden_layer}, {self.value_head}, {self.advantage_heads}\n  d_dim: {discrete_action_dims}, c_dim: {continuous_action_dim}, h_dim: {hidden_dims}, head_hidden_dim: {head_hidden_dim}"
+            )
         self.to(device)
 
     def forward(self, x, action_mask=None):
