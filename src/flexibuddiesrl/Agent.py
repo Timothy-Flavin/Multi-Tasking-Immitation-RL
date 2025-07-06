@@ -261,7 +261,7 @@ class StochasticActor(nn.Module):
         gumbel_tau=1.0,  # for gumbel soft
         gumbel_tau_decay=0.9999,
         gumbel_tau_min=0.1,
-        hard=False,
+        gumble_hard=False,
         orthogonal_init=False,
         activation="relu",  # activation function for the encoder
         action_head_hidden_dims=[32],  # iterable of hidden dims for action heads
@@ -270,6 +270,7 @@ class StochasticActor(nn.Module):
         clamp_type: str = "tanh",  # tanh, clamp, or None
     ):
         super(StochasticActor, self).__init__()
+        self.encoder = None
         self.device = device
         self.std_type = std_type
         self.obs_dim = obs_dim
@@ -282,7 +283,7 @@ class StochasticActor(nn.Module):
         self.gumbel_tau = gumbel_tau
         self.gumbel_tau_decay = gumbel_tau_decay
         self.gumbel_tau_min = gumbel_tau_min
-        self.hard = hard
+        self.gumble_hard = gumble_hard
         self.continuous_action_dim = continuous_action_dim
         sizes = {None: 0, "full": continuous_action_dim, "diagonal": 1}
         self.log_std_dim = sizes[self.std_type]
@@ -382,11 +383,10 @@ class StochasticActor(nn.Module):
         if orthogonal_init:
             _orthogonal_init(self.action_layers[-1])
 
-    def forward(self, x, action_mask=None, gumbel=False, debug=False):
+    # TODO: action mask implementation
+    def forward(self, x, action_mask=None, debug=False):
         if debug:
-            print(
-                f"  MixedActor forward: x {x}, action_mask {action_mask}, gumbel {gumbel}"
-            )
+            print(f"  MixedActor forward: x {x}, action_mask {action_mask}, ")
 
         embedding = self.encoder(x=x, debug=debug) if self.encoder is not None else x
         for i, layer in enumerate(self.action_layers):
@@ -462,7 +462,7 @@ class StochasticActor(nn.Module):
         return continuous_means, continuous_log_std_logits, discrete_logits
 
     def action_from_logits(
-        self, continuous_means, continuous_log_std_logits, discrete_logits
+        self, continuous_means, continuous_log_std_logits, discrete_logits, gumble=False
     ):
         """
         Produces actions from logits with gradient maintained always for continuous and if gumbel is True for discrete
@@ -483,37 +483,33 @@ class StochasticActor(nn.Module):
                 If not gumbel, then it is a long tensor of the sampled actions where each action is sampled from
                 the categorical distribution
         """
+        continuous_actions = None
+        discrete_actions = None
         if self.continuous_action_dim > 0:
-            c_dist = torch.distributions.Normal(
-                continuous_means,
-                torch.exp(continuous_log_std_logits),
-            )
-            continuous_activations = c_dist.rsample()  # reparameterization trick
-            if self.squash:
+            if continuous_log_std_logits is None:
+                continuous_activations = continuous_means
+            else:
+                c_dist = torch.distributions.Normal(
+                    continuous_means,
+                    torch.exp(continuous_log_std_logits),
+                )
+                continuous_activations = c_dist.rsample()  # reparameterization trick
+            if self.clamp_type == "tanh":
                 continuous_actions = (
                     torch.tanh(continuous_activations) * self.action_scales
                     + self.action_biases
                 )
-            elif self.clamp_actions:
+            elif self.clamp_type == "clamp":
                 continuous_actions = torch.clamp(
                     continuous_activations, self.min_actions, self.max_actions
                 )
-            # continuous_actions = continuous_means + torch.exp(
-            #     continuous _log_std_logits
-            # ) * torch.randn(continuous_means.shape)
-            # continuous_actions = (
-            #     torch.tanh(continuous_actions) * self.action_scales + self.action_biases
-            # )
-        else:
-            continuous_actions = None
 
         if self.discrete_action_dims is not None and len(self.discrete_action_dims) > 0:
-
-            if self.gumbel_tau > self.gumbel_tau_min:
+            if gumble:
                 discrete_actions = []
                 for i, logits in enumerate(discrete_logits):
                     probs = F.gumbel_softmax(
-                        logits, dim=-1, tau=self.gumbel_tau, hard=self.hard
+                        logits, dim=-1, tau=self.gumbel_tau, hard=self.gumble_hard
                     )
                     discrete_actions.append(probs)
             else:
@@ -524,7 +520,6 @@ class StochasticActor(nn.Module):
                     discrete_actions[:, i] = torch.distributions.Categorical(
                         logits=logits
                     ).sample()
-
         return continuous_actions, discrete_actions
 
 
