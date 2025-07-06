@@ -180,7 +180,20 @@ def SA_test(verbose=False):
                                     or batch_sample_ca.shape[1] != con  # type:ignore
                                 ):
                                     ca_passing = False
-
+                            if dis is not None:
+                                if gum:
+                                    if (
+                                        batch_da[0].shape[0] != 18
+                                        or batch_da[1].shape[0] != 18
+                                        or batch_da[0].shape[1] != 3
+                                        or batch_da[1].shape[1] != 4
+                                    ):
+                                        da_passing = False
+                                else:
+                                    if batch_sample_da.shape[
+                                        0
+                                    ] != 18 or batch_sample_da.shape[1] != len(dis):
+                                        da_passing = False
                             da_pass_count += da_passing
                             ca_pass_count += ca_passing
                             log_pass_count += lstd_passing
@@ -190,14 +203,21 @@ def SA_test(verbose=False):
                                     f"One or more tests failed for with discrete={dis}, continuous={con}, head_hidden={head_hidden}, encoder: {enc is not None}, logtype: {lstd}, gumble {gum}"
                                 )
                             if not da_passing:
-                                print("Discrete action failing shapes: ")
+                                print("  Discrete action failing shapes: ")
                                 for a in da:
-                                    print(f"layer shape: {a.shape}")
+                                    print(f"    layer shape: {a.shape}")
+                                for a in batch_da:
+                                    print(f"    batch layer shape: {a.shape}")
+                                print(
+                                    f"    batch sample shape: {batch_sample_da.shape}"
+                                )
                             if not ca_passing:
-                                print(f"Continuous action failing shape: {ca.shape}")
+                                print(
+                                    f"  Continuous action failing shape: {ca.shape}, batch shape {batch_ca.shape}"
+                                )
                             if not lstd_passing:
                                 print(
-                                    f"Continuous log probs not passing with shape {calp.shape}"
+                                    f"  Continuous log probs not passing with shape {calp.shape}, batch shape {batch_calp.shape}"
                                 )
     print(
         f"Stochastic Actor Continuous Actions   passed {ca_pass_count}/{total_tests} = {ca_pass_count/total_tests*100:.2f}%"

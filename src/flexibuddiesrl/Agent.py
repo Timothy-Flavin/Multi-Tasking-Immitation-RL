@@ -513,13 +513,22 @@ class StochasticActor(nn.Module):
                     )
                     discrete_actions.append(probs)
             else:
-                discrete_actions = torch.zeros(
-                    discrete_logits[0].shape[0], len(self.discrete_action_dims)
-                )
+                if len(discrete_logits[0].shape) == 1:
+                    discrete_actions = torch.zeros(len(self.discrete_action_dims))
+                else:
+                    discrete_actions = torch.zeros(
+                        discrete_logits[0].shape[0], len(self.discrete_action_dims)
+                    )
+
                 for i, logits in enumerate(discrete_logits):
-                    discrete_actions[:, i] = torch.distributions.Categorical(
-                        logits=logits
-                    ).sample()
+                    if len(discrete_logits[0].shape) == 1:
+                        discrete_actions[i] = torch.distributions.Categorical(
+                            logits=logits
+                        ).sample()
+                    else:
+                        discrete_actions[:, i] = torch.distributions.Categorical(
+                            logits=logits
+                        ).sample()
         return continuous_actions, discrete_actions
 
 
