@@ -742,7 +742,7 @@ class QS(nn.Module):
         # If the heads have their own hidden layer for a 2 layer dueling network
         if self.joint_heads_hidden_layer is not None:
             x = F.relu(self.joint_heads_hidden_layer(x))
-        if self.dueling:
+        if self.dueling and self.value_head is not None:
             values = self.value_head(x[:, : self.last_hidden_dim])
 
         if self.advantage_heads is not None:
@@ -835,9 +835,9 @@ class DuelingQSAA(nn.Module):
         self.l1 = nn.Linear(input_dim, hidden_dim)
         self.l2 = nn.Linear(hidden_dim, hidden_dim)
         self.value_head = nn.Linear(hidden_dim, 1)
-        self.advantage_head = nn.Linear(
-            hidden_dim + continuous_action_dim + total_discrete_dims, 1
-        )
+        self.advantage_heads = [
+            nn.Linear(hidden_dim + continuous_action_dim + total_discrete_dims, 1)
+        ]
 
         self.to(device)
 

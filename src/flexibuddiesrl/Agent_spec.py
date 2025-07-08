@@ -190,6 +190,8 @@ def SA_test(verbose=False):
                                     ):
                                         da_passing = False
                                 else:
+                                    assert batch_sample_da is not None
+                                    assert isinstance(batch_sample_da, torch.Tensor)
                                     if batch_sample_da.shape[
                                         0
                                     ] != 18 or batch_sample_da.shape[1] != len(dis):
@@ -209,7 +211,7 @@ def SA_test(verbose=False):
                                 for a in batch_da:
                                     print(f"    batch layer shape: {a.shape}")
                                 print(
-                                    f"    batch sample shape: {batch_sample_da.shape}"
+                                    f"    batch sample shape: {batch_sample_da.shape}"  # type:ignore
                                 )
                             if not ca_passing:
                                 print(
