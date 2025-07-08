@@ -7,42 +7,111 @@ from flexibuddiesrl.Agent import QS, StochasticActor, ffEncoder
 
 def QS_test(verbose=False):
     mat = torch.from_numpy(np.random.rand(18, 12))
-
     encoder = ffEncoder(12, [24, 12])
 
     duel_tests = [True, False]
-    dis_tests = [None, [2, 3, 4]]
+    value_per_head_tests = [True, False]
+    dis_tests = [None, [2, 3]]
     con_tests = [0, 5]
-    head_hidden_tests = [None, 64]
+    head_hidden_tests = [None, [32], [16, 16]]
     encoder_arg = [None, encoder]
 
+    total_tests = 0
+    ca_passes = 0
+    da_passes = 0
+    v_passes = 0
     for duel in duel_tests:
-        for dis in dis_tests:
-            for con in con_tests:
-                for head_hidden in head_hidden_tests:
-                    for enc in encoder_arg:
-                        print(
-                            f"Testing with dueling={duel}, discrete={dis}, continuous={con}, head_hidden={head_hidden}, encoder: {enc is not None}"
-                        )
-                        Q = QS(
-                            obs_dim=12,
-                            continuous_action_dim=con,
-                            discrete_action_dims=dis,
-                            hidden_dims=[32, 32],
-                            dueling=duel,
-                            n_c_action_bins=3,
-                            head_hidden_dim=head_hidden,
-                            encoder=enc,
-                        )
-                        v, d, c = Q(mat)
-                        if duel:
-                            print("  Value shape:", v.shape)
-                        if dis is not None:
-                            print("  Discrete action dimensions:", len(d))
-                            for dim in d:
-                                print("    Discrete action dim shape:", dim.shape)
-                        if con > 0:
-                            print("  Continuous action shape:", c.shape)
+        for sv in value_per_head_tests:
+            for dis in dis_tests:
+                for con in con_tests:
+                    if dis is None and con == 0:
+                        continue
+                    for head_hidden in head_hidden_tests:
+                        for enc in encoder_arg:
+                            total_tests += 1
+                            if verbose:
+                                print(
+                                    f"Testing with dueling={duel}, discrete={dis}, continuous={con}, head_hidden={head_hidden}, encoder: {enc is not None}"
+                                )
+                            Q = QS(
+                                obs_dim=12,
+                                continuous_action_dim=con,
+                                discrete_action_dims=dis,
+                                hidden_dims=[32, 32],
+                                dueling=duel,
+                                n_c_action_bins=3,
+                                head_hidden_dims=(
+                                    np.array(head_hidden)
+                                    if head_hidden is not None
+                                    else None
+                                ),
+                                encoder=enc,
+                                value_per_head=sv,
+                            )
+                            bv, bd, bc = Q(mat)
+                            v, d, c = Q(mat[0])
+                            con_pass = True
+                            dis_pass = True
+                            val_pass = True
+
+                            # batch passing
+                            if con > 0:
+                                if bc.shape != torch.Size(
+                                    (18, con, 3)
+                                ) or c.shape != torch.Size([con, 3]):
+                                    con_pass = False
+                                    input(
+                                        f"Failed Testing with dueling={duel}, discrete={dis}, continuous={con}, head_hidden={head_hidden}, encoder: {enc is not None} shared: {sv} + d: {c}, vb:[{bc.shape},{c.shape}]"
+                                    )
+
+                            if dis is not None:
+                                if (
+                                    len(bd) != 2
+                                    or bd[0].shape != torch.Size((18, 2))
+                                    or bd[1].shape != torch.Size((18, 3))
+                                ):
+                                    dis_pass = False
+                                if (
+                                    len(d) != 2
+                                    or d[0].shape != torch.Size([2])
+                                    or d[1].shape != torch.Size([3])
+                                ):
+                                    dis_pass = False
+                                    # print(bd[0])
+                                    input(
+                                        f"Failed Testing with dueling={duel}, discrete={dis}, continuous={con}, head_hidden={head_hidden}, encoder: {enc is not None} shared: {sv} + d: {d}, vb:[{bd[0].shape},{bd[1].shape}]"
+                                    )
+
+                            dis_dim = 0 if dis is None else 2
+
+                            v_size = dis_dim + con if sv else 1
+                            if duel and (
+                                bv.shape != torch.Size([18, v_size])
+                                or v.shape != torch.Size([v_size])
+                            ):
+                                v_passes = False
+                                input(
+                                    f"Failed Testing with dueling={duel}, discrete={dis}, continuous={con}, head_hidden={head_hidden}, encoder: {enc is not None} shared: {sv} vsize: {(v_size)} + v: {v.shape}, vb: {bv.shape}"
+                                )
+                            # single action passing
+                            ca_passes += con_pass
+                            da_passes += dis_pass
+                            v_passes += val_pass
+                            if verbose:
+                                if duel:
+                                    print("  Value shape:", v.shape)
+                                if dis is not None:
+                                    print("  Discrete action dimensions:", len(d))
+                                    for dim in d:
+                                        print(
+                                            "    Discrete action dim shape:", dim.shape
+                                        )
+                                if con > 0:
+                                    print("  Continuous action shape:", c.shape)
+    print(f"Total tests run: {total_tests}")
+    print(f"value passes: {v_passes}")
+    print(f"continuous action passes: {ca_passes}")
+    print(f"discrete action passes: {da_passes}")
 
 
 def SA_test(verbose=False):
@@ -250,7 +319,7 @@ if __name__ == "__main__":
     #         data[0],
     #     )
     # )
-    # QS_test()
+    QS_test()
     SA_test()
 
 # %%

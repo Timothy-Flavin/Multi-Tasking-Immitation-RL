@@ -718,7 +718,7 @@ class QS(nn.Module):
             self.tot_adv_size += sum(discrete_action_dims)
             self.n_heads += len(discrete_action_dims)
 
-        self.value_dim = 0
+        self.value_dim = 1
         if self.dueling:
             if self.value_per_head:
                 self.value_dim = self.n_heads
@@ -727,6 +727,7 @@ class QS(nn.Module):
         # set up hidden layer for the adv and V heads
         joint_head_layers = []
         if head_hidden_dims is not None:
+            # print(head_hidden_dims)
             head_hidden_dims[-1] = head_hidden_dims[-1] * (
                 2 if dueling else 1  # separate embeddings if dueling
             )  # need independent chunk for value vs advantage
@@ -756,7 +757,11 @@ class QS(nn.Module):
             if self.value_per_head:
                 self.value_head = nn.Linear(
                     self.last_hidden_dim // 2,
-                    len(discrete_action_dims)
+                    (
+                        len(discrete_action_dims)
+                        if discrete_action_dims is not None
+                        else 0
+                    )
                     + continuous_action_dim,  # because the continuous dims are discrete behind the hood
                 )
             else:
@@ -776,17 +781,24 @@ class QS(nn.Module):
             x = self.encoder(x)
         values = 0
 
+        single_dim = False
+        if len(x.shape) == 1:
+            single_dim = True
+            x = x.unsqueeze(0)
+
         # If the heads have their own hidden layers for a 2 layer dueling network
         if self.joint_head_layers is not None:
             for li in self.joint_head_layers:
                 x = torch.relu(li(x))
         if self.dueling and self.value_head is not None:
-            values = self.value_head(x[:, : self.last_hidden_dim])
+            values = self.value_head(x[:, : self.last_hidden_dim // 2])
+            if single_dim:
+                values = values.squeeze(0)
 
         # half the embedding belongs to the value head if dueling
         advantages = None
         if self.dueling and self.advantage_heads is not None:
-            advantages = self.advantage_heads(x[:, -self.last_hidden_dim :])
+            advantages = self.advantage_heads(x[:, -self.last_hidden_dim // 2 :])
         elif self.advantage_heads is not None:
             advantages = self.advantage_heads(x)
 
@@ -806,12 +818,14 @@ class QS(nn.Module):
                     disc_advantages[-1] = disc_advantages[-1] - disc_advantages[
                         -1
                     ].mean(dim=-1, keepdim=True)
+                if single_dim:
+                    disc_advantages[-1] = disc_advantages[-1].squeeze(0)
                 start = end
 
         if self.cont_action_dim > 0 and advantages is not None:
             cont_advantages = (
                 advantages[:, tot_disc_dims:].view(
-                    advantages.shape[0], -1, self.cont_action_dim
+                    advantages.shape[0], self.cont_action_dim, -1
                 )
                 # .transpose(0, 1)  # TODO: figure out if it is worth it to transpose
             )  # transposed because then discrete and continuous output same dim order
@@ -819,6 +833,8 @@ class QS(nn.Module):
                 cont_advantages = cont_advantages - cont_advantages.mean(
                     dim=-1, keepdim=True
                 )
+            if single_dim:
+                cont_advantages = cont_advantages.squeeze(0)
 
         return values, disc_advantages, cont_advantages
 
