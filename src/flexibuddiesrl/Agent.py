@@ -123,13 +123,13 @@ class ffEncoder(nn.Module):
             else:
                 x = self.activation(layer(x))
             if debug:
-                interlist.append(x)
+                interlist.append(x)  # type: ignore
         # if x contains nan, print the intermediate list and encoder weights
         if torch.isnan(x).any():
             if debug:
-                print(f"Intermediate list: {interlist}")
+                print(f"Intermediate list: {interlist}")  # type: ignore
             for layer in self.encoder:
-                print(f"Layer {layer.weight}")
+                print(f"Layer {layer.weight}")  # type: ignore
         return x
 
 
@@ -139,9 +139,9 @@ class MixedActor(nn.Module):
         obs_dim,
         continuous_action_dim=None,  # number of continuouis action dimensions =5
         discrete_action_dims=None,  # list of discrete action dimensions =[2, 3, 4]
-        max_actions: np.array = np.array([1.0], dtype=np.float32),
-        min_actions: np.array = np.array([-1.0], dtype=np.float32),
-        hidden_dims: np.array = np.array([256, 256], dtype=np.int32),
+        max_actions: np.ndarray = np.array([1.0], dtype=np.float32),
+        min_actions: np.ndarray = np.array([-1.0], dtype=np.float32),
+        hidden_dims: np.ndarray = np.array([256, 256], dtype=np.int32),
         encoder=None,  # ffEncoder if hidden dims are provided and encoder is not provided
         device="cpu",
         tau=1.0,
