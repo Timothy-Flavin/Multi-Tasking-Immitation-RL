@@ -163,13 +163,14 @@ class PG(nn.Module, Agent):
         # print(self.actor_logstd)
         # self.actor_logstd.retain_grad()
 
-        # self.optimizer = torch.optim.Adam(
-        #     list(self.parameters()) + [self.actor_logstd], lr=self.lr
-        # )
+        self.optimizer = torch.optim.Adam(list(self.parameters()), lr=self.lr)
 
     def _sample_multi_discrete(
         self, logits, debug=False
     ):  # logits of the form [action_dim, batch_size, action_dim_size]
+        assert (
+            self.discrete_action_dims is not None
+        ), "Can't sample multi discrete with no discrete actions, dim=None"
         actions = torch.zeros(
             size=(len(self.discrete_action_dims),),
             device=self.device,
@@ -211,16 +212,16 @@ class PG(nn.Module, Agent):
             self.optimizer.param_groups[0]["lr"] = lrnow
 
         with torch.no_grad():
-            continuous_mean_logits, continuous_std_logits, discrete_logits = self.actor(
-                x=observations, action_mask=action_mask, gumbel=False, debug=debug
+            continuous_logits, continuous_log_std_logits, discrete_action_logits = (
+                self.actor(
+                    x=observations, action_mask=action_mask, gumbel=False, debug=debug
+                )
             )
             if debug:
-                print(f"  After actor: clog {continuous_logits}, dlog{discrete_logits}")
+                print(
+                    f"  After actor: clog {continuous_logits}, dlog{discrete_action_logits}"
+                )
 
-        if debug:
-            print(
-                f" Expanding actor logstd {self.actor_logstd.squeeze(0)}, {continuous_logits}"
-            )
         continuous_actions, continuous_log_probs = None, None
         try:
             if self.continuous_action_dim > 0:

@@ -155,7 +155,7 @@ class MixedActor(nn.Module):
         self.tau = tau
         self.hard = hard
         # print(hidden_dims)
-        if encoder is None and len(hidden_dims) > 0:
+        if encoder is None and hidden_dims is not None and len(hidden_dims) > 0:
             self.encoder = ffEncoder(
                 obs_dim, hidden_dims, device=device, activation=activation, dropout=0
             )
@@ -251,9 +251,13 @@ class StochasticActor(nn.Module):
         discrete_action_dims: (
             list[int] | None
         ) = None,  # list of discrete action dimensions =[2, 3, 4]
-        max_actions: np.ndarray = np.array([1.0], dtype=np.float32),
-        min_actions: np.ndarray = np.array([-1.0], dtype=np.float32),
-        hidden_dims: np.ndarray = np.array(
+        max_actions: np.ndarray | None | torch.Tensor = np.array(
+            [1.0], dtype=np.float32
+        ),
+        min_actions: np.ndarray | None | torch.Tensor = np.array(
+            [-1.0], dtype=np.float32
+        ),
+        hidden_dims: np.ndarray | None | torch.Tensor = np.array(
             [64, 64], dtype=np.int32
         ),  # Last dim will be used to specify encoder output dim if one is supplied
         encoder=None,  # ffEncoder if hidden dims are provided and encoder is not provided
@@ -296,7 +300,12 @@ class StochasticActor(nn.Module):
             self.activation = activation
 
         self.provided_encoder = encoder is not None
-        if encoder is None and len(hidden_dims) > 0:
+        assert not (
+            hidden_dims is None and encoder is None
+        ), "If you do not provide an encoder then you need to provide mlp dims"
+
+        # At this point, either encoder is not None or hidden_dims is not None (asserted above)
+        if encoder is None and hidden_dims is not None and len(hidden_dims) > 0:
             self.encoder = ffEncoder(
                 obs_dim,
                 hidden_dims,
@@ -310,9 +319,11 @@ class StochasticActor(nn.Module):
         ), "At least one action dim should be provided"
         if continuous_action_dim > 0:
             assert (
-                len(max_actions) == continuous_action_dim
+                max_actions is not None
+                and min_actions is not None
+                and len(max_actions) == continuous_action_dim
                 and len(min_actions) == continuous_action_dim
-            ), f"max_actions should be provided for each continuous action dim {len(max_actions)},{continuous_action_dim}"
+            ), f"max_actions should be provided for each continuous action dim len(max): {len(max_actions) if max_actions is not None else None}, continuous_action_dim: {continuous_action_dim}"
 
         # print(
         #    f"Min actions: {min_actions}, max actions: {max_actions}, torch {torch.from_numpy(max_actions - min_actions)}"

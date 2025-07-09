@@ -1,7 +1,6 @@
 # %%
 import numpy as np
 import torch
-import flexibuddiesrl
 from flexibuddiesrl.Agent import QS, StochasticActor, ffEncoder
 
 
