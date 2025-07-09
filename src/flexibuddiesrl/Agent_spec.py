@@ -235,11 +235,16 @@ def SA_test(verbose=False):
                                 print("Testing action sampler")
 
                             batch_ca, batch_calp, batch_da = sa(mat)
-                            batch_sample_ca, batch_sample_da = sa.action_from_logits(
+                            (
+                                batch_sample_ca,
+                                batch_clogpi,
+                                batch_sample_da,
+                                batch_dlogpi,
+                            ) = sa.action_from_logits(
                                 batch_ca, batch_calp, batch_da, gumble=gum
                             )
-                            sample_ca, sample_da = sa.action_from_logits(
-                                ca, calp, da, gumble=gum
+                            sample_ca, clogpi, sample_da, dlogpi = (
+                                sa.action_from_logits(ca, calp, da, gumble=gum)
                             )
 
                             if con > 0:

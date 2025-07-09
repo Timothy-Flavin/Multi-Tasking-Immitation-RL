@@ -472,8 +472,35 @@ class StochasticActor(nn.Module):
             )
         return continuous_means, continuous_log_std_logits, discrete_logits
 
+    # TODO refactor into this
+    def sample_continuous(self, means, log_stds, with_log_probs=False):
+        pass
+
+    def sample_discrete(self, logits, with_log_probs=False):
+        pass
+
+    def deterministic_action(self, c_logits, d_logits, noise_generator, gumble=False):
+        pass
+
+    def stochastic_action(
+        self,
+        c_logits,
+        d_logits,
+        c_log_stds,
+        with_logc=False,
+        with_logd=False,
+        gumble=False,
+    ):
+        pass
+
     def action_from_logits(
-        self, continuous_means, continuous_log_std_logits, discrete_logits, gumble=False
+        self,
+        continuous_means,
+        continuous_log_std_logits,
+        discrete_logits,
+        gumble=False,
+        log_con=False,
+        log_disc=False,
     ):
         """
         Produces actions from logits with gradient maintained always for continuous and if gumbel is True for discrete
@@ -496,24 +523,64 @@ class StochasticActor(nn.Module):
         """
         continuous_actions = None
         discrete_actions = None
+        continuous_log_probs = None
+        discrete_log_probs = None
+        c_dist = None
+        d_dist = None
+
+        assert not (
+            continuous_log_std_logits is None and log_con
+        ), "You can't get log probs from just a mean, log stds was none"
+
         if self.continuous_action_dim > 0:
             if continuous_log_std_logits is None:
                 continuous_activations = continuous_means
             else:
+                # if full do it this way
+                # If log_std is shape (m, 1), expand to (m, n) to match means
+                log_std = continuous_log_std_logits
+                if log_std.shape[1] == 1 and continuous_means.shape[1] > 1:
+                    log_std = log_std.expand(-1, continuous_means.shape[1])
                 c_dist = torch.distributions.Normal(
                     continuous_means,
-                    torch.exp(continuous_log_std_logits),
+                    torch.exp(log_std),
                 )
-                continuous_activations = c_dist.rsample()  # reparameterization trick
+                continuous_activations = c_dist.rsample()
+
             if self.clamp_type == "tanh":
                 continuous_actions = (
                     torch.tanh(continuous_activations) * self.action_scales
                     + self.action_biases
                 )
+                if log_con:
+                    assert (
+                        c_dist is not None
+                    ), "Somehow we want log probs from a distirbution that doesn't exist"
+
+                    # This is from spinningup SAC
+                    continuous_log_probs = c_dist.log_prob(continuous_actions).sum(
+                        axis=-1
+                    )
+                    continuous_log_probs -= (
+                        2
+                        * (
+                            np.log(2)
+                            - continuous_actions
+                            - F.softplus(-2 * continuous_actions)
+                        )
+                    ).sum(axis=1)
+
             elif self.clamp_type == "clamp":
                 continuous_actions = torch.clamp(
                     continuous_activations, self.min_actions, self.max_actions
                 )
+                if log_con:
+                    assert (
+                        c_dist is not None
+                    ), "Somehow we want log probs from a distirbution that doesn't exist"
+                    continuous_log_probs = c_dist.log_prob(continuous_actions).sum(
+                        axis=-1
+                    )
 
         if self.discrete_action_dims is not None and len(self.discrete_action_dims) > 0:
             if gumble:
@@ -526,21 +593,35 @@ class StochasticActor(nn.Module):
             else:
                 if len(discrete_logits[0].shape) == 1:
                     discrete_actions = torch.zeros(len(self.discrete_action_dims))
+                    if log_disc:
+                        discrete_log_probs = torch.zeros(len(self.discrete_action_dims))
                 else:
                     discrete_actions = torch.zeros(
                         discrete_logits[0].shape[0], len(self.discrete_action_dims)
                     )
-
+                    if log_disc:
+                        discrete_log_probs = torch.zeros(
+                            discrete_logits[0].shape[0], len(self.discrete_action_dims)
+                        )
                 for i, logits in enumerate(discrete_logits):
                     if len(discrete_logits[0].shape) == 1:
-                        discrete_actions[i] = torch.distributions.Categorical(
-                            logits=logits
-                        ).sample()
+                        d_dist = torch.distributions.Categorical(logits=logits)
+                        discrete_actions[i] = d_dist.sample()
+                        if log_disc and discrete_log_probs is not None:
+                            discrete_log_probs[i] = d_dist.log_prob(discrete_actions[i])
                     else:
-                        discrete_actions[:, i] = torch.distributions.Categorical(
-                            logits=logits
-                        ).sample()
-        return continuous_actions, discrete_actions
+                        d_dist = torch.distributions.Categorical(logits=logits)
+                        discrete_actions[:, i] = d_dist.sample()
+                        if log_disc and discrete_log_probs is not None:
+                            discrete_log_probs[:, i] = d_dist.log_prob(
+                                discrete_actions[:, i]
+                            )
+        return (
+            continuous_actions,
+            continuous_log_probs,
+            discrete_actions,
+            discrete_log_probs,
+        )
 
 
 class ValueSA(nn.Module):

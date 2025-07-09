@@ -222,43 +222,19 @@ class PG(nn.Module, Agent):
                     f"  After actor: clog {continuous_logits}, dlog{discrete_action_logits}"
                 )
 
-        continuous_actions, continuous_log_probs = None, None
-        try:
-            if self.continuous_action_dim > 0:
-                # action_logstd = self.actor_logstd
-                action_std = torch.exp(self.actor_logstd.squeeze(0))
-                continuous_dist = torch.distributions.Normal(
-                    loc=continuous_logits,
-                    scale=action_std,
-                )
-                continuous_actions = continuous_dist.sample()
-                continuous_log_probs = (
-                    continuous_dist.log_prob(continuous_actions).detach().cpu().numpy()
-                )
-                continuous_actions = continuous_actions.detach().cpu().numpy()
-        except Exception as e:
-            print(
-                f"bad stuff, {continuous_logits}, {discrete_logits}, {observations}, {action_mask} {e}"
+            (
+                continuous_actions,
+                continuous_log_probs,
+                discrete_actions,
+                discrete_log_probs,
+            ) = self.actor.action_from_logits(
+                continuous_logits,
+                continuous_log_std_logits,
+                discrete_action_logits,
+                False,
+                True,
+                True,
             )
-            exit()
-
-        discrete_actions, discrete_log_probs = None, None
-        if self.discrete_action_dims is not None:
-            # print(f"obs: {observations}")
-
-            discrete_actions, discrete_log_probs = self._sample_multi_discrete(
-                discrete_logits
-            )
-            # print(
-            #     "Logit, act, logprob",
-            #     discrete_logits,
-            #     discrete_actions,
-            #     discrete_log_probs,
-            # )
-            # print(torch.log(discrete_logits[0][discrete_actions[0]]))
-            discrete_actions = discrete_actions.detach().cpu().numpy()
-            discrete_log_probs = discrete_log_probs.detach().cpu().numpy()
-
         return (
             discrete_actions,
             continuous_actions,
