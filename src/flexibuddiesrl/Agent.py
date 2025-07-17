@@ -27,8 +27,11 @@ class Agent(ABC):
         )  # discrete actions, continuous actions, discrete log probs, continuous log probs, value
 
     @abstractmethod
-    def ego_actions(self, observations, action_mask=None):
-        return 0
+    def ego_actions(self, observations, action_mask=None) -> tuple[
+        np.ndarray | int | None,
+        np.ndarray | float | None,
+    ]:
+        return np.array([1]), np.array([0.5])
 
     @abstractmethod
     def imitation_learn(
@@ -497,13 +500,18 @@ class StochasticActor(nn.Module):
 
     def action_from_logits(
         self,
-        continuous_means,
-        continuous_log_std_logits,
-        discrete_logits,
-        gumble=False,
-        log_con=False,
-        log_disc=False,
-    ):
+        continuous_means: torch.Tensor,
+        continuous_log_std_logits: torch.Tensor,
+        discrete_logits: list[torch.Tensor],
+        gumble: bool = False,
+        log_con: bool = False,
+        log_disc: bool = False,
+    ) -> tuple[
+        None | torch.Tensor | list[torch.Tensor],
+        None | torch.Tensor | list[torch.Tensor],
+        None | torch.Tensor | list[torch.Tensor],
+        None | torch.Tensor | list[torch.Tensor],
+    ]:
         """
         Produces actions from logits with gradient maintained always for continuous and if gumbel is True for discrete
         Args:
@@ -586,7 +594,7 @@ class StochasticActor(nn.Module):
 
         if self.discrete_action_dims is not None and len(self.discrete_action_dims) > 0:
             if gumble:
-                discrete_actions = []
+                discrete_actions: list[torch.Tensor] | torch.Tensor | None = []
                 for i, logits in enumerate(discrete_logits):
                     probs = F.gumbel_softmax(
                         logits, dim=-1, tau=self.gumbel_tau, hard=self.gumble_hard
@@ -619,10 +627,10 @@ class StochasticActor(nn.Module):
                                 discrete_actions[:, i]
                             )
         return (
-            continuous_actions,
-            continuous_log_probs,
             discrete_actions,
+            continuous_actions,
             discrete_log_probs,
+            continuous_log_probs,
         )
 
 

@@ -165,6 +165,26 @@ class PG(nn.Module, Agent):
 
         self.optimizer = torch.optim.Adam(list(self.parameters()), lr=self.lr)
 
+    def _to_numpy(self, x):
+        if x is None:
+            return None
+        if isinstance(x, torch.Tensor):
+            return x.cpu().numpy()
+        elif isinstance(x, list):
+            return np.stack(
+                [
+                    t.cpu().numpy() if isinstance(t, torch.Tensor) else np.array(t)
+                    for t in x
+                ],
+                axis=-1,
+            )
+        elif x is None:
+            return None
+        else:
+            return np.array(x)
+
+    # train_actions will take one or multiple actions if given a list of observations
+    # this way the agent can be parameter shared in a batched fashion.
     def train_actions(self, observations, action_mask=None, step=False, debug=False):
         if debug:
             print(f"  Testing PPO Train Actions: Observations: {observations}")
@@ -196,10 +216,10 @@ class PG(nn.Module, Agent):
                 )
 
             (
-                continuous_actions,
-                continuous_log_probs,
                 discrete_actions,
+                continuous_actions,
                 discrete_log_probs,
+                continuous_log_probs,
             ) = self.actor.action_from_logits(
                 continuous_logits,
                 continuous_log_std_logits,
@@ -208,31 +228,40 @@ class PG(nn.Module, Agent):
                 True,
                 True,
             )
+
         return (
-            discrete_actions,
-            continuous_actions,
-            discrete_log_probs,
-            continuous_log_probs,
+            self._to_numpy(discrete_actions),
+            self._to_numpy(continuous_actions),
+            self._to_numpy(discrete_log_probs),
+            self._to_numpy(continuous_log_probs),
             0,  # vals.detach().cpu().numpy(), TODO: re-enable this when flexibuff is done
         )
 
     # takes the observations and returns the action with the highest probability
     def ego_actions(self, observations, action_mask=None):
         with torch.no_grad():
-            continuous_actions, discrete_action_activations = self.actor(
-                observations, action_mask, gumbel=False
+            continuous_logits, continuous_log_std_logits, discrete_action_logits = (
+                self.actor(
+                    x=observations, action_mask=action_mask, gumbel=False, debug=False
+                )
             )
-            if len(continuous_actions.shape) == 1:
-                continuous_actions = continuous_actions.unsqueeze(0)
-            # Ignore the continuous actions std for ego action
-            discrete_actions = torch.zeros(
-                (observations.shape[0], len(discrete_action_activations)),
-                device=self.device,
-                dtype=torch.float32,
+            # TODO: Make it so that action_from_logits has ego version
+            (
+                discrete_actions,
+                continuous_actions,
+                discrete_log_probs,
+                continuous_log_probs,
+            ) = self.actor.action_from_logits(
+                continuous_logits,
+                continuous_log_std_logits,
+                discrete_action_logits,
+                False,
+                False,
+                False,
             )
-            for i, activation in enumerate(discrete_action_activations):
-                discrete_actions[:, i] = torch.argmax(activation, dim=1)
-            return discrete_actions, continuous_actions
+            return self._to_numpy(discrete_actions), self._to_numpy(continuous_actions)
+
+    # TODO: From here down is not finished
 
     def imitation_learn(
         self,

@@ -236,16 +236,19 @@ def SA_test(verbose=False):
 
                             batch_ca, batch_calp, batch_da = sa(mat)
                             (
-                                batch_sample_ca,
-                                batch_clogpi,
                                 batch_sample_da,
+                                batch_sample_ca,
                                 batch_dlogpi,
+                                batch_clogpi,
                             ) = sa.action_from_logits(
                                 batch_ca, batch_calp, batch_da, gumble=gum
                             )
-                            sample_ca, clogpi, sample_da, dlogpi = (
-                                sa.action_from_logits(ca, calp, da, gumble=gum)
-                            )
+                            (
+                                sample_da,
+                                sample_ca,
+                                dlogpi,
+                                clogpi,
+                            ) = sa.action_from_logits(ca, calp, da, gumble=gum)
 
                             if con > 0:
                                 if (
