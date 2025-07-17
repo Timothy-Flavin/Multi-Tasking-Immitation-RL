@@ -479,9 +479,11 @@ class StochasticActor(nn.Module):
     def sample_discrete(self, logits, with_log_probs=False):
         pass
 
+    # DDPG way
     def deterministic_action(self, c_logits, d_logits, noise_generator, gumble=False):
         pass
 
+    # PPO / SAC way
     def stochastic_action(
         self,
         c_logits,

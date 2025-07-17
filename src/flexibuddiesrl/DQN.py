@@ -27,7 +27,7 @@ class DQN(nn.Module, Agent):
         self,
         obs_dim=10,
         discrete_action_dims=None,  # np.array([2]),
-        continuous_action_dims: int = None,  # 2,
+        continuous_action_dims: int = 0,  # 2,
         min_actions=None,  # np.array([-1,-1]),
         max_actions=None,  # ,np.array([1,1]),
         hidden_dims=[64, 64],  # first is obs dim if encoder provded
@@ -36,7 +36,7 @@ class DQN(nn.Module, Agent):
         lr=3e-5,
         imitation_lr=1e-5,
         dueling=False,
-        n_c_action_bins=10,
+        n_c_action_bins=5,
         munchausen=0,  # turns it into munchausen dqn
         entropy=0,  # turns it into soft-dqn
         activation="relu",

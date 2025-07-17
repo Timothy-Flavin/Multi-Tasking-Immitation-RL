@@ -165,39 +165,12 @@ class PG(nn.Module, Agent):
 
         self.optimizer = torch.optim.Adam(list(self.parameters()), lr=self.lr)
 
-    def _sample_multi_discrete(
-        self, logits, debug=False
-    ):  # logits of the form [action_dim, batch_size, action_dim_size]
-        assert (
-            self.discrete_action_dims is not None
-        ), "Can't sample multi discrete with no discrete actions, dim=None"
-        actions = torch.zeros(
-            size=(len(self.discrete_action_dims),),
-            device=self.device,
-            dtype=torch.int,
-        )
-        log_probs = torch.zeros(
-            size=(len(self.discrete_action_dims),),
-            device=self.device,
-        )
-        for i in range(len(self.discrete_action_dims)):
-            # print(f"logits: {logits}")
-            dist = Categorical(probs=logits[i])
-            actions[i] = dist.sample()
-            # print(f"act: {actions[i]}")
-            # print(
-            #    f"logprob: {dist.log_prob(actions[i])}, {torch.log(logits[i][actions[i]])}"
-            # )
-            log_probs[i] = dist.log_prob(actions[i])
-            # print(dist)
-        return actions, log_probs
-
     def train_actions(self, observations, action_mask=None, step=False, debug=False):
         if debug:
-            print(f"  Testing Train Actions: Observations: {observations}")
+            print(f"  Testing PPO Train Actions: Observations: {observations}")
         if not torch.is_tensor(observations):
             observations = T(observations, device=self.device, dtype=torch.float)
-        if not torch.is_tensor(action_mask) and action_mask is not None:
+        if action_mask is not None and not torch.is_tensor(action_mask):
             action_mask = torch.tensor(action_mask, dtype=torch.float).to(self.device)
 
         if debug:
