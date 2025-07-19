@@ -63,7 +63,6 @@ def PG_test():
             ),
             device=h["device"],
         )
-        tot += 1
     print(tot)
     # for dev in device:
     #     temp_enc = ffEncoder(12, [32, 32], device=dev)
