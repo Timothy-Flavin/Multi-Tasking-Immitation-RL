@@ -32,7 +32,6 @@ class PG(nn.Module, Agent):
         mini_batch_size=64,
         anneal_lr=200000,
         orthogonal=True,
-        starting_actorlogstd=0,
         clip_grad=True,
         gae_lambda=0.95,
         load_from_checkpoint=None,
@@ -40,6 +39,7 @@ class PG(nn.Module, Agent):
         eval_mode=False,
         encoder=None,
         action_head_hidden_dims=None,
+        std_type="stateless",  # ['full' 'diagonal' or 'stateless']
     ):
         super(PG, self).__init__()
         self.eval_mode = eval_mode
@@ -64,13 +64,13 @@ class PG(nn.Module, Agent):
             "mini_batch_size",
             "anneal_lr",
             "orthogonal",
-            "starting_actorlogstd",
             "clip_grad",
             "gae_lambda",
             "g_mean",
             "steps",
             "eval_mode",
             "action_head_hidden_dims",
+            "std_type",
         ]
         assert (
             continuous_action_dim > 0 or discrete_action_dims is not None
@@ -112,7 +112,7 @@ class PG(nn.Module, Agent):
         self.hidden_dims = hidden_dims
         self.orthogonal = orthogonal
 
-        self.starting_actorlogstd = starting_actorlogstd
+        self.std_type = std_type
         self.g_mean = 0
         self.steps = 0
         self.anneal_lr = anneal_lr
@@ -132,6 +132,9 @@ class PG(nn.Module, Agent):
                 self.max_actions = torch.from_numpy(max_actions).to(self.device)
 
     def _get_torch_params(self, encoder, action_head_hidden_dims=None):
+        st = None
+        if self.std_type in ["full", "diagonal"]:
+            st = self.std_type
         self.actor = StochasticActor(
             obs_dim=self.obs_dim,
             continuous_action_dim=self.continuous_action_dim,
@@ -145,6 +148,7 @@ class PG(nn.Module, Agent):
             encoder=encoder,
             gumbel_tau=0,
             action_head_hidden_dims=action_head_hidden_dims,
+            std_type=st,
         )
 
         self.critic = ValueS(
@@ -154,15 +158,11 @@ class PG(nn.Module, Agent):
             orthogonal_init=self.orthogonal,
             activation=self.activation,
         )
-        # self.actor_logstd = (
-        #     nn.Parameter(
-        #         torch.zeros(1, self.continuous_action_dim), requires_grad=True
-        #     ).to(self.device)
-        #     + self.starting_actorlogstd
-        # )
-        # print(self.actor_logstd)
-        # self.actor_logstd.retain_grad()
-
+        if self.std_type == "stateless":
+            self.actor_logstd = nn.Parameter(
+                torch.zeros(1, self.continuous_action_dim), requires_grad=True
+            ).to(self.device)
+            self.actor_logstd.retain_grad()
         self.optimizer = torch.optim.Adam(list(self.parameters()), lr=self.lr)
 
     def _to_numpy(self, x):
