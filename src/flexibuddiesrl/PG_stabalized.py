@@ -1,5 +1,5 @@
 from .Agent import ValueS, StochasticActor, Agent
-from .Util import T
+from .Util import T, minmaxnorm
 import torch
 from flexibuff import FlexiBatch
 from torch.distributions import Categorical
@@ -7,6 +7,8 @@ import numpy as np
 import torch.nn as nn
 import pickle
 import os
+from torch.distributions import TransformedDistribution, TanhTransform
+import torch.nn.functional as F
 
 
 class PG(nn.Module, Agent):
@@ -40,6 +42,8 @@ class PG(nn.Module, Agent):
         encoder=None,
         action_head_hidden_dims=None,
         std_type="stateless",  # ['full' 'diagonal' or 'stateless']
+        naive_immitation=False,  # if true, do MSE instead of MLE
+        action_clamp_type="tanh",
     ):
         super(PG, self).__init__()
         self.eval_mode = eval_mode
@@ -71,12 +75,16 @@ class PG(nn.Module, Agent):
             "eval_mode",
             "action_head_hidden_dims",
             "std_type",
+            "naive_immitation",
+            "action_clamp_type",
         ]
         assert (
             continuous_action_dim > 0 or discrete_action_dims is not None
         ), "At least one action dim should be provided"
         self.name = name
         self.encoder = encoder
+        self.action_clamp_type = action_clamp_type
+        self.naive_immitation = naive_immitation
         if load_from_checkpoint is not None:
             self.load(load_from_checkpoint)
             return
@@ -158,12 +166,18 @@ class PG(nn.Module, Agent):
             orthogonal_init=self.orthogonal,
             activation=self.activation,
         )
+        self.actor_logstd = None
+        self.optimizer: torch.optim.Adam
         if self.std_type == "stateless":
             self.actor_logstd = nn.Parameter(
                 torch.zeros(1, self.continuous_action_dim), requires_grad=True
             ).to(self.device)
             self.actor_logstd.retain_grad()
-        self.optimizer = torch.optim.Adam(list(self.parameters()), lr=self.lr)
+            self.optimizer = torch.optim.Adam(
+                list(self.parameters()) + [self.actor_logstd], lr=self.lr
+            )
+        else:
+            self.optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
 
     def _to_numpy(self, x):
         if x is None:
@@ -261,7 +275,168 @@ class PG(nn.Module, Agent):
             )
             return self._to_numpy(discrete_actions), self._to_numpy(continuous_actions)
 
-    # TODO: From here down is not finished
+    def _discrete_imitation_loss(self, discrete_logits, discrete_actions):
+        """
+        Calculates the total cross-entropy loss for multiple discrete action dimensions.
+        Args:
+            discrete_logits (list of torch.Tensor): A list where each element is the logits
+                for an action dimension. `discrete_logits[i]` has shape
+                [batch_size, num_categories_in_dim_i].
+
+            discrete_actions (torch.Tensor): The expert actions, with shape
+                [batch_size, num_action_dims].
+        Returns:
+            torch.Tensor: A single scalar value representing the sum of losses.
+        """
+        total_loss = 0.0
+        # Iterate through each action dimension
+        for i, single_dimension_logits in enumerate(discrete_logits):
+            # Get the target actions for the current dimension (i)
+            target_actions_for_dim = discrete_actions[:, i]
+            # Calculate the cross-entropy loss for this dimension
+            loss_for_dim = F.cross_entropy(
+                single_dimension_logits, target_actions_for_dim
+            )
+            total_loss += loss_for_dim
+
+        return total_loss
+
+    def _continuous_mle_immitation_loss(
+        self, continuous_mean_logits, continuous_log_std_logits, continuous_actions
+    ):
+        # if self.std_type == 'stateless' then we have a single nn parameter
+        # called actor_logstd which does not depend on the state or action dimension.
+        # if self.std_type == 'diagonal' then there will be one std_dev per sample
+        # so that the std is constant accross action dimensions but it is stateful
+        # if self.std_type == 'full' then there will be one std per output dimension
+        # per sample, so expand_as will do nothing
+        # In this case we are going with out self.actorlogstd
+        if continuous_log_std_logits is None or self.std_type == "stateless":
+            continuous_log_std_logits = self.actor_logstd
+        assert (
+            continuous_log_std_logits is not None
+        ), f"Inside _continuous_mle_immitation_loss: log std logits is none for type: {self.std_type}"
+
+        continuous_log_std_logits.expand_as(continuous_mean_logits)
+
+        # If self.action_clamp_type == tanh, then we will use tanh to clamp both the
+        # action ranges and standard deviations of the output distribution.
+        # Otherwise we always clamp the standard deviation at least
+        # If self.action_clamp_type == 'clamp' then we will clamp our own output actions
+        # but this doesnt effect the loss function
+        if self.action_clamp_type == "tanh":
+            continuous_log_std_logits = torch.tanh(continuous_log_std_logits)
+            continuous_log_std_logits = self.actor.log_std_clamp_range[0] + 0.5 * (
+                self.actor.log_std_clamp_range[1] - self.actor.log_std_clamp_range[0]
+            ) * (continuous_log_std_logits + 1)
+        else:
+            continuous_log_std_logits = torch.clamp(
+                continuous_log_std_logits,
+                self.actor.log_std_clamp_range[0],
+                self.actor.log_std_clamp_range[1],
+            )
+
+        dist = torch.distributions.Normal(
+            loc=continuous_mean_logits, scale=torch.exp(continuous_log_std_logits)
+        )
+        if self.action_clamp_type == "tanh":
+            dist = TransformedDistribution(dist, TanhTransform())
+            continuous_actions = minmaxnorm(
+                continuous_actions, self.min_actions, self.max_actions
+            )
+
+        loss = -dist.log_prob(continuous_actions).sum(axis=-1).mean()
+        return loss
+
+    def _continuous_naive_immitation_loss(
+        self,
+        continuous_mean_logits: torch.Tensor,
+        continuous_log_std_logits: torch.Tensor,
+        continuous_actions: torch.Tensor,
+        std_target=0.1,
+    ):
+        """
+        Calculates a naive imitation loss using Mean Squared Error (MSE).
+
+        This loss is composed of two parts:
+        1. MSE between the clamped/squashed predicted mean and the expert actions.
+        2. MSE between the predicted standard deviation and a fixed target std (0.1).
+        """
+        # --- 1. Process and Calculate Loss for Standard Deviation ---
+
+        # Handle different std_types ('stateless', 'diagonal', 'full')
+        if continuous_log_std_logits is None or self.std_type == "stateless":
+            assert self.actor_logstd is not None and isinstance(
+                self.actor_logstd, torch.Tensor
+            )
+            continuous_log_std_logits = self.actor_logstd
+
+        assert (
+            continuous_log_std_logits is not None
+        ), f"Inside _continuous_naive_immitation_loss: log std logits is none for type: {self.std_type}"
+
+        continuous_log_std_logits = continuous_log_std_logits.expand_as(
+            continuous_mean_logits
+        )
+
+        # Clamp or squash the log_std logits based on the clamp type
+        if self.action_clamp_type == "tanh":
+            continuous_log_std_logits = torch.tanh(continuous_log_std_logits)
+            # Rescale from [-1, 1] to the defined clamp range
+            continuous_log_std_logits = self.actor.log_std_clamp_range[0] + 0.5 * (
+                self.actor.log_std_clamp_range[1] - self.actor.log_std_clamp_range[0]
+            ) * (continuous_log_std_logits + 1)
+        else:
+            continuous_log_std_logits = torch.clamp(
+                continuous_log_std_logits,
+                self.actor.log_std_clamp_range[0],
+                self.actor.log_std_clamp_range[1],
+            )
+
+        # Calculate the predicted standard deviation
+        predicted_std = torch.exp(continuous_log_std_logits)
+
+        # Create a target std tensor with the same shape and a fixed value (e.g., 0.1)
+        target_std = torch.full_like(predicted_std, std_target)
+
+        # Calculate the MSE loss for the standard deviation
+        std_loss = F.mse_loss(predicted_std, target_std)
+
+        # --- 2. Process and Calculate Loss for the Mean ---
+
+        # Apply the appropriate transformation to the predicted mean before calculating loss
+        if self.action_clamp_type == "tanh":
+            # Squash raw logits to [-1, 1]
+            processed_mean = torch.tanh(continuous_mean_logits)
+            # Denormalize from [-1, 1] to the environment's action space [min, max]
+            assert isinstance(self.min_actions, torch.Tensor)
+
+            final_mean = self.min_actions + 0.5 * (
+                self.max_actions - self.min_actions
+            ) * (processed_mean + 1)
+
+        elif self.action_clamp_type == "clamp":
+            # Clamp the raw logits directly to the environment's action space
+            assert (
+                isinstance(self.min_actions, torch.Tensor)
+                and isinstance(continuous_mean_logits, torch.Tensor)
+                and isinstance(self.max_actions, torch.Tensor)
+            )
+            final_mean = torch.clamp(
+                continuous_mean_logits, self.min_actions, self.max_actions
+            )
+
+        else:  # 'None'
+            # Use the raw logits as the final mean
+            final_mean = continuous_mean_logits
+
+        # Calculate the MSE loss for the mean
+        mean_loss = F.mse_loss(final_mean, continuous_actions)
+
+        # --- 3. Combine Losses ---
+        total_loss = mean_loss + std_loss
+
+        return total_loss
 
     def imitation_learn(
         self,
@@ -271,25 +446,43 @@ class PG(nn.Module, Agent):
         action_mask=None,
         debug=False,
     ):
-        # print("not implemented yet")
-        return 0, 0
-        dact, cact = self.actor(
-            observations, action_mask=action_mask, gumbel=False, debug=False
+        continuous_mean_logits, continuous_log_std_logits, discrete_logits = self.actor(
+            x=observations, action_mask=action_mask, gumbel=False, debug=False
         )
-        loss = 0
-        if self.continuous_action_dim > 0:
-            loss += ((cact - continuous_actions) ** 2).mean()
-        if self.discrete_action_dims is not None:
-            for head in range(len(self.discrete_action_dims)):
-                loss += nn.CrossEntropyLoss()(
-                    dact[head], discrete_actions[:, head].long()
-                )
-        loss = torch.nn.functional.cross_entropy(probs, oh_actions, reduction="mean")
-        self.actor_optimizer.zero_grad()
-        loss.backward()
-        self.actor_optimizer.step()
+        continuous_immitation_loss = 0
+        discrete_immitation_loss = 0
 
-        return loss.item()  # loss
+        if self.continuous_action_dim > 0 and continuous_actions is not None:
+            if self.naive_immitation:
+                continuous_immitation_loss = self._continuous_mle_immitation_loss(
+                    continuous_mean_logits,
+                    continuous_log_std_logits,
+                    continuous_actions,
+                )
+            else:
+                continuous_immitation_loss = self._continuous_naive_immitation_loss(
+                    continuous_mean_logits,
+                    continuous_log_std_logits,
+                    continuous_actions,
+                    0.1,
+                )
+        if self.discrete_action_dims is not None and discrete_actions is not None:
+            discrete_immitation_loss = self._discrete_imitation_loss(
+                discrete_logits, discrete_actions
+            )
+
+        loss = discrete_immitation_loss + continuous_immitation_loss
+        self.optimizer.zero_grad()
+        loss.backward()  # type:ignore  started as a float
+        self.optimizer.step()
+
+        if isinstance(discrete_immitation_loss, torch.Tensor):
+            discrete_immitation_loss = discrete_immitation_loss.to("cpu").item()
+        if isinstance(continuous_immitation_loss, torch.Tensor):
+            continuous_immitation_loss = continuous_immitation_loss.to("cpu").item()
+        return discrete_immitation_loss, continuous_immitation_loss
+
+    # TODO: From here down is not finished
 
     def utility_function(self, observations, actions=None):
         if not torch.is_tensor(observations):

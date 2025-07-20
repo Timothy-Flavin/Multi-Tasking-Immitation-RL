@@ -27,5 +27,10 @@ def get_multi_discrete_one_hot(x, discrete_action_dims, debug=False):
     return onehot
 
 
+def minmaxnorm(data, mins, maxes):
+    data_0_to_1 = (data - mins) / (maxes - mins)
+    return data_0_to_1 * 2 - 1
+
+
 def normgrad(parameters, grad_clip=0.5):
     torch.nn.utils.clip_grad_norm_(parameters, grad_clip)

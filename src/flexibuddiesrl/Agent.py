@@ -438,7 +438,7 @@ class StochasticActor(nn.Module):
                     ) * (
                         continuous_log_std_logits + 1
                     )  # From CleanRL / SpinUp / Denis Yarats
-                elif self.clamp_type == "clamp":
+                else:  # self.clamp_type == "clamp" Always clamp at least
                     continuous_log_std_logits = torch.clamp(
                         continuous_log_std_logits,
                         self.log_std_clamp_range[0],
