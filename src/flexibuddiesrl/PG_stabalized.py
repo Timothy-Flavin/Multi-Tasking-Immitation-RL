@@ -9,6 +9,7 @@ import pickle
 import os
 from torch.distributions import TransformedDistribution, TanhTransform
 import torch.nn.functional as F
+from typing import Any, cast
 
 
 class PG(nn.Module, Agent):
@@ -482,8 +483,6 @@ class PG(nn.Module, Agent):
             continuous_immitation_loss = continuous_immitation_loss.to("cpu").item()
         return discrete_immitation_loss, continuous_immitation_loss
 
-    # TODO: From here down is not finished
-
     def utility_function(self, observations, actions=None):
         if not torch.is_tensor(observations):
             observations = torch.tensor(observations, dtype=torch.float).to(self.device)
@@ -496,131 +495,79 @@ class PG(nn.Module, Agent):
     def expected_V(self, obs, legal_action=None):
         return self.critic(obs)
 
-    # def marl_learn(self, batch, agent_num, mixer, critic_only=False, debug=False):
-    #    return super().marl_learn(batch, agent_num, mixer, critic_only, debug)
-
-    def zero_grads(self):
-        return 0
-
     def _get_disc_log_probs_entropy(self, logits, actions):
         log_probs = torch.zeros_like(actions, dtype=torch.float)
         dist = Categorical(logits=logits)
         log_probs = dist.log_prob(actions)
         return log_probs, dist.entropy().mean()
 
-    def _get_cont_log_probs_entropy(self, logits, actions):
-        log_probs = torch.zeros_like(actions, dtype=torch.float)
-        dist = torch.distributions.Normal(
-            loc=logits, scale=torch.exp(self.actor_logstd.expand_as(logits))
-        )
+    def _get_cont_log_probs_entropy(
+        self, logits, actions, lstd_logits: torch.Tensor | None = None
+    ):
+        lstd = 1.0
+        if self.actor_logstd is not None:
+            lstd = self.actor_logstd.expand_as(logits)
+        else:
+            assert (
+                lstd_logits is not None
+            ), "If the actor doesnt generate logits then it needs to have a global logstd"
+            lstd = lstd_logits.expand_as(logits)
+
+        dist = torch.distributions.Normal(loc=logits, scale=torch.exp(lstd))
+        if self.action_clamp_type == "tanh":
+            dist = TransformedDistribution(dist, TanhTransform())
+            actions = minmaxnorm(actions, self.min_actions, self.max_actions)
         log_probs = dist.log_prob(actions)
         return log_probs, dist.entropy().mean()
 
+    # TODO: From here down is not finished
     def _get_probs_and_entropy(self, batch: FlexiBatch, agent_num):
-        cp, dp = self.actor(
-            batch.obs[agent_num], action_mask=batch.action_mask[agent_num]
+        bm = None
+        if batch.action_mask is not None:
+            bm = batch.action_mask[agent_num]
+
+        assert hasattr(
+            batch, "obs"
+        ), "Batch needs attribute 'obs' for PG stabalized get_probs_and_entropy to work"
+
+        continuous_means, continuous_log_std_logits, discrete_logits = self.actor(
+            x=batch.obs[agent_num], action_mask=bm  # type:ignore
         )
-        if len(self.discrete_action_dims) > 0:
+        old_disc_log_probs = 0
+        old_disc_entropy = 0
+        old_cont_log_probs = 0
+        old_cont_entropy = 0
+
+        if self.discrete_action_dims is not None and len(self.discrete_action_dims) > 0:
+            assert (
+                hasattr(batch, "discrete_actions")
+                and batch.__getattribute__("discrete_actions") is not None
+            ), "Batch does not have attribute 'discrete_actions' but model has discrete_action_dims"
             old_disc_log_probs = []
-            old_disc_entropy = []
+            old_disc_entropy = 0
             for head in range(len(self.discrete_action_dims)):
                 odlp, ode = self._get_disc_log_probs_entropy(
-                    logits=dp[head],
-                    actions=batch.discrete_actions[agent_num][:, head],
+                    logits=discrete_logits[head],
+                    actions=batch.discrete_actions[agent_num][:, head],  # type:ignore
                 )
                 old_disc_log_probs.append(odlp)
-                old_disc_entropy.append(ode)
-        else:
-            old_disc_log_probs = 0
-            old_disc_entropy = 0
+                old_disc_entropy += ode
 
         if self.continuous_action_dim > 0:
+            assert (
+                hasattr(batch, "continuous_actions")
+                and batch.__getattribute__("continuous_actions") is not None
+            ), "Batch does not have attribute 'continuous_actions' but model has discrete_action_dims"
             old_cont_log_probs, old_cont_entropy = self._get_cont_log_probs_entropy(
-                logits=cp, actions=batch.continuous_actions[agent_num]
+                logits=continuous_means,
+                actions=batch.continuous_actions[agent_num],  # type:ignore
             )
-        else:
-            old_cont_log_probs = 0
-            old_cont_entropy = 0
-
         return (
             old_disc_log_probs,
             old_disc_entropy,
             old_cont_log_probs,
             old_cont_entropy,
         )
-
-    def _G(self, batch, agent_num):
-        G = torch.zeros_like(batch.global_rewards).to(self.device)
-        G[-1] = batch.global_rewards[-1]
-        if batch.terminated[-1] < 0.5:
-            if self.advantage_type == "constant":
-                G[-1] += self.gamma * self.g_mean
-            else:
-                G[-1] += self.gamma * self.critic(batch.obs_[agent_num][-1]).squeeze(-1)
-
-        for i in range(len(batch.global_rewards) - 2, -1, -1):
-            G[i] = batch.global_rewards[i] + self.gamma * G[i + 1] * (
-                1 - batch.terminated[i]
-            )
-        G = G.unsqueeze(-1)
-        return G
-
-    def _gae(self, batch, agent_num):
-        with torch.no_grad():
-            advantages = torch.zeros_like(batch.global_rewards).to(self.device)
-            num_steps = batch.global_rewards.shape[0]
-            last_values = self.critic(batch.obs_[agent_num, -1]).squeeze(-1)
-            values = self.critic(batch.obs[agent_num]).squeeze(-1)
-
-            last_gae_lam = 0
-            for step in reversed(range(num_steps)):
-                if step == num_steps - 1:
-                    next_non_terminal = 1.0 - batch.terminated[-1]
-                    next_values = last_values
-                else:
-                    next_non_terminal = 1.0 - batch.terminated[step]
-                    next_values = values[step + 1]
-                delta = (
-                    batch.global_rewards[step]
-                    + self.gamma * next_values * next_non_terminal
-                    - values[step]
-                )
-                last_gae_lam = (
-                    delta
-                    + self.gamma * self.gae_lambda * next_non_terminal * last_gae_lam
-                )
-                advantages[step] = last_gae_lam
-            # TD(lambda) estimator, see Github PR #375 or "Telescoping in TD(lambda)"
-            # in David Silver Lecture 4: https://www.youtube.com/watch?v=PnHCvfgC_ZA
-            #
-            G = advantages + values
-
-            # print(f"new: advantages {advantages} and G {G}")
-            # input()
-        return G.unsqueeze(-1), advantages.unsqueeze(-1)
-
-    def _td(self, batch, agent_num):
-        reward_arr = batch.global_rewards
-        td = torch.zeros_like(reward_arr).to(self.device)
-
-        with torch.no_grad():  # If last obs is non terminal critic to not bias it
-            old_values = self.critic(batch.obs[agent_num]).squeeze(-1)
-            td[-1] = (
-                self.gamma
-                * self.critic(batch.obs_[agent_num, -1]).squeeze(-1)
-                * batch.terminated[-1]
-                - old_values[-1]
-            )
-
-        for t in range(len(reward_arr) - 1):
-            td[t] = (
-                reward_arr[t]
-                + self.gamma * old_values[t + 1] * (1 - batch.terminated[t])
-                - old_values[t]
-            )
-
-        G = td + old_values
-        return G.unsqueeze(-1), td.unsqueeze(-1)
 
     def _print_grad_norm(self):
         total_norm = 0
@@ -632,6 +579,7 @@ class PG(nn.Module, Agent):
         total_norm = total_norm ** (1.0 / 2)
         print(total_norm)
 
+    # TODO: evreything below this is unfinished
     def reinforcement_learn(
         self,
         batch: FlexiBatch,
