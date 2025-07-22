@@ -1,7 +1,7 @@
 from .Agent import ValueS, StochasticActor, Agent
 from .Util import T, minmaxnorm
 import torch
-from flexibuff import FlexiBatch
+from flexibuff import FlexiBatch, FlexibleBuffer
 from torch.distributions import Categorical
 import numpy as np
 import torch.nn as nn
@@ -45,6 +45,13 @@ class PG(nn.Module, Agent):
         std_type="stateless",  # ['full' 'diagonal' or 'stateless']
         naive_immitation=False,  # if true, do MSE instead of MLE
         action_clamp_type="tanh",
+        batch_name_map={
+            "discrete_actions": "discrete_actions",
+            "continuous_actions": "continuous_actions",
+            "rewards": "global_rewards",
+            "obs": "obs",
+            "obs_": "obs_",
+        },
     ):
         super(PG, self).__init__()
         self.eval_mode = eval_mode
@@ -82,6 +89,20 @@ class PG(nn.Module, Agent):
         assert (
             continuous_action_dim > 0 or discrete_action_dims is not None
         ), "At least one action dim should be provided"
+
+        self.batch_name_map = batch_name_map
+        for k in ["rewards", "obs", "obs_"]:
+            assert (
+                k in batch_name_map
+            ), "PPO needs these names defined ['rewards','obs','obs_'] "
+        if discrete_action_dims is not None:
+            assert (
+                "discrete_actions" in batch_name_map
+            ), 'discrete actions is not None but "discrete_actions" does not appear in batch_name_map'
+        if continuous_action_dim > 0:
+            assert (
+                "continuous_actions" in batch_name_map
+            ), 'continuous actions is not None but "continuous_actions" does not appear in batch_name_map'
         self.name = name
         self.encoder = encoder
         self.action_clamp_type = action_clamp_type
@@ -531,7 +552,8 @@ class PG(nn.Module, Agent):
         ), "Batch needs attribute 'obs' for PG stabalized get_probs_and_entropy to work"
 
         continuous_means, continuous_log_std_logits, discrete_logits = self.actor(
-            x=batch.obs[agent_num], action_mask=bm  # type:ignore
+            x=batch.__getattribute__(self.batch_name_map["obs"])[agent_num],
+            action_mask=bm,  # type:ignore
         )
         old_disc_log_probs = 0
         old_disc_entropy = 0
@@ -541,14 +563,19 @@ class PG(nn.Module, Agent):
         if self.discrete_action_dims is not None and len(self.discrete_action_dims) > 0:
             assert (
                 hasattr(batch, "discrete_actions")
-                and batch.__getattribute__("discrete_actions") is not None
+                and batch.__getattribute__(self.batch_name_map["discrete_actions"])
+                is not None
             ), "Batch does not have attribute 'discrete_actions' but model has discrete_action_dims"
             old_disc_log_probs = []
             old_disc_entropy = 0
             for head in range(len(self.discrete_action_dims)):
                 odlp, ode = self._get_disc_log_probs_entropy(
                     logits=discrete_logits[head],
-                    actions=batch.discrete_actions[agent_num][:, head],  # type:ignore
+                    actions=batch.__getattribute__(
+                        self.batch_name_map["discrete_actions"]
+                    )[agent_num][
+                        :, head
+                    ],  # type:ignore
                 )
                 old_disc_log_probs.append(odlp)
                 old_disc_entropy += ode
@@ -560,7 +587,11 @@ class PG(nn.Module, Agent):
             ), "Batch does not have attribute 'continuous_actions' but model has discrete_action_dims"
             old_cont_log_probs, old_cont_entropy = self._get_cont_log_probs_entropy(
                 logits=continuous_means,
-                actions=batch.continuous_actions[agent_num],  # type:ignore
+                actions=batch.__getattribute__(
+                    self.batch_name_map["continuous_actions"]
+                )[
+                    agent_num
+                ],  # type:ignore
             )
         return (
             old_disc_log_probs,
@@ -589,18 +620,47 @@ class PG(nn.Module, Agent):
     ):
         if self.eval_mode:
             return 0, 0
-        # print(f"Doing PPO learn for agent {agent_num}")
-        # Update the critic with Bellman Equation
-        # Monte Carlo Estimate of returns
         if debug:
-            print(f"Starting Reinforcement Learn for agent {agent_num}")
-        # # G = G / 100
+            print(f"Starting PG Reinforcement Learn for agent {agent_num}")
         with torch.no_grad():
+            assert isinstance(
+                batch.terminated, torch.Tensor
+            ), "need to send batch to torch first"
+            rewards = batch.__getattribute__(self.batch_name_map["rewards"])
+            last_val = self.expected_V(
+                batch.__getattribute__(self.batch_name_map["obs_"])[agent_num, -1], None
+            )
             if self.advantage_type == "gv":
-                G = self._G(batch, agent_num)
-                advantages = G - self.critic(batch.obs[agent_num])
+                G = FlexibleBuffer.G(
+                    rewards,
+                    batch.terminated,
+                    last_value=last_val,
+                    gamma=self.gamma,
+                )
+                advantages = G - self.critic(
+                    batch.__getattribute__(self.batch_name_map["rewards"])[agent_num]
+                )
             elif self.advantage_type == "gae":
-                G, advantages = self._gae(batch, agent_num)
+                values = 0
+                if "values" in self.batch_name_map.keys():
+                    values = batch.__getattribute__(self.batch_name_map["values"])[
+                        agent_num
+                    ]
+                elif hasattr(batch, "values"):
+                    values = batch.__getattribute__("values")[agent_num]
+                else:
+                    values = self.expected_V(
+                        batch.__getattribute__(self.batch_name_map["obs"])
+                    )
+                G, advantages = FlexibleBuffer.GAE(
+                    rewards,
+                    values,
+                    batch.terminated,
+                    last_val,
+                    self.gamma,
+                    self.gae_lambda,
+                )
+            # TODO below here
             elif self.advantage_type == "a2c":
                 G, advantages = self._td(batch, agent_num)
             elif self.advantage_type == "constant":
