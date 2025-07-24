@@ -540,7 +540,7 @@ class StochasticActor(nn.Module):
 
         assert not (
             continuous_log_std_logits is None and log_con
-        ), "You can't get log probs from just a mean, log stds was none"
+        ), f"clstdl: {continuous_log_std_logits}, log_con: {log_con} You can't get log probs from just a mean, log stds was none"
 
         if self.continuous_action_dim > 0:
             if continuous_log_std_logits is None:
@@ -549,8 +549,8 @@ class StochasticActor(nn.Module):
                 # if full do it this way
                 # If log_std is shape (m, 1), expand to (m, n) to match means
                 log_std = continuous_log_std_logits
-                if log_std.shape[1] == 1 and continuous_means.shape[1] > 1:
-                    log_std = log_std.expand(-1, continuous_means.shape[1])
+                # if log_std.shape[1] == 1 and continuous_means.shape[1] > 1:
+                log_std = log_std.expand_as(continuous_means)
                 c_dist = torch.distributions.Normal(
                     continuous_means,
                     torch.exp(log_std),
@@ -578,7 +578,7 @@ class StochasticActor(nn.Module):
                             - continuous_actions
                             - F.softplus(-2 * continuous_actions)
                         )
-                    ).sum(axis=1)
+                    ).sum(axis=-1)
 
             elif self.clamp_type == "clamp":
                 continuous_actions = torch.clamp(
@@ -602,23 +602,39 @@ class StochasticActor(nn.Module):
                     discrete_actions.append(probs)
             else:
                 if len(discrete_logits[0].shape) == 1:
-                    discrete_actions = torch.zeros(len(self.discrete_action_dims))
-                    if log_disc:
-                        discrete_log_probs = torch.zeros(len(self.discrete_action_dims))
-                else:
                     discrete_actions = torch.zeros(
-                        discrete_logits[0].shape[0], len(self.discrete_action_dims)
+                        len(self.discrete_action_dims), device=self.device
                     )
                     if log_disc:
                         discrete_log_probs = torch.zeros(
-                            discrete_logits[0].shape[0], len(self.discrete_action_dims)
+                            len(self.discrete_action_dims), device=self.device
+                        )
+                else:
+                    discrete_actions = torch.zeros(
+                        discrete_logits[0].shape[0],
+                        len(self.discrete_action_dims),
+                        device=self.device,
+                    )
+                    if log_disc:
+                        discrete_log_probs = torch.zeros(
+                            discrete_logits[0].shape[0],
+                            len(self.discrete_action_dims),
+                            device=self.device,
                         )
                 for i, logits in enumerate(discrete_logits):
                     if len(discrete_logits[0].shape) == 1:
                         d_dist = torch.distributions.Categorical(logits=logits)
                         discrete_actions[i] = d_dist.sample()
                         if log_disc and discrete_log_probs is not None:
-                            discrete_log_probs[i] = d_dist.log_prob(discrete_actions[i])
+                            try:
+                                discrete_log_probs[i] = d_dist.log_prob(
+                                    discrete_actions[i]
+                                )
+                            except Exception as e:
+                                print(discrete_actions[i])
+                                print(logits)
+                                print("hmmmm")
+                                raise e
                     else:
                         d_dist = torch.distributions.Categorical(logits=logits)
                         discrete_actions[:, i] = d_dist.sample()

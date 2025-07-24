@@ -51,8 +51,8 @@ class PG(nn.Module, Agent):
             "rewards": "global_rewards",
             "obs": "obs",
             "obs_": "obs_",
-            "continuous_log_probs":"continuous_log_probs",
-            "discrete_log_probs":"discrete_log_probs",
+            "continuous_log_probs": "continuous_log_probs",
+            "discrete_log_probs": "discrete_log_probs",
         },
     ):
         super(PG, self).__init__()
@@ -99,11 +99,13 @@ class PG(nn.Module, Agent):
             ), "PPO needs these names defined ['rewards','obs','obs_'] "
         if discrete_action_dims is not None:
             assert (
-                "discrete_actions" in batch_name_map and "discrete_log_probs" in batch_name_map
+                "discrete_actions" in batch_name_map
+                and "discrete_log_probs" in batch_name_map
             ), 'discrete actions is not None but "discrete_actions" or "discrete_log_probs" does not appear in batch_name_map'
         if continuous_action_dim > 0:
             assert (
-                "continuous_actions" in batch_name_map and "continuous_log_probs" in batch_name_map
+                "continuous_actions" in batch_name_map
+                and "continuous_log_probs" in batch_name_map
             ), 'continuous actions is not None but "continuous_actions" or "continuous_log_probs" does not appear in batch_name_map'
         self.name = name
         self.encoder = encoder
@@ -181,7 +183,7 @@ class PG(nn.Module, Agent):
             gumbel_tau=0,
             action_head_hidden_dims=action_head_hidden_dims,
             std_type=st,
-        )
+        ).to(self.device)
 
         self.critic = ValueS(
             obs_dim=self.obs_dim,
@@ -189,19 +191,18 @@ class PG(nn.Module, Agent):
             device=self.device,
             orthogonal_init=self.orthogonal,
             activation=self.activation,
-        )
+        ).to(self.device)
         self.actor_logstd = None
         self.optimizer: torch.optim.Adam
         if self.std_type == "stateless":
             self.actor_logstd = nn.Parameter(
-                torch.zeros(1, self.continuous_action_dim), requires_grad=True
-            ).to(self.device)
+                torch.zeros(self.continuous_action_dim), requires_grad=True
+            ).to(
+                self.device
+            )  # TODO: Check this for expand as
             self.actor_logstd.retain_grad()
-            self.optimizer = torch.optim.Adam(
-                list(self.parameters()) + [self.actor_logstd], lr=self.lr
-            )
-        else:
-            self.optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
+
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
 
     def _to_numpy(self, x):
         if x is None:
@@ -244,29 +245,42 @@ class PG(nn.Module, Agent):
 
         with torch.no_grad():
             continuous_logits, continuous_log_std_logits, discrete_action_logits = (
-                self.actor(
-                    x=observations, action_mask=action_mask, gumbel=False, debug=debug
-                )
+                self.actor(x=observations, action_mask=action_mask, debug=debug)
             )
+            if continuous_log_std_logits is None and self.continuous_action_dim > 0:
+                assert (
+                    self.std_type == "stateless"
+                ), "Log std logits should only be none if we don't want the actor producing them aka stateless"
+                continuous_log_std_logits = self.actor_logstd
             if debug:
                 print(
                     f"  After actor: clog {continuous_logits}, dlog{discrete_action_logits}"
                 )
 
-            (
-                discrete_actions,
-                continuous_actions,
-                discrete_log_probs,
-                continuous_log_probs,
-            ) = self.actor.action_from_logits(
-                continuous_logits,
-                continuous_log_std_logits,
-                discrete_action_logits,
-                False,
-                True,
-                True,
-            )
-
+            try:
+                (
+                    discrete_actions,
+                    continuous_actions,
+                    discrete_log_probs,
+                    continuous_log_probs,
+                ) = self.actor.action_from_logits(
+                    continuous_logits,
+                    continuous_log_std_logits,
+                    discrete_action_logits,
+                    False,
+                    self.continuous_action_dim > 0,
+                    self.discrete_action_dims is not None,
+                )
+            except Exception as e:
+                if continuous_logits is not None:
+                    print(f"clogit train actions: {continuous_logits}")
+                    print(f"clogstd train actions: {continuous_log_std_logits}")
+                if discrete_action_logits is not None:
+                    print(f"dlogit train actions: {discrete_action_logits}")
+                print(self.actor)
+                print(self.actor.device)
+                print(e)
+                raise (e)
         return (
             self._to_numpy(discrete_actions),
             self._to_numpy(continuous_actions),
@@ -279,9 +293,7 @@ class PG(nn.Module, Agent):
     def ego_actions(self, observations, action_mask=None):
         with torch.no_grad():
             continuous_logits, continuous_log_std_logits, discrete_action_logits = (
-                self.actor(
-                    x=observations, action_mask=action_mask, gumbel=False, debug=False
-                )
+                self.actor(x=observations, action_mask=action_mask, debug=False)
             )
             # TODO: Make it so that action_from_logits has ego version
             (
@@ -369,7 +381,9 @@ class PG(nn.Module, Agent):
                 continuous_actions, self.min_actions, self.max_actions
             )
 
-        loss = -dist.log_prob(continuous_actions).sum(axis=-1).mean()
+        loss = (
+            -dist.log_prob(continuous_actions).sum(axis=-1).mean()
+        )  # TODO: dist.entropy() to stop it from overfitting
         return loss
 
     def _continuous_naive_immitation_loss(
@@ -472,7 +486,7 @@ class PG(nn.Module, Agent):
         debug=False,
     ):
         continuous_mean_logits, continuous_log_std_logits, discrete_logits = self.actor(
-            x=observations, action_mask=action_mask, gumbel=False, debug=False
+            x=observations, action_mask=action_mask, debug=False
         )
         continuous_immitation_loss = 0
         discrete_immitation_loss = 0
@@ -594,7 +608,7 @@ class PG(nn.Module, Agent):
                 )[
                     agent_num
                 ],  # type:ignore
-                lstd_logits=continuous_log_std_logits
+                lstd_logits=continuous_log_std_logits,
             )
         return (
             old_disc_log_probs,
@@ -613,21 +627,23 @@ class PG(nn.Module, Agent):
         total_norm = total_norm ** (1.0 / 2)
         print(total_norm)
 
-    def _critic_loss(self, batch:FlexiBatch, indices, G, agent_num = 0, debug=False) -> torch.Tensor:
-        V_current = self.critic(batch.__getattribute__(self.batch_name_map['obs'])[agent_num, indices])
+    def _critic_loss(
+        self, batch: FlexiBatch, indices, G, agent_num=0, debug=False
+    ) -> torch.Tensor:
+        V_current = self.critic(
+            batch.__getattribute__(self.batch_name_map["obs"])[agent_num, indices]
+        )
         if debug:
-            print(
-                f"    V_current: {V_current.shape}, G[indices] {G[indices].shape}"
-            )
+            print(f"    V_current: {V_current.shape}, G[indices] {G[indices].shape}")
             input()
         critic_loss = 0.5 * ((V_current - G[indices]) ** 2).mean()
         return critic_loss
-    
-    def _calculate_advantages(self, batch:FlexiBatch, agent_num = 0, debug=False):
+
+    def _calculate_advantages(self, batch: FlexiBatch, agent_num=0, debug=False):
         assert isinstance(
             batch.terminated, torch.Tensor
         ), "need to send batch to torch first"
-        
+
         values = None
         rewards = batch.__getattribute__(self.batch_name_map["rewards"])
         last_val = self.expected_V(
@@ -669,9 +685,7 @@ class PG(nn.Module, Agent):
             elif hasattr(batch, "values"):
                 values = batch.__getattribute__("values")[agent_num]
             else:
-                values = self.critic(
-                    batch.__getattribute__(self.batch_name_map["obs"])
-                )
+                values = self.critic(batch.__getattribute__(self.batch_name_map["obs"]))
 
             if self.advantage_type == "gae":
                 G, advantages = FlexibleBuffer.GAE(
@@ -694,16 +708,20 @@ class PG(nn.Module, Agent):
             else:
                 raise ValueError("Invalid advantage type")
         if debug:
-                print(f"  batch rewards: {batch.__getattribute__(self.batch_name_map['rewards'])}")
-                print(f"  raw critic: {self.critic(
-                        batch.__getattribute__(self.batch_name_map['obs'])
-                    )}")
-                print(f"  Advantages: {advantages}")
-                print(f"  G: {G}")
+            print(
+                f"  batch rewards: {batch.__getattribute__(self.batch_name_map['rewards'])}"
+            )
+            print(
+                f"  raw critic: {self.critic(batch.__getattribute__(self.batch_name_map['obs']))}"
+            )
+            print(f"  Advantages: {advantages}")
+            print(f"  G: {G}")
         return G, advantages, values
 
-    def _continuous_actor_loss(self, action_means, action_log_std, old_log_probs, advantages, actions):
-        
+    def _continuous_actor_loss(
+        self, action_means, action_log_std, old_log_probs, advantages, actions
+    ):
+
         cont_log_probs, cont_entropy = self._get_cont_log_probs_entropy(
             logits=action_means,
             actions=actions,
@@ -712,7 +730,7 @@ class PG(nn.Module, Agent):
         if self.ppo_clip > 0:
             logratio = (
                 cont_log_probs
-                - old_log_probs#batch.continuous_log_probs[agent_num, indices]
+                - old_log_probs  # batch.continuous_log_probs[agent_num, indices]
             )
             ratio = logratio.exp()
             pg_loss1 = advantages * ratio
@@ -724,29 +742,25 @@ class PG(nn.Module, Agent):
             continuous_policy_gradient = cont_log_probs * advantages
         actor_loss = (
             -self.policy_loss * continuous_policy_gradient.mean()
-            -self.entropy_loss * cont_entropy
+            - self.entropy_loss * cont_entropy
         )
         return actor_loss
-    
+
     def _discrete_actor_loss(self, actions, log_probs, logits, advantages, debug=False):
         actor_loss = torch.zeros(1)
         for head in range(actions.shape[-1]):
             if debug:
                 print(f"    Discrete head: {head}")
                 print(f"    disc_probs: {log_probs[head]}")
-                print(
-                    f"    batch.discrete_actions: {actions}"
-                )
+                print(f"    batch.discrete_actions: {actions}")
             dist = Categorical(logits=logits)
             entropy = dist.entropy().mean()
-            selected_log_probs = dist.log_prob(
-                actions[:,head]
-            )
+            selected_log_probs = dist.log_prob(actions[:, head])
 
             if self.ppo_clip > 0:
                 logratio = (
                     selected_log_probs
-                    - log_probs#batch.discrete_log_probs[agent_num, indices, head]
+                    - log_probs  # batch.discrete_log_probs[agent_num, indices, head]
                 )
                 ratio = logratio.exp()
                 pg_loss1 = advantages.squeeze(-1) * ratio
@@ -755,9 +769,7 @@ class PG(nn.Module, Agent):
                 )
                 discrete_policy_gradient = torch.min(pg_loss1, pg_loss2)
             else:
-                discrete_policy_gradient = (
-                    selected_log_probs * advantages.squeeze(-1)
-                )
+                discrete_policy_gradient = selected_log_probs * advantages.squeeze(-1)
 
             actor_loss += (
                 -self.policy_loss * discrete_policy_gradient.mean()
@@ -778,8 +790,10 @@ class PG(nn.Module, Agent):
             print(f"Starting PG Reinforcement Learn for agent {agent_num}")
         with torch.no_grad():
             G, advantages, values = self._calculate_advantages(batch, agent_num, debug)
-        
-        assert isinstance(advantages,torch.Tensor),"Advantages has to be a tensor but it isn't, maybe batch was not called with as_torch=True?"
+
+        assert isinstance(
+            advantages, torch.Tensor
+        ), "Advantages has to be a tensor but it isn't, maybe batch was not called with as_torch=True?"
         if self.norm_advantages:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         avg_actor_loss = 0
@@ -790,7 +804,7 @@ class PG(nn.Module, Agent):
             action_mask = batch.action_mask[agent_num]  # TODO: Unit test this later
             if action_mask is not None:
                 print("Action mask Not implemented yet")
-        
+
         assert isinstance(
             batch.terminated, torch.Tensor
         ), "need to send batch to torch first"
@@ -820,24 +834,44 @@ class PG(nn.Module, Agent):
                         f"    Mini batch: {bstart}:{bend}, Indices: {indices}, {len(indices)}"
                     )
 
-                critic_loss = self._critic_loss(batch,indices,G,agent_num,debug)
+                critic_loss = self._critic_loss(batch, indices, G, agent_num, debug)
                 actor_loss = torch.zeros(1)
                 # print(torch.abs(V_current - G[indices]).mean())
                 if not critic_only:
                     mb_adv = advantages[torch.from_numpy(indices).to(self.device)]
-                    continuous_means, continuous_log_std_logits, discrete_logits = self.actor(
-                        x=obs,
+                    continuous_means, continuous_log_std_logits, discrete_logits = (
+                        self.actor(
+                            x=obs,
+                        )
                     )
                     if self.continuous_action_dim > 0:
-                        clp = batch.__getattribute__(self.batch_name_map['continuous_log_probs'])[agent_num,indices]
-                        cact = batch.__getattribute__(self.batch_name_map['continuous_actions'])[agent_num,indices]
-                        actor_loss += self._continuous_actor_loss(continuous_means,continuous_log_std_logits,clp,mb_adv,cact)
+                        clp = batch.__getattribute__(
+                            self.batch_name_map["continuous_log_probs"]
+                        )[agent_num, indices]
+                        cact = batch.__getattribute__(
+                            self.batch_name_map["continuous_actions"]
+                        )[agent_num, indices]
+                        actor_loss += self._continuous_actor_loss(
+                            continuous_means,
+                            continuous_log_std_logits,
+                            clp,
+                            mb_adv,
+                            cact,
+                        )
                     if self.discrete_action_dims is not None:
                         dlp = []
-                        dact = batch.__getattribute__(self.batch_name_map['continuous_actions'])[agent_num,indices]
+                        dact = batch.__getattribute__(
+                            self.batch_name_map["continuous_actions"]
+                        )[agent_num, indices]
                         for head in range(len(self.discrete_action_dims)):
-                            dlp.append(batch.__getattribute__(self.batch_name_map['discrete_log_probs'])[head][agent_num,indices])
-                        actor_loss += self._discrete_actor_loss(dact,dlp,discrete_logits,advantages,debug)
+                            dlp.append(
+                                batch.__getattribute__(
+                                    self.batch_name_map["discrete_log_probs"]
+                                )[head][agent_num, indices]
+                            )
+                        actor_loss += self._discrete_actor_loss(
+                            dact, dlp, discrete_logits, advantages, debug
+                        )
 
                     # print("actor")
                     # self.optimizer.zero_grad()
@@ -863,8 +897,8 @@ class PG(nn.Module, Agent):
 
                 self.optimizer.step()
 
-                avg_actor_loss += actor_loss.to('cpu').item()
-                avg_critic_loss += critic_loss.to('cpu').item()
+                avg_actor_loss += actor_loss.to("cpu").item()
+                avg_critic_loss += critic_loss.to("cpu").item()
             avg_actor_loss /= nbatch
             avg_critic_loss /= nbatch
             # print(f"actor_loss: {actor_loss.item()}")
@@ -923,6 +957,8 @@ class PG(nn.Module, Agent):
 
 
 if __name__ == "__main__":
+    import random
+
     obs_dim = 3
     continuous_action_dim = 2
     discrete_action_dims = [4, 5]
@@ -951,7 +987,6 @@ if __name__ == "__main__":
         axis=-1,
     )
 
-    import random
     mem_buff = FlexibleBuffer(
         num_steps=64,
         n_agents=1,
@@ -975,7 +1010,7 @@ if __name__ == "__main__":
     for i in range(obs_batch.shape[0]):
         c_acs = np.arange(0, continuous_action_dim, dtype=np.float32)
         mem_buff.save_transition(
-            terminated=bool(random.randint(0,1)),
+            terminated=bool(random.randint(0, 1)),
             registered_vals={
                 "global_rewards": i * 1.01,
                 "obs": np.array([obs_batch[i]]),
@@ -994,7 +1029,7 @@ if __name__ == "__main__":
                 "continuous_actions": [c_acs.copy() + i / obs_batch.shape[0]],
             },
         )
-    mem = mem_buff.sample_transitions(batch_size=18,as_torch=True,device='cuda')
+    mem = mem_buff.sample_transitions(batch_size=14, as_torch=True, device="cuda")
 
     d_acts, c_acts, d_log, c_log, _ = agent.train_actions(obs, step=True, debug=True)
     print(f"Training actions: c: {c_acts}, d: {d_acts}, d_log: {d_log}, c_log: {c_log}")
