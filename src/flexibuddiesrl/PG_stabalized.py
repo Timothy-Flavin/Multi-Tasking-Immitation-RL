@@ -638,10 +638,27 @@ class PG(nn.Module, Agent):
                     gamma=self.gamma,
                 )
                 advantages = G - self.critic(
-                    batch.__getattribute__(self.batch_name_map["rewards"])[agent_num]
+                    batch.__getattribute__(self.batch_name_map["obs"])[agent_num]
                 )
-            elif self.advantage_type == "gae":
-                values = 0
+            elif self.advantage_type == "constant":
+                G = FlexibleBuffer.G(
+                    rewards,
+                    batch.terminated,
+                    last_value=last_val,
+                    gamma=self.gamma,
+                )
+                self.g_mean = 0.9 * self.g_mean + 0.1 * G.mean()
+                advantages = G - self.g_mean
+            elif self.advantage_type == "g":
+                G = FlexibleBuffer.G(
+                    rewards,
+                    batch.terminated,
+                    last_value=last_val,
+                    gamma=self.gamma,
+                )
+                advantages = G
+            else:
+                values = torch.zeros(1)
                 if "values" in self.batch_name_map.keys():
                     values = batch.__getattribute__(self.batch_name_map["values"])[
                         agent_num
@@ -649,35 +666,37 @@ class PG(nn.Module, Agent):
                 elif hasattr(batch, "values"):
                     values = batch.__getattribute__("values")[agent_num]
                 else:
-                    values = self.expected_V(
+                    values = self.critic(
                         batch.__getattribute__(self.batch_name_map["obs"])
                     )
-                G, advantages = FlexibleBuffer.GAE(
-                    rewards,
-                    values,
-                    batch.terminated,
-                    last_val,
-                    self.gamma,
-                    self.gae_lambda,
-                )
-            # TODO below here
-            elif self.advantage_type == "a2c":
-                G, advantages = self._td(batch, agent_num)
-            elif self.advantage_type == "constant":
-                G = self._G(batch, agent_num)
-                self.g_mean = 0.9 * self.g_mean + 0.1 * G.mean()
-                advantages = G - self.g_mean
-            elif self.advantage_type == "g":
-                G = self._G(batch, agent_num)
-                advantages = G
 
-            else:
-                raise ValueError("Invalid advantage type")
+                if self.advantage_type == "gae":
+                    G, advantages = FlexibleBuffer.GAE(
+                        rewards,
+                        values,
+                        batch.terminated,
+                        last_val,
+                        self.gamma,
+                        self.gae_lambda,
+                    )
+                elif self.advantage_type == "a2c":
+                    G, advantages = FlexibleBuffer.GAE(
+                        rewards,
+                        values,
+                        batch.terminated,
+                        last_val,
+                        self.gamma,
+                        0.0,
+                    )
+                else:
+                    raise ValueError("Invalid advantage type")
 
                 # print(advantages.squeeze(-1))
             if debug:
-                print(f"  batch rewards: {batch.global_rewards}")
-                print(f"  raw critic: {self.critic(batch.obs[agent_num])}")
+                print(f"  batch rewards: {batch.__getattribute__(self.batch_name_map['rewards'])}")
+                print(f"  raw critic: {self.critic(
+                        batch.__getattribute__(self.batch_name_map['obs'])
+                    )}")
                 print(f"  Advantages: {advantages}")
                 print(f"  G: {G}")
         if self.norm_advantages:
