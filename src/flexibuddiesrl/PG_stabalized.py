@@ -434,6 +434,7 @@ class PG(nn.Module, Agent):
             processed_mean = torch.tanh(continuous_mean_logits)
             # Denormalize from [-1, 1] to the environment's action space [min, max]
             assert isinstance(self.min_actions, torch.Tensor)
+            assert isinstance(self.max_actions, torch.Tensor)
 
             final_mean = self.min_actions + 0.5 * (
                 self.max_actions - self.min_actions
@@ -787,6 +788,8 @@ class PG(nn.Module, Agent):
         action_mask = None
         if batch.action_mask is not None:
             action_mask = batch.action_mask[agent_num]  # TODO: Unit test this later
+            if action_mask is not None:
+                print("Action mask Not implemented yet")
         
         assert isinstance(
             batch.terminated, torch.Tensor
@@ -922,12 +925,13 @@ class PG(nn.Module, Agent):
 if __name__ == "__main__":
     obs_dim = 3
     continuous_action_dim = 2
+    discrete_action_dims = [4, 5]
     agent = PG(
         obs_dim=obs_dim,
         continuous_action_dim=continuous_action_dim,
         max_actions=np.array([1, 2]),
         min_actions=np.array([0, 0]),
-        discrete_action_dims=[4, 5],
+        discrete_action_dims=discrete_action_dims,
         hidden_dims=[32, 32],
         device="cuda:0",
         lr=0.001,
@@ -947,15 +951,50 @@ if __name__ == "__main__":
         axis=-1,
     )
 
-    mem = FlexiBatch(
-        obs=np.array([obs_batch]),
-        obs_=np.array([obs_batch_]),
-        continuous_actions=np.array([np.random.rand(14, 2).astype(np.float32)]),
-        discrete_actions=np.array([dacs]),
-        global_rewards=np.random.rand(14).astype(np.float32),
-        terminated=np.random.randint(0, 2, size=14),
+    import random
+    mem_buff = FlexibleBuffer(
+        num_steps=64,
+        n_agents=1,
+        discrete_action_cardinalities=discrete_action_dims,
+        track_action_mask=False,
+        path="./test_buffer",
+        name="spec_buffer",
+        memory_weights=False,
+        global_registered_vars={
+            "global_rewards": (None, np.float32),
+        },
+        individual_registered_vars={
+            "obs": ([obs_dim], np.float32),
+            "obs_": ([obs_dim], np.float32),
+            "discrete_log_probs": ([len(discrete_action_dims)], np.float32),
+            "continuous_log_probs": ([continuous_action_dim], np.float32),
+            "discrete_actions": ([len(discrete_action_dims)], np.int64),
+            "continuous_actions": ([continuous_action_dim], np.float32),
+        },
     )
-    mem.to_torch("cuda:0")
+    for i in range(obs_batch.shape[0]):
+        c_acs = np.arange(0, continuous_action_dim, dtype=np.float32)
+        mem_buff.save_transition(
+            terminated=bool(random.randint(0,1)),
+            registered_vals={
+                "global_rewards": i * 1.01,
+                "obs": np.array([obs_batch[i]]),
+                "obs_": np.array([obs_batch_[i]]),
+                "discrete_log_probs": np.zeros(
+                    len(discrete_action_dims), dtype=np.float32
+                )
+                - i / obs_batch.shape[0]
+                - 0.1,
+                "continuous_log_probs": np.zeros(
+                    continuous_action_dim, dtype=np.float32
+                )
+                - i / obs_batch.shape[0] / 2
+                - 0.1,
+                "discrete_actions": [dacs[i]],
+                "continuous_actions": [c_acs.copy() + i / obs_batch.shape[0]],
+            },
+        )
+    mem = mem_buff.sample_transitions(batch_size=18,as_torch=True,device='cuda')
 
     d_acts, c_acts, d_log, c_log, _ = agent.train_actions(obs, step=True, debug=True)
     print(f"Training actions: c: {c_acts}, d: {d_acts}, d_log: {d_log}, c_log: {c_log}")
