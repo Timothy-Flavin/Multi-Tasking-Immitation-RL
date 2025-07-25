@@ -500,9 +500,9 @@ class StochasticActor(nn.Module):
 
     def action_from_logits(
         self,
-        continuous_means: torch.Tensor,
-        continuous_log_std_logits: torch.Tensor,
-        discrete_logits: list[torch.Tensor],
+        continuous_means: torch.Tensor | None,
+        continuous_log_std_logits: torch.Tensor | None,
+        discrete_logits: list[torch.Tensor] | None,
         gumble: bool = False,
         log_con: bool = False,
         log_disc: bool = False,
@@ -543,6 +543,9 @@ class StochasticActor(nn.Module):
         ), f"clstdl: {continuous_log_std_logits}, log_con: {log_con} You can't get log probs from just a mean, log stds was none"
 
         if self.continuous_action_dim > 0:
+            assert (
+                continuous_means is not None
+            ), "Cant have continuous dims with no logits"
             if continuous_log_std_logits is None:
                 continuous_activations = continuous_means
             else:
@@ -593,6 +596,9 @@ class StochasticActor(nn.Module):
                     )
 
         if self.discrete_action_dims is not None and len(self.discrete_action_dims) > 0:
+            assert (
+                discrete_logits is not None
+            ), "Cant have discrete action dim and no discrete actions"
             if gumble:
                 discrete_actions: list[torch.Tensor] | torch.Tensor | None = []
                 for i, logits in enumerate(discrete_logits):

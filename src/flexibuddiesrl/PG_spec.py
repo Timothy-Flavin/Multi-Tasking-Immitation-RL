@@ -10,15 +10,15 @@ import random
 
 def PG_test():
     obs_dim = 3
-    continuous_action_dim = 2
-    discrete_action_dims = [4, 5]
+    continuous_action_dim = 5
+    discrete_action_dims = [3, 5]
     obs = np.random.rand(obs_dim).astype(np.float32)
     obs_ = np.random.rand(obs_dim).astype(np.float32)
     obs_batch = np.random.rand(14, obs_dim).astype(np.float32)
     obs_batch_ = obs_batch + 0.1
 
     dacs = np.stack(
-        (np.random.randint(0, 4, size=(14)), np.random.randint(0, 5, size=(14))),
+        (np.random.randint(0, 3, size=(14)), np.random.randint(0, 4, size=(14))),
         axis=-1,
     )
 
@@ -43,7 +43,9 @@ def PG_test():
         },
     )
     for i in range(obs_batch.shape[0]):
-        c_acs = np.arange(0, continuous_action_dim, dtype=np.float32)
+        c_acs = np.array(
+            [-0.5, 0.2, 1.8, 1.9, -2.4], dtype=np.float32
+        )  # np.arange(0, continuous_action_dim, dtype=np.float32)
         mem_buff.save_transition(
             terminated=bool(random.randint(0, 1)),
             registered_vals={
@@ -61,15 +63,15 @@ def PG_test():
                 - i / obs_batch.shape[0] / 2
                 - 0.1,
                 "discrete_actions": [dacs[i]],
-                "continuous_actions": [c_acs.copy() + i / obs_batch.shape[0]],
+                "continuous_actions": [c_acs.copy() / (i + 1)],
             },
         )
     mem = mem_buff.sample_transitions(batch_size=14, as_torch=True, device="cuda")
 
     param_grid = {
-        "continuous_action_dim": [0, 5],
+        "continuous_action_dim": [5, 0],
         "discrete_action_dims": [None, [3, 4]],
-        "device": ["cpu", "cuda"],
+        "device": ["cuda", "cpu"],
         "entropy_loss": [0, 0.05],
         "ppo_clip": (0, 0.2),
         "value_clip": (0, 0.5),
@@ -128,17 +130,47 @@ def PG_test():
             orthogonal=h["orthogonal"],
             std_type=h["std_type"],
             clip_grad=h["clip_grad"],
+            mini_batch_size=2,
         )
         d_acts, c_acts, d_log, c_log, _ = model.train_actions(
             obs, step=True, debug=False
         )
         if (d_acts is not None and d_acts.shape[0] != 2) or (
-            c_acts is not None and c_acts.shape != 5
+            c_acts is not None and c_acts.shape[0] != 5
         ):
             print(
                 f"Training actions: c: {c_acts}, d: {d_acts}, d_log: {d_log}, c_log: {c_log}"
             )
 
+        d_acts, c_acts, d_log, c_log, _ = model.train_actions(
+            obs_batch, step=True, debug=False
+        )
+        if (d_acts is not None and (d_acts.shape[0] != 14 or d_acts.shape[1] != 2)) or (
+            c_acts is not None and (c_acts.shape[0] != 14 or c_acts.shape[1] != 5)
+        ):
+            print(
+                f"Training batch actions: c: {c_acts}, d: {d_acts}, d_log: {d_log}, c_log: {c_log}"
+            )
+        mb = mem_buff.sample_transitions(
+            batch_size=6, as_torch=True, device=h["device"]
+        )
+        try:
+            aloss, closs = model.imitation_learn(
+                mb.obs[0], mb.continuous_actions[0], mb.discrete_actions[0]
+            )
+        except Exception as e:
+            print("Couldn't immitation learn ")
+            print(
+                f"obs: {mb.obs}, ca: {mb.continuous_actions}, da: {mb.discrete_actions}"
+            )
+            print(h)
+            raise e
+
+        try:
+            aloss, closs = model.reinforcement_learn(mb, 0)
+        except Exception as e:
+            print(h)
+            raise e
     print(tot)
     # for dev in device:
     #     temp_enc = ffEncoder(12, [32, 32], device=dev)

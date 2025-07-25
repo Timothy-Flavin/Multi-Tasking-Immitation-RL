@@ -554,7 +554,16 @@ class PG(nn.Module, Agent):
         dist = torch.distributions.Normal(loc=logits, scale=torch.exp(lstd))
         if self.action_clamp_type == "tanh":
             dist = TransformedDistribution(dist, TanhTransform())
-            actions = minmaxnorm(actions, self.min_actions, self.max_actions)
+            new_actions = minmaxnorm(actions, self.min_actions, self.max_actions)
+            try:
+                log_probs = dist.log_prob(new_actions)
+                return log_probs, -log_probs.mean()
+            except Exception as e:
+                print(actions)
+                if self.action_clamp_type == "tanh":
+                    print(new_actions)
+                print(f"min: {self.min_actions}, max: {self.max_actions}")
+                raise e
         log_probs = dist.log_prob(actions)
         return log_probs, dist.entropy().mean()
 
@@ -631,7 +640,7 @@ class PG(nn.Module, Agent):
         self, batch: FlexiBatch, indices, G, agent_num=0, debug=False
     ) -> torch.Tensor:
         V_current = self.critic(
-            batch.__getattribute__(self.batch_name_map["obs"])[agent_num, indices]
+            batch.__getattribute__(self.batch_name_map["obs"])[agent_num]
         )
         if debug:
             print(f"    V_current: {V_current.shape}, G[indices] {G[indices].shape}")
@@ -677,16 +686,19 @@ class PG(nn.Module, Agent):
             )
             advantages = G
         else:
-            values = torch.zeros(1)
-            if "values" in self.batch_name_map.keys():
-                values = batch.__getattribute__(self.batch_name_map["values"])[
-                    agent_num
-                ]
-            elif hasattr(batch, "values"):
-                values = batch.__getattribute__("values")[agent_num]
-            else:
-                values = self.critic(batch.__getattribute__(self.batch_name_map["obs"]))
+            with torch.no_grad():
+                if "values" in self.batch_name_map.keys():
+                    values = batch.__getattribute__(self.batch_name_map["values"])[
+                        agent_num
+                    ]
+                elif hasattr(batch, "values"):
+                    values = batch.__getattribute__("values")[agent_num]
+                else:
+                    values = self.critic(
+                        batch.__getattribute__(self.batch_name_map["obs"])[agent_num]
+                    )
 
+            # values = values.squeeze(-1)
             if self.advantage_type == "gae":
                 G, advantages = FlexibleBuffer.GAE(
                     rewards,
@@ -747,16 +759,20 @@ class PG(nn.Module, Agent):
         return actor_loss
 
     def _discrete_actor_loss(self, actions, log_probs, logits, advantages, debug=False):
-        actor_loss = torch.zeros(1)
+        actor_loss = torch.zeros(1, device=self.device)
         for head in range(actions.shape[-1]):
             if debug:
                 print(f"    Discrete head: {head}")
                 print(f"    disc_probs: {log_probs[head]}")
                 print(f"    batch.discrete_actions: {actions}")
-            dist = Categorical(logits=logits)
+            dist = Categorical(logits=logits[head])  # TODO: th
             entropy = dist.entropy().mean()
-            selected_log_probs = dist.log_prob(actions[:, head])
-
+            try:
+                selected_log_probs = dist.log_prob(actions[:, head])
+            except Exception as e:
+                print(f"hmm failed to do log prob on actions: {actions}")
+                print(f"logit head: {logits[head]}, actions head: {actions[:,head]}")
+                raise e
             if self.ppo_clip > 0:
                 logratio = (
                     selected_log_probs
@@ -835,13 +851,15 @@ class PG(nn.Module, Agent):
                     )
 
                 critic_loss = self._critic_loss(batch, indices, G, agent_num, debug)
-                actor_loss = torch.zeros(1)
+                actor_loss = torch.zeros(1, device=self.device)
                 # print(torch.abs(V_current - G[indices]).mean())
                 if not critic_only:
                     mb_adv = advantages[torch.from_numpy(indices).to(self.device)]
                     continuous_means, continuous_log_std_logits, discrete_logits = (
                         self.actor(
-                            x=obs,
+                            x=batch.__getattribute__(self.batch_name_map["obs"])[
+                                agent_num, indices
+                            ],
                         )
                     )
                     if self.continuous_action_dim > 0:
@@ -859,18 +877,21 @@ class PG(nn.Module, Agent):
                             cact,
                         )
                     if self.discrete_action_dims is not None:
-                        dlp = []
                         dact = batch.__getattribute__(
-                            self.batch_name_map["continuous_actions"]
+                            self.batch_name_map["discrete_actions"]
                         )[agent_num, indices]
-                        for head in range(len(self.discrete_action_dims)):
-                            dlp.append(
-                                batch.__getattribute__(
-                                    self.batch_name_map["discrete_log_probs"]
-                                )[head][agent_num, indices]
-                            )
+                        # dlp = []
+                        # for head in range(len(self.discrete_action_dims)):
+                        #     dlp.append(
+                        #         batch.__getattribute__(
+                        #             self.batch_name_map["discrete_log_probs"]
+                        #         )[head][agent_num, indices]
+                        #     )
+                        dlp = batch.__getattribute__(
+                            self.batch_name_map["discrete_log_probs"]
+                        )[agent_num, indices]
                         actor_loss += self._discrete_actor_loss(
-                            dact, dlp, discrete_logits, advantages, debug
+                            dact, dlp, discrete_logits, mb_adv, debug
                         )
 
                     # print("actor")
