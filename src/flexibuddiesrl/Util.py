@@ -2,13 +2,14 @@ import torch
 import numpy as np
 
 
+# Depricate this and get rid of it
 def T(a, device="cpu", dtype=torch.float32, debug=False):
     if debug:
         print("T: ", a)
     if isinstance(a, np.ndarray):
-        return torch.from_numpy(a).to(device)
+        return torch.tensor(a, dtype=dtype).to(device)
     elif not torch.is_tensor(a):
-        return torch.from_numpy(np.array(a), dtype=dtype).to(device)
+        return torch.tensor(a, dtype=dtype).to(device)
     elif a.device != device:
         return a.to(device)
     else:

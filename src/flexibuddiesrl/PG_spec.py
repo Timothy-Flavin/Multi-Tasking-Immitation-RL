@@ -156,16 +156,17 @@ def PG_test():
         )
         try:
             aloss, closs = model.imitation_learn(
-                mb.obs[0], mb.continuous_actions[0], mb.discrete_actions[0]
+                mb.__getattribute__("obs")[0],
+                mb.__getattribute__("continuous_actions")[0],
+                mb.__getattribute__("discrete_actions")[0],
             )
         except Exception as e:
             print("Couldn't immitation learn ")
             print(
-                f"obs: {mb.obs}, ca: {mb.continuous_actions}, da: {mb.discrete_actions}"
+                f"obs: {mb.__getattribute__('obs')}, ca: {mb.__getattribute__('continuous_actions')}, da: {mb.__getattribute__('discrete_actions')}"
             )
             print(h)
             raise e
-
         try:
             aloss, closs = model.reinforcement_learn(mb, 0)
         except Exception as e:
