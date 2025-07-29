@@ -6,24 +6,46 @@ from itertools import product
 import time
 from flexibuff import FlexibleBuffer
 import random
+import time
 
 
 def PG_test():
+    run_times = {
+        "create_model": 0.0,
+        "train_action_single": 0.0,
+        "train_action_batch": 0.0,
+        "immitation_learn": 0.0,
+        "reinforcement_learn": 0.0,
+    }
+    rl_times = {
+        "advantage": 0.0,
+        "critic_loss": 0.0,
+        "act": 0.0,
+        "dloss": 0.0,
+        "closs": 0.0,
+        "backward": 0.0,
+        "tot": 0.0,
+    }
     obs_dim = 3
     continuous_action_dim = 5
     discrete_action_dims = [3, 5]
+    batch_size = 16
+    mini_batch_size = 4
     obs = np.random.rand(obs_dim).astype(np.float32)
     obs_ = np.random.rand(obs_dim).astype(np.float32)
-    obs_batch = np.random.rand(14, obs_dim).astype(np.float32)
+    obs_batch = np.random.rand(batch_size, obs_dim).astype(np.float32)
     obs_batch_ = obs_batch + 0.1
 
     dacs = np.stack(
-        (np.random.randint(0, 3, size=(14)), np.random.randint(0, 4, size=(14))),
+        (
+            np.random.randint(0, 3, size=(batch_size)),
+            np.random.randint(0, 4, size=(batch_size)),
+        ),
         axis=-1,
     )
 
     mem_buff = FlexibleBuffer(
-        num_steps=64,
+        num_steps=256,
         n_agents=1,
         discrete_action_cardinalities=discrete_action_dims,
         track_action_mask=False,
@@ -66,22 +88,26 @@ def PG_test():
                 "continuous_actions": [c_acs.copy() / (i + 1)],
             },
         )
-    mem = mem_buff.sample_transitions(batch_size=14, as_torch=True, device="cuda")
+    mem = mem_buff.sample_transitions(
+        batch_size=batch_size, as_torch=True, device="cuda"
+    )
 
     param_grid = {
+        "action_clamp_type": ["tanh", "clamp", None],
         "continuous_action_dim": [5, 0],
-        "discrete_action_dims": [None, [3, 4]],
-        "device": ["cuda", "cpu"],
+        "discrete_action_dims": [[3, 4], None],
+        "device": ["cpu", "cuda"],
+        "std_type": ["stateless", "diagonal", "full"],
         "entropy_loss": [0, 0.05],
         "ppo_clip": (0, 0.2),
         "value_clip": (0, 0.5),
         "norm_advantages": (False, True),
         "anneal_lr": (0, 20000),
         "orthogonal": (True, False),
-        "std_type": ["full", "diagonal", "stateless"],
         "clip_grad": (True, False),
         "eval_mode": (False, True),
-        "action_head_hidden_dims": (None, [32, 32]),
+        "action_head_hidden_dims": (None, [8, 4]),
+        "adv_type": ["gae", "gv", "a2c", "g", "constant"],
     }
 
     p_keys = param_grid.keys()
@@ -101,12 +127,29 @@ def PG_test():
             continue
         # print(h)
         t = time.time()
-        if t - current_time > 1.0:
+        if t - current_time > 5.0:
             print(
                 f"Iter: {current_iter}, time: {(t-start_time):.1f}, iter/s: {current_iter/(t-start_time):.1f}, {(current_iter/tot)*100:.2f}%"
             )
+            tot_t = 0.0
+            for k in run_times.keys():
+                tot_t += run_times[k]
+            for k in run_times.keys():
+                print(f"  {k}: {run_times[k] / tot_t *100:.2f}%")
+
+            rl_tot = 0.0
+            for k in rl_times:
+                if k != "tot":
+                    rl_tot += rl_times[k]
+            print(f"     Captured: {rl_tot/rl_times['tot'] *100:.3f}%")
+            for k in rl_times:
+                if k != "tot":
+                    print(f"     {k}: {rl_times[k] / rl_times['tot'] *100:.2f}%")
+
             current_time = t
         current_iter += 1
+
+        _s = time.time()
         model = PG(
             obs_dim=obs_dim,
             continuous_action_dim=h["continuous_action_dim"],
@@ -130,11 +173,18 @@ def PG_test():
             orthogonal=h["orthogonal"],
             std_type=h["std_type"],
             clip_grad=h["clip_grad"],
-            mini_batch_size=2,
+            mini_batch_size=mini_batch_size,
+            action_clamp_type=h["action_clamp_type"],
+            advantage_type=h["adv_type"],
         )
+        run_times["create_model"] += time.time() - _s
+
+        _s = time.time()
         d_acts, c_acts, d_log, c_log, _ = model.train_actions(
             obs, step=True, debug=False
         )
+        run_times["train_action_single"] += time.time() - _s
+
         if (d_acts is not None and d_acts.shape[0] != 2) or (
             c_acts is not None and c_acts.shape[0] != 5
         ):
@@ -142,18 +192,27 @@ def PG_test():
                 f"Training actions: c: {c_acts}, d: {d_acts}, d_log: {d_log}, c_log: {c_log}"
             )
 
+        _s = time.time()
         d_acts, c_acts, d_log, c_log, _ = model.train_actions(
             obs_batch, step=True, debug=False
         )
-        if (d_acts is not None and (d_acts.shape[0] != 14 or d_acts.shape[1] != 2)) or (
-            c_acts is not None and (c_acts.shape[0] != 14 or c_acts.shape[1] != 5)
+        run_times["train_action_batch"] += time.time() - _s
+
+        if (
+            d_acts is not None
+            and (d_acts.shape[0] != batch_size or d_acts.shape[1] != 2)
+        ) or (
+            c_acts is not None
+            and (c_acts.shape[0] != batch_size or c_acts.shape[1] != 5)
         ):
             print(
                 f"Training batch actions: c: {c_acts}, d: {d_acts}, d_log: {d_log}, c_log: {c_log}"
             )
         mb = mem_buff.sample_transitions(
-            batch_size=6, as_torch=True, device=h["device"]
+            batch_size=batch_size, as_torch=True, device=h["device"]
         )
+
+        _s = time.time()
         try:
             aloss, closs = model.imitation_learn(
                 mb.__getattribute__("obs")[0],
@@ -167,38 +226,20 @@ def PG_test():
             )
             print(h)
             raise e
+        run_times["immitation_learn"] += time.time() - _s
+
+        _s = time.time()
         try:
-            aloss, closs = model.reinforcement_learn(mb, 0)
+            aloss, closs = model.reinforcement_learn_perf(mb, 0)
         except Exception as e:
             print(h)
             raise e
+        run_times["reinforcement_learn"] += time.time() - _s
+
+        for k in rl_times:
+            rl_times[k] += model.run_times[k]
+
     print(tot)
-    # for dev in device:
-    #     temp_enc = ffEncoder(12, [32, 32], device=dev)
-    #     hidden_encoder = [[[32, 32], None], [None, temp_enc]]
-    #     for h_sizes, enc in hidden_encoder:
-    #         for con in continuous_action_dim:
-    #             for dis in discrete_action_dims:
-    #                 for eloss in entropy_loss:
-    #                     for ppc in ppo_clip:
-    #                         for vclip in value_clip:
-    #                             for n_adv in norm_advantages:
-    #                                 for lra in anneal_lr:
-    #                                     for ortho in orthogonal:
-    #                                         for stdt in std_type:
-    #                                             for clipg in clip_grad:
-    #                                                 for eval in eval_mode:
-    #                                                     for (
-    #                                                         ahd
-    #                                                     ) in action_head_hidden_dims:
-    #                                                         tot += 1
-    # print(tot)
-    # PG(
-    #     obs_dim=obs_dim,
-    #     continuous_action_dim=con,
-    #     min_actions=(np.array([-1, -1, -2, -2, -3]) if con > 0 else np.zeros(1)),
-    #     max_actions=(np.array([1, 1, 2, 2, 3]) if con > 0 else np.zeros(1)),
-    # )
 
 
 if __name__ == "__main__":
