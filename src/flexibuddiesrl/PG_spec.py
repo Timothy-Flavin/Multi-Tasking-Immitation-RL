@@ -4,7 +4,7 @@ from flexibuddiesrl.PG_stabalized import PG
 from flexibuddiesrl.Agent import ffEncoder
 from itertools import product
 import time
-from flexibuff import FlexibleBuffer
+from flexibuff import FlexibleBuffer, FlexiBatch
 import random
 import time
 
@@ -30,7 +30,7 @@ def PG_test():
     continuous_action_dim = 5
     discrete_action_dims = [3, 5]
     batch_size = 16
-    mini_batch_size = 4
+    mini_batch_size = 8
     obs = np.random.rand(obs_dim).astype(np.float32)
     obs_ = np.random.rand(obs_dim).astype(np.float32)
     obs_batch = np.random.rand(batch_size, obs_dim).astype(np.float32)
@@ -88,15 +88,12 @@ def PG_test():
                 "continuous_actions": [c_acs.copy() / (i + 1)],
             },
         )
-    mem = mem_buff.sample_transitions(
-        batch_size=batch_size, as_torch=True, device="cuda"
-    )
 
     param_grid = {
         "action_clamp_type": ["tanh", "clamp", None],
         "continuous_action_dim": [5, 0],
         "discrete_action_dims": [[3, 4], None],
-        "device": ["cpu", "cuda"],
+        "device": ["cuda", "cpu"],
         "std_type": ["stateless", "diagonal", "full"],
         "entropy_loss": [0, 0.05],
         "ppo_clip": (0, 0.2),
@@ -104,7 +101,7 @@ def PG_test():
         "norm_advantages": (False, True),
         "anneal_lr": (0, 20000),
         "orthogonal": (True, False),
-        "clip_grad": (True, False),
+        "clip_grad": (False, True),
         "eval_mode": (False, True),
         "action_head_hidden_dims": (None, [8, 4]),
         "adv_type": ["gae", "gv", "a2c", "g", "constant"],
@@ -176,6 +173,7 @@ def PG_test():
             mini_batch_size=mini_batch_size,
             action_clamp_type=h["action_clamp_type"],
             advantage_type=h["adv_type"],
+            n_epochs=1,
         )
         run_times["create_model"] += time.time() - _s
 
@@ -211,18 +209,20 @@ def PG_test():
         mb = mem_buff.sample_transitions(
             batch_size=batch_size, as_torch=True, device=h["device"]
         )
+        # print(mb)
 
         _s = time.time()
         try:
             aloss, closs = model.imitation_learn(
-                mb.__getattribute__("obs")[0],
-                mb.__getattribute__("continuous_actions")[0],
-                mb.__getattribute__("discrete_actions")[0],
+                mb.__getattr__("obs")[0],
+                mb.__getattr__("continuous_actions")[0],
+                mb.__getattr__("discrete_actions")[0],
             )
         except Exception as e:
             print("Couldn't immitation learn ")
+            print(mb.__getattr__("obs"))
             print(
-                f"obs: {mb.__getattribute__('obs')}, ca: {mb.__getattribute__('continuous_actions')}, da: {mb.__getattribute__('discrete_actions')}"
+                f"obs: {mb.__getattr__('obs')}, ca: {mb.__getattr__('continuous_actions')}, da: {mb.__getattr__('discrete_actions')}"
             )
             print(h)
             raise e
