@@ -93,7 +93,7 @@ class PG(nn.Module, Agent):
             "advantage": 0.0,
             "critic_loss": 0.0,
             "act": 0.0,
-            "aloss": 0.0,
+            "dloss": 0.0,
             "closs": 0.0,
             "backward": 0.0,
             "tot": 0.0,

@@ -7,6 +7,7 @@ import time
 from flexibuff import FlexibleBuffer, FlexiBatch
 import random
 import time
+import gymnasium as gym
 
 
 def PG_test():
@@ -240,6 +241,144 @@ def PG_test():
             rl_times[k] += model.run_times[k]
 
     print(tot)
+
+
+def PG_integration():
+
+    gym.make("CartPole-v1")
+
+    mem_buff = FlexibleBuffer(
+        num_steps=10000,
+        n_agents=1,
+        discrete_action_cardinalities=[2],
+        track_action_mask=False,
+        path="./test_buffer",
+        name="spec_buffer",
+        memory_weights=False,
+        global_registered_vars={
+            "global_rewards": (None, np.float32),
+        },
+        individual_registered_vars={
+            "obs": ([4], np.float32),
+            "obs_": ([4], np.float32),
+            "discrete_log_probs": (None, np.float32),
+            "continuous_log_probs": (None, np.float32),
+            "discrete_actions": ([1], np.int64),
+            "continuous_actions": ([1], np.float32),
+        },
+    )
+    param_grid = {
+        "action_clamp_type": ["tanh", "clamp", None],
+        "continuous_action_dim": [5, 0],
+        "discrete_action_dims": [[3, 4], None],
+        "device": ["cuda", "cpu"],
+        "std_type": ["stateless", "diagonal", "full"],
+        "entropy_loss": [0, 0.05],
+        "ppo_clip": (0, 0.2),
+        "value_clip": (0, 0.5),
+        "norm_advantages": (False, True),
+        "anneal_lr": (0, 20000),
+        "orthogonal": (True, False),
+        "clip_grad": (False, True),
+        "eval_mode": (False, True),
+        "action_head_hidden_dims": (None, [8, 4]),
+        "adv_type": ["gae", "gv", "a2c", "g", "constant"],
+    }
+
+    for config_id in range(10):
+        mem_buff.reset()
+        cdim = 0
+        ddim = None
+        if config_id % 2 == 0:
+            cdim = 1
+        else:
+            ddim = [2]
+
+        model = PG(
+            obs_dim=4,
+            continuous_action_dim=cdim,
+            discrete_action_dims=ddim,
+            min_actions=(np.array([0]) if cdim > 0 else np.zeros(1)),
+            max_actions=(np.array([1]) if cdim > 0 else np.zeros(1)),
+            device=param_grid["device"][random.randint(0, 1)],
+            entropy_loss=param_grid["entropy_loss"][random.randint(0, 1)],
+            ppo_clip=param_grid["ppo_clip"][random.randint(0, 1)],
+            value_clip=param_grid["value_clip"][random.randint(0, 1)],
+            norm_advantages=param_grid["norm_advantages"][random.randint(0, 1)],
+            anneal_lr=param_grid["anneal_lr"][random.randint(0, 1)],
+            orthogonal=param_grid["orthogonal"][random.randint(0, 1)],
+            std_type=param_grid["std_type"][random.randint(0, 2)],
+            clip_grad=param_grid["clip_grad"][random.randint(0, 1)],
+            mini_batch_size=64,
+            action_clamp_type=param_grid["action_clamp_type"][random.randint(0, 2)],
+            advantage_type=param_grid["adv_type"][random.randint(0, 4)],
+            n_epochs=2,
+        )
+
+        gym_env = gym.make("CartPole-v1")
+        obs, _ = gym_env.reset()
+        obs_ = obs + 0.1
+        batch_size = 256
+        rewards = [0.0]
+        ep_num = 0
+
+        for i in range(5000):
+            with torch.no_grad():
+                env_action = 0
+                default_dact = np.zeros((1, 1), dtype=np.int64)
+                default_cact = np.zeros((1, 1), dtype=np.float32)
+                default_clp = np.zeros((1), dtype=np.float32)
+                default_dlp = np.zeros((1), dtype=np.float32)
+                dact, cact, dlp, clp, v = model.train_actions(
+                    obs, step=True, debug=False
+                )
+
+            if cdim > 0:
+                assert (
+                    cact is not None and clp is not None
+                ), f"Continuous action and log prob {cact} {clp} should not be None when cdim [{cdim}] is not 0"
+                env_action = int(cact[0] > 0.5)
+                default_cact[0][0] = cact[0]
+                default_clp[0] = clp[0]
+            else:
+                assert (
+                    dact is not None and dlp is not None
+                ), f"Discrete action and log prob {dact} {dlp} should not be None when cdim [{cdim}] is 0"
+                env_action = dact[0][0]
+                default_dact[0][0] = dact[0][0]
+                default_dlp[0] = dlp[0]
+
+            obs_, reward, terminated, truncated, _ = gym_env.step(env_action)
+            rewards[-1] = rewards[-1] + float(reward)
+            rv = {
+                "global_rewards": reward,
+                "obs": [obs.copy()],
+                "obs_": [obs_.copy()],
+                "discrete_log_probs": default_dlp.copy(),
+                "continuous_log_probs": default_clp.copy(),
+                "discrete_actions": default_dact.copy(),
+                "continuous_actions": default_cact.copy(),
+            }
+            print(rv)
+            mem_buff.save_transition(
+                terminated=terminated,
+                registered_vals=rv,
+            )
+
+            obs = obs_.copy()
+            if terminated or truncated:
+                obs, _ = gym_env.reset()
+                obs = obs.copy()
+                rewards.append(0.0)
+                print(f"Episode {ep_num}, total reward: {rewards[-2]}")
+                ep_num += 1
+
+            if i % batch_size == 0 and i > 0:
+                mb = mem_buff.sample_transitions(
+                    batch_size=batch_size, as_torch=True, device=model.device
+                )
+                aloss, closs = model.reinforcement_learn(mb, 0)
+                print(f"Iteration {i}, aloss: {aloss}, closs: {closs}")
 
 
 if __name__ == "__main__":
