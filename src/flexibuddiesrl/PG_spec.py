@@ -261,7 +261,7 @@ def PG_integration():
         individual_registered_vars={
             "obs": ([4], np.float32),
             "obs_": ([4], np.float32),
-            "discrete_log_probs": (None, np.float32),
+            "discrete_log_probs": ([1], np.float32),
             "continuous_log_probs": (None, np.float32),
             "discrete_actions": ([1], np.int64),
             "continuous_actions": ([1], np.float32),
@@ -309,7 +309,7 @@ def PG_integration():
             orthogonal=param_grid["orthogonal"][random.randint(0, 1)],
             std_type=param_grid["std_type"][random.randint(0, 2)],
             clip_grad=param_grid["clip_grad"][random.randint(0, 1)],
-            mini_batch_size=64,
+            mini_batch_size=16,
             action_clamp_type=param_grid["action_clamp_type"][random.randint(0, 2)],
             advantage_type=param_grid["adv_type"][random.randint(0, 4)],
             n_epochs=2,
@@ -318,17 +318,17 @@ def PG_integration():
         gym_env = gym.make("CartPole-v1")
         obs, _ = gym_env.reset()
         obs_ = obs + 0.1
-        batch_size = 256
+        batch_size = 64
         rewards = [0.0]
         ep_num = 0
 
         for i in range(5000):
             with torch.no_grad():
                 env_action = 0
-                default_dact = np.zeros((1, 1), dtype=np.int64)
-                default_cact = np.zeros((1, 1), dtype=np.float32)
-                default_clp = np.zeros((1), dtype=np.float32)
-                default_dlp = np.zeros((1), dtype=np.float32)
+                default_dact = np.zeros((1), dtype=np.int64)
+                default_cact = np.zeros((1), dtype=np.float32) - 0.5
+                default_clp = np.ones((1), dtype=np.float32)
+                default_dlp = np.ones((1, 1), dtype=np.float32)
                 dact, cact, dlp, clp, v = model.train_actions(
                     obs, step=True, debug=False
                 )
@@ -337,16 +337,23 @@ def PG_integration():
                 assert (
                     cact is not None and clp is not None
                 ), f"Continuous action and log prob {cact} {clp} should not be None when cdim [{cdim}] is not 0"
+                print(f"Continuous action: {cact}, log prob: {clp}")
+                # print(cact.shape, clp.shape)
+                # print("from logits look like:")
+                # print(model.actor.forward(obs))
+                # print(model.action_clamp_type)
+
                 env_action = int(cact[0] > 0.5)
-                default_cact[0][0] = cact[0]
-                default_clp[0] = clp[0]
+                default_cact[0] = cact[0]
+                default_clp[0] = clp
             else:
                 assert (
                     dact is not None and dlp is not None
                 ), f"Discrete action and log prob {dact} {dlp} should not be None when cdim [{cdim}] is 0"
-                env_action = dact[0][0]
-                default_dact[0][0] = dact[0][0]
-                default_dlp[0] = dlp[0]
+                print(dact.shape, dlp.shape, dact, dlp)
+                env_action = dact[0]
+                default_dact[0] = dact[0]
+                default_dlp[0][0] = dlp[0]
 
             obs_, reward, terminated, truncated, _ = gym_env.step(env_action)
             rewards[-1] = rewards[-1] + float(reward)
@@ -359,7 +366,7 @@ def PG_integration():
                 "discrete_actions": default_dact.copy(),
                 "continuous_actions": default_cact.copy(),
             }
-            print(rv)
+            # print(rv)
             mem_buff.save_transition(
                 terminated=terminated,
                 registered_vals=rv,
@@ -373,13 +380,16 @@ def PG_integration():
                 print(f"Episode {ep_num}, total reward: {rewards[-2]}")
                 ep_num += 1
 
-            if i % batch_size == 0 and i > 0:
+            if mem_buff.steps_recorded > batch_size:
+                print(model.action_clamp_type)
                 mb = mem_buff.sample_transitions(
-                    batch_size=batch_size, as_torch=True, device=model.device
+                    idx=np.arange(0, batch_size), as_torch=True, device=model.device
                 )
                 aloss, closs = model.reinforcement_learn(mb, 0)
                 print(f"Iteration {i}, aloss: {aloss}, closs: {closs}")
+                mem_buff.reset()
 
 
 if __name__ == "__main__":
+    PG_integration()
     PG_test()

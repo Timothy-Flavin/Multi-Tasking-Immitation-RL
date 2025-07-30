@@ -562,7 +562,8 @@ class StochasticActor(nn.Module):
 
             if self.clamp_type == "tanh":
                 continuous_actions = (
-                    torch.tanh(continuous_activations) * self.action_scales
+                    torch.tanh(torch.clamp(continuous_activations, -1 + 1e-6, 1 - 1e-6))
+                    * self.action_scales
                     + self.action_biases
                 )
                 if log_con:
@@ -571,18 +572,20 @@ class StochasticActor(nn.Module):
                     ), "Somehow we want log probs from a distirbution that doesn't exist"
 
                     # This is from spinningup SAC
-                    continuous_log_probs = c_dist.log_prob(continuous_actions).sum(
+                    continuous_log_probs = c_dist.log_prob(continuous_activations).sum(
                         axis=-1
                     )
                     continuous_log_probs -= (
                         2
                         * (
                             np.log(2)
-                            - continuous_actions
-                            - F.softplus(-2 * continuous_actions)
+                            - continuous_activations
+                            - F.softplus(-2 * continuous_activations)
                         )
                     ).sum(axis=-1)
-
+                # print(
+                #     f"Continuous actions: {continuous_actions}, log probs: {continuous_log_probs} continuous_activations: {continuous_activations}, means: {continuous_means}, stds: {torch.exp(continuous_log_std_logits) if continuous_log_std_logits is not None else None}"
+                # )
             elif self.clamp_type == "clamp":
                 continuous_actions = torch.clamp(
                     continuous_activations, self.min_actions, self.max_actions
@@ -591,10 +594,22 @@ class StochasticActor(nn.Module):
                     assert (
                         c_dist is not None
                     ), "Somehow we want log probs from a distirbution that doesn't exist"
-                    continuous_log_probs = c_dist.log_prob(continuous_actions).sum(
+                    continuous_log_probs = c_dist.log_prob(continuous_activations).sum(
                         axis=-1
                     )
-
+            else:
+                continuous_actions = continuous_activations
+                if log_con:
+                    assert (
+                        c_dist is not None
+                    ), "Somehow we want log probs from a distirbution that doesn't exist"
+                    print(c_dist.log_prob(continuous_activations))
+                    continuous_log_probs = c_dist.log_prob(continuous_activations).sum(
+                        axis=-1
+                    )
+            print(
+                f"{self.clamp_type} Continuous actions: {continuous_actions}, log probs: {continuous_log_probs} from  {c_dist.log_prob(continuous_activations) if c_dist is not None else None} continuous_activations: {continuous_activations}, means: {continuous_means}, stds: {torch.exp(continuous_log_std_logits) if continuous_log_std_logits is not None else None}"
+            )
         if self.discrete_action_dims is not None and len(self.discrete_action_dims) > 0:
             assert (
                 discrete_logits is not None
@@ -609,7 +624,9 @@ class StochasticActor(nn.Module):
             else:
                 if len(discrete_logits[0].shape) == 1:
                     discrete_actions = torch.zeros(
-                        len(self.discrete_action_dims), device=self.device
+                        len(self.discrete_action_dims),
+                        device=self.device,
+                        dtype=torch.long,
                     )
                     if log_disc:
                         discrete_log_probs = torch.zeros(
@@ -620,6 +637,7 @@ class StochasticActor(nn.Module):
                         discrete_logits[0].shape[0],
                         len(self.discrete_action_dims),
                         device=self.device,
+                        dtype=torch.long,
                     )
                     if log_disc:
                         discrete_log_probs = torch.zeros(

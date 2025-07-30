@@ -257,6 +257,7 @@ class PG(nn.Module, Agent):
             continuous_logits, continuous_log_std_logits, discrete_action_logits = (
                 self.actor(x=observations, action_mask=action_mask, debug=debug)
             )
+            # print(continuous_log_std_logits)
             if continuous_log_std_logits is None and self.continuous_action_dim > 0:
                 assert (
                     self.std_type == "stateless"
@@ -552,7 +553,7 @@ class PG(nn.Module, Agent):
     def _get_cont_log_probs_entropy(
         self, logits, actions, lstd_logits: torch.Tensor | None = None
     ):
-        lstd = 1.0
+        lstd = -1.0
         if self.actor_logstd is not None:
             lstd = self.actor_logstd.expand_as(logits)
         else:
@@ -561,20 +562,35 @@ class PG(nn.Module, Agent):
             ), "If the actor doesnt generate logits then it needs to have a global logstd"
             lstd = lstd_logits.expand_as(logits)
 
-        dist = torch.distributions.Normal(loc=logits, scale=torch.exp(lstd))
+        dist = torch.distributions.Normal(
+            loc=logits, scale=torch.clip(torch.exp(lstd), min=1e-6)
+        )
         if self.action_clamp_type == "tanh":
-            dist = TransformedDistribution(dist, TanhTransform())
-            new_actions = minmaxnorm(actions, self.min_actions, self.max_actions)
-            try:
-                log_probs = dist.log_prob(new_actions)
-                return log_probs, -log_probs.mean()
-            except Exception as e:
-                print(actions)
-                if self.action_clamp_type == "tanh":
-                    print(new_actions)
-                print(f"min: {self.min_actions}, max: {self.max_actions}")
-                raise e
-        log_probs = dist.log_prob(actions)
+            # dist = TransformedDistribution(dist, TanhTransform())
+            # print("actions were tanhed so we need to get form raw to dist activations")
+            # print(actions)
+            activations = minmaxnorm(actions, self.min_actions, self.max_actions)
+            eps = 1e-6
+            activations = torch.clamp(activations, -1 + eps, 1 - eps)
+            # print(f"normed actions: {activations}")
+            activations = torch.atanh(activations)
+            # print(f"inverse tanh actions: {activations}")
+        else:
+            activations = actions
+
+        log_probs = dist.log_prob(activations)
+        # correction = torch.zeros_like(log_probs, dtype=torch.float)
+
+        if self.action_clamp_type == "tanh":
+            log_probs -= 2 * (np.log(2) - activations - F.softplus(-2 * activations))
+        if torch.min(log_probs) < -1000:
+            print(
+                f"{self.action_clamp_type} Warning: log_probs has very low values: {torch.min(log_probs)}. "
+                "This might cause numerical instability."
+            )
+            input(f"print the rest? {self.action_clamp_type}")
+            print(f"loc: {logits}, scale: {torch.exp(lstd)} actions: {activations}")
+            log_probs = torch.clamp(log_probs, -1000, 2)
         return log_probs, dist.entropy().mean()
 
     def _get_probs_and_entropy(self, batch: FlexiBatch, agent_num):
