@@ -17,6 +17,7 @@ class Agent(ABC):
         np.ndarray | float | None,
         np.ndarray | float | None,
         np.ndarray | float | None,
+        np.ndarray | float | None,
     ]:
         return (
             0,
@@ -24,7 +25,8 @@ class Agent(ABC):
             0.0,
             0.0,
             0.0,
-        )  # discrete actions, continuous actions, discrete log probs, continuous log probs, value
+            0.0,
+        )  # discrete actions, continuous actions, discrete log probs, continuous log probs, raw_continuous_activation, value
 
     @abstractmethod
     def ego_actions(self, observations, action_mask=None) -> tuple[
@@ -511,6 +513,7 @@ class StochasticActor(nn.Module):
         None | torch.Tensor | list[torch.Tensor],
         None | torch.Tensor | list[torch.Tensor],
         None | torch.Tensor | list[torch.Tensor],
+        None | torch.Tensor | list[torch.Tensor],
     ]:
         """
         Produces actions from logits with gradient maintained always for continuous and if gumbel is True for discrete
@@ -535,6 +538,7 @@ class StochasticActor(nn.Module):
         discrete_actions = None
         continuous_log_probs = None
         discrete_log_probs = None
+        continuous_activations = None
         c_dist = None
         d_dist = None
 
@@ -556,7 +560,7 @@ class StochasticActor(nn.Module):
                 log_std = log_std.expand_as(continuous_means)
                 c_dist = torch.distributions.Normal(
                     continuous_means,
-                    torch.exp(log_std),
+                    torch.clip(torch.exp(log_std), min=0.05),
                 )
                 continuous_activations = c_dist.rsample()
 
@@ -671,6 +675,7 @@ class StochasticActor(nn.Module):
             continuous_actions,
             discrete_log_probs,
             continuous_log_probs,
+            continuous_activations,
         )
 
 

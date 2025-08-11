@@ -217,6 +217,7 @@ class DDPG(Agent):
                 discrete_logprobs,
                 continuous_logprobs,
                 0,
+                0,
             )
 
     def reinforcement_learn(

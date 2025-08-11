@@ -249,6 +249,7 @@ class PG(nn.Module, Agent):
             continuous_actions,
             discrete_log_probs,
             continuous_log_probs,
+            0,
             0,  # vals.detach().cpu().numpy(), TODO: re-enable this when flexibuff is done
         )
 
@@ -501,7 +502,7 @@ class PG(nn.Module, Agent):
         # print(self.mini_batch_size)
         nbatch = bsize // self.mini_batch_size
         mini_batch_indices = np.arange(len(batch.global_rewards))
-        # np.random.shuffle(mini_batch_indices)
+        np.random.shuffle(mini_batch_indices)
 
         if debug:
             print(
@@ -763,7 +764,9 @@ if __name__ == "__main__":
     )
     mem.to_torch("cuda:0")
 
-    d_acts, c_acts, d_log, c_log, _ = agent.train_actions(obs, step=True, debug=True)
+    d_acts, c_acts, d_log, c_log, _1, _ = agent.train_actions(
+        obs, step=True, debug=True
+    )
     print(f"Training actions: c: {c_acts}, d: {d_acts}, d_log: {d_log}, c_log: {c_log}")
 
     for adv_type in ["g", "gae", "a2c", "constant", "gv"]:

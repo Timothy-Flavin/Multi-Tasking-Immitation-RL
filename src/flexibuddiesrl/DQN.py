@@ -244,7 +244,7 @@ class DQN(nn.Module, Agent):
             observations, action_mask, step, debug
         )
         self.step += int(step)
-        return disc_act, cont_act, 0.0, 0.0, 0.0
+        return disc_act, cont_act, 0.0, 0.0, 0.0, 0.0
 
     def ego_actions(self, observations, action_mask=None):
         return 0
@@ -1019,7 +1019,9 @@ if __name__ == "__main__":
     # %%
 
     # %%
-    d_acts, c_acts, d_log, c_log, _ = agent.train_actions(obs, step=True, debug=True)
+    d_acts, c_acts, d_log, c_log, _1, _ = agent.train_actions(
+        obs, step=True, debug=True
+    )
     print(f"Training actions: c: {c_acts}, d: {d_acts}, d_log: {d_log}, c_log: {c_log}")
     aloss, closs = agent.reinforcement_learn(mem, 0, critic_only=False, debug=True)
     print("Finished Testing")
@@ -1038,7 +1040,9 @@ if __name__ == "__main__":
         activation="relu",
         entropy=0.1,
     )
-    d_acts, c_acts, d_log, c_log, _ = agent.train_actions(obs, step=True, debug=True)
+    d_acts, c_acts, d_log, c_log, _1, _ = agent.train_actions(
+        obs, step=True, debug=True
+    )
     print(f"Training actions: c: {c_acts}, d: {d_acts}, d_log: {d_log}, c_log: {c_log}")
     aloss, closs = agent.reinforcement_learn(mem, 0, critic_only=False, debug=True)
     print("Finished Testing")
@@ -1056,7 +1060,9 @@ if __name__ == "__main__":
         entropy=0.1,
         munchausen=0.5,
     )
-    d_acts, c_acts, d_log, c_log, _ = agent.train_actions(obs, step=True, debug=True)
+    d_acts, c_acts, d_log, c_log, _1, _ = agent.train_actions(
+        obs, step=True, debug=True
+    )
     print(f"Training actions: c: {c_acts}, d: {d_acts}, d_log: {d_log}, c_log: {c_log}")
     aloss, closs = agent.reinforcement_learn(mem, 0, critic_only=False, debug=True)
     print("Finished Testing")

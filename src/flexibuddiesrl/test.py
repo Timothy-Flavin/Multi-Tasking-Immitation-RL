@@ -53,7 +53,7 @@ def test_single_env(
         terminated, truncated = False, False
         while not (terminated or truncated):
 
-            discrete_actions, continuous_actions, disc_lp, cont_lp, value = (
+            discrete_actions, continuous_actions, disc_lp, cont_lp, rawcact, value = (
                 agent.train_actions(obs, step=True, debug=debug)
             )
             # print(discrete_actions, continuous_actions)
@@ -242,7 +242,7 @@ def test_dual_env(
     obs = np.concatenate([d_obs, c_obs])
 
     while step < n_steps:
-        discrete_actions, continuous_actions, cont_lp, disc_lp, value = (
+        discrete_actions, continuous_actions, cont_lp, disc_lp, rawcact, value = (
             agent.train_actions(obs, step=True, debug=debug)
         )
         if disc_lp is None:

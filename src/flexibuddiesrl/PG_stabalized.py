@@ -96,7 +96,7 @@ class PG(nn.Module, Agent):
             "dloss": 0.0,
             "closs": 0.0,
             "backward": 0.0,
-            "tot": 0.0,
+            "tot": 0.0001,
         }
         assert (
             continuous_action_dim > 0 or discrete_action_dims is not None
@@ -282,6 +282,7 @@ class PG(nn.Module, Agent):
                     continuous_actions,
                     discrete_log_probs,
                     continuous_log_probs,
+                    raw_continuous_activations,
                 ) = self.actor.action_from_logits(
                     continuous_logits,
                     continuous_log_std_logits,
@@ -303,11 +304,13 @@ class PG(nn.Module, Agent):
         # print("train actions: ")
         # print(continuous_logits)
         # print(continuous_actions)
+        # print(f"in train action lp: {continuous_log_probs}")
         return (
             self._to_numpy(discrete_actions),
             self._to_numpy(continuous_actions),
             self._to_numpy(discrete_log_probs),
             self._to_numpy(continuous_log_probs),
+            self._to_numpy(raw_continuous_activations),
             0,  # vals.detach().cpu().numpy(), TODO: re-enable this when flexibuff is done
         )
 
@@ -323,6 +326,7 @@ class PG(nn.Module, Agent):
                 continuous_actions,
                 discrete_log_probs,
                 continuous_log_probs,
+                _,
             ) = self.actor.action_from_logits(
                 continuous_logits,
                 continuous_log_std_logits,
@@ -577,7 +581,7 @@ class PG(nn.Module, Agent):
         # print(self.std_type)
 
         dist = torch.distributions.Normal(
-            loc=logits, scale=torch.clip(torch.exp(lstd), min=1e-4)
+            loc=logits, scale=torch.clip(torch.exp(lstd), min=0.05)
         )
         if self.action_clamp_type == "tanh":
             # dist = TransformedDistribution(dist, TanhTransform())
@@ -595,11 +599,18 @@ class PG(nn.Module, Agent):
         else:
             activations = actions
 
-        log_probs = dist.log_prob(activations)
+        log_probs = dist.log_prob(activations).sum(dim=-1)
         # correction = torch.zeros_like(log_probs, dtype=torch.float)
 
         if self.action_clamp_type == "tanh":
-            log_probs -= 2 * (np.log(2) - activations - F.softplus(-2 * activations))
+            # print(
+            #    f"log prob shape: {log_probs.shape} activ shape: {activations.shape} softplus thing: {F.softplus(-2 * activations).shape}"
+            # )
+            log_probs -= 2 * (
+                np.log(2) - activations - F.softplus(-2 * activations)
+            ).sum(dim=-1)
+
+        eloss = dist.entropy().mean()
         if torch.min(log_probs) < -100:
             print(
                 f"{self.action_clamp_type} Warning: log_probs has very low values: {torch.min(log_probs)}. "
@@ -609,8 +620,10 @@ class PG(nn.Module, Agent):
             print(
                 f"loc: {logits}, scale: {torch.exp(lstd)} actions: {actions} activations {activations}"
             )
-            log_probs = torch.clamp(log_probs, -1000, 2)
-        return log_probs, dist.entropy().mean()
+            # log_probs = torch.clamp(log_probs, -100, 2)
+            # eloss = eloss * 100
+
+        return log_probs, eloss
 
     def _get_probs_and_entropy(self, batch: FlexiBatch, agent_num):
         bm = None
@@ -780,24 +793,29 @@ class PG(nn.Module, Agent):
     def _continuous_actor_loss(
         self, action_means, action_log_std, old_log_probs, advantages, actions
     ):
-
+        if len(advantages.shape) > 1:
+            advantages = advantages.squeeze(-1)
         cont_log_probs, cont_entropy = self._get_cont_log_probs_entropy(
             logits=action_means,
             actions=actions,
             lstd_logits=action_log_std,
         )
         if self.ppo_clip > 0:
+            # print(f"cont lp shape: {cont_log_probs.shape}")
+            # print(f"old lp shape: {old_log_probs.shape}")
             logratio = (
                 cont_log_probs
                 - old_log_probs  # batch.continuous_log_probs[agent_num, indices]
             )
             ratio = logratio.exp()
+            # print(f" ratio shape: {ratio.shape} adv shape: {advantages.shape}")
             pg_loss1 = advantages * ratio
             pg_loss2 = advantages * torch.clamp(
                 ratio, 1 - self.ppo_clip, 1 + self.ppo_clip
             )
             continuous_policy_gradient = torch.min(pg_loss1, pg_loss2)
         else:
+            # print(f" lp shape: {cont_log_probs.shape} adv shape: {advantages.shape}")
             continuous_policy_gradient = cont_log_probs * advantages
         actor_loss = (
             -self.policy_loss * continuous_policy_gradient.mean()
@@ -812,6 +830,9 @@ class PG(nn.Module, Agent):
             entropy = dist.entropy().mean()
             selected_log_probs = dist.log_prob(actions[:, head])
             if self.ppo_clip > 0:
+                # print(
+                #     f"disc shapes sel_lp {selected_log_probs.shape} lphead: {log_probs[:, head].shape}"
+                # )
                 logratio = (
                     selected_log_probs
                     - log_probs[
@@ -823,8 +844,14 @@ class PG(nn.Module, Agent):
                 pg_loss2 = advantages.squeeze(-1) * torch.clamp(
                     ratio, 1 - self.ppo_clip, 1 + self.ppo_clip
                 )
+                # print(
+                #     f"advsq {advantages.squeeze(-1).shape} ratio: {ratio.shape} pg1: {pg_loss1.shape} pg2: {pg_loss2.shape}"
+                # )
                 discrete_policy_gradient = torch.min(pg_loss1, pg_loss2)
             else:
+                # print(
+                #     f"adv {advantages.squeeze(-1).shape} slp: {selected_log_probs.shape}"
+                # )
                 discrete_policy_gradient = selected_log_probs * advantages.squeeze(-1)
 
             actor_loss += (
@@ -866,7 +893,7 @@ class PG(nn.Module, Agent):
         bsize = len(batch.terminated)
         nbatch = bsize // self.mini_batch_size
         mini_batch_indices = np.arange(len(batch.terminated))
-        # np.random.shuffle(mini_batch_indices)
+        np.random.shuffle(mini_batch_indices)
 
         if debug:
             print(
@@ -1042,7 +1069,7 @@ class PG(nn.Module, Agent):
     def __str__(self):
         st = ""
         for d in self.__dict__.keys():
-            st += f"{d}: {self.__dict__[d]}"
+            st += f"{d}: {self.__dict__[d]}\n"
         return st
 
     def reinforcement_learn_perf(

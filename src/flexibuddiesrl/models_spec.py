@@ -239,7 +239,7 @@ def test_hyperparams(args, verbose=False):
             print(f"Testing agent {i} with parameters: {agent_params[i]}")
 
         try:
-            d_acts, c_acts, d_log, c_log, _ = agents[i].train_actions(
+            d_acts, c_acts, d_log, c_log, _1, _ = agents[i].train_actions(
                 obs, step=True, debug=verbose
             )
             if verbose:

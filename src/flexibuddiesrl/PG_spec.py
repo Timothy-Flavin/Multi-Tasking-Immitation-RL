@@ -8,6 +8,7 @@ from flexibuff import FlexibleBuffer, FlexiBatch
 import random
 import time
 import gymnasium as gym
+import matplotlib.pyplot as plt
 
 
 def PG_test():
@@ -60,7 +61,7 @@ def PG_test():
             "obs": ([obs_dim], np.float32),
             "obs_": ([obs_dim], np.float32),
             "discrete_log_probs": ([len(discrete_action_dims)], np.float32),
-            "continuous_log_probs": ([continuous_action_dim], np.float32),
+            "continuous_log_probs": (None, np.float32),
             "discrete_actions": ([len(discrete_action_dims)], np.int64),
             "continuous_actions": ([continuous_action_dim], np.float32),
         },
@@ -80,9 +81,7 @@ def PG_test():
                 )
                 - i / obs_batch.shape[0]
                 - 0.1,
-                "continuous_log_probs": np.zeros(
-                    continuous_action_dim, dtype=np.float32
-                )
+                "continuous_log_probs": np.zeros(1, dtype=np.float32)
                 - i / obs_batch.shape[0] / 2
                 - 0.1,
                 "discrete_actions": [dacs[i]],
@@ -179,7 +178,7 @@ def PG_test():
         run_times["create_model"] += time.time() - _s
 
         _s = time.time()
-        d_acts, c_acts, d_log, c_log, _ = model.train_actions(
+        d_acts, c_acts, d_log, c_log, _1, _ = model.train_actions(
             obs, step=True, debug=False
         )
         run_times["train_action_single"] += time.time() - _s
@@ -192,7 +191,7 @@ def PG_test():
             )
 
         _s = time.time()
-        d_acts, c_acts, d_log, c_log, _ = model.train_actions(
+        d_acts, c_acts, d_log, c_log, _1, _ = model.train_actions(
             obs_batch, step=True, debug=False
         )
         run_times["train_action_batch"] += time.time() - _s
@@ -231,7 +230,7 @@ def PG_test():
 
         _s = time.time()
         try:
-            aloss, closs = model.reinforcement_learn_perf(mb, 0)
+            aloss, closs = model.reinforcement_learn(mb, 0)
         except Exception as e:
             print(h)
             raise e
@@ -245,28 +244,6 @@ def PG_test():
 
 def PG_integration():
 
-    gym.make("CartPole-v1")
-
-    mem_buff = FlexibleBuffer(
-        num_steps=10000,
-        n_agents=1,
-        discrete_action_cardinalities=[2],
-        track_action_mask=False,
-        path="./test_buffer",
-        name="spec_buffer",
-        memory_weights=False,
-        global_registered_vars={
-            "global_rewards": (None, np.float32),
-        },
-        individual_registered_vars={
-            "obs": ([4], np.float32),
-            "obs_": ([4], np.float32),
-            "discrete_log_probs": ([1], np.float32),
-            "continuous_log_probs": (None, np.float32),
-            "discrete_actions": ([1], np.int64),
-            "continuous_actions": ([1], np.float32),
-        },
-    )
     param_grid = {
         "action_clamp_type": ["tanh", "clamp", None],
         "continuous_action_dim": [5, 0],
@@ -286,53 +263,89 @@ def PG_integration():
     }
 
     for config_id in range(10):
-        mem_buff.reset()
+
         cdim = 0
         ddim = None
         if config_id % 2 == 0:
-            cdim = 1
+            cdim = 2
         else:
-            ddim = [2]
+            ddim = [4]
 
+        ppo_clip = param_grid["ppo_clip"][random.randint(0, 1)]
+
+        if ppo_clip > 0.0:
+            batch_size = 512
+            mini_batch_size = 128
+        else:
+            batch_size = 128
+            mini_batch_size = 128
+
+        std_type = param_grid["std_type"][random.randint(0, 2)]
+        mem_buff = FlexibleBuffer(
+            num_steps=10000,
+            n_agents=1,
+            discrete_action_cardinalities=[4],
+            track_action_mask=False,
+            path="./test_buffer",
+            name="spec_buffer",
+            memory_weights=False,
+            global_registered_vars={
+                "global_rewards": (None, np.float32),
+            },
+            individual_registered_vars={
+                "obs": ([8], np.float32),
+                "obs_": ([8], np.float32),
+                "discrete_log_probs": ([1], np.float32),
+                "continuous_log_probs": (None, np.float32),
+                "discrete_actions": ([1], np.int64),
+                "continuous_actions": ([2], np.float32),
+            },
+        )
+        mem_buff.reset()
         model = PG(
-            obs_dim=4,
+            obs_dim=8,
             continuous_action_dim=cdim,
             discrete_action_dims=ddim,
-            min_actions=(np.array([0]) if cdim > 0 else np.zeros(1)),
-            max_actions=(np.array([1]) if cdim > 0 else np.zeros(1)),
+            min_actions=(np.array([-1, -1]) if cdim > 0 else np.zeros(2)),
+            max_actions=(np.array([1, 1]) if cdim > 0 else np.zeros(2)),
             device=param_grid["device"][random.randint(0, 1)],
             entropy_loss=param_grid["entropy_loss"][random.randint(0, 1)],
-            ppo_clip=param_grid["ppo_clip"][random.randint(0, 1)],
+            ppo_clip=ppo_clip,
             value_clip=param_grid["value_clip"][random.randint(0, 1)],
             norm_advantages=param_grid["norm_advantages"][random.randint(0, 1)],
             anneal_lr=param_grid["anneal_lr"][random.randint(0, 1)],
             orthogonal=param_grid["orthogonal"][random.randint(0, 1)],
-            std_type=param_grid["std_type"][random.randint(0, 2)],
+            std_type=std_type,
             clip_grad=param_grid["clip_grad"][random.randint(0, 1)],
-            mini_batch_size=16,
+            mini_batch_size=(
+                mini_batch_size
+                if ppo_clip > 0.0
+                else batch_size  # Dont do epochs if no ppo clip
+            ),
             action_clamp_type=param_grid["action_clamp_type"][random.randint(0, 2)],
             advantage_type=param_grid["adv_type"][random.randint(0, 4)],
-            n_epochs=2,
-            lr=2e-4,
+            n_epochs=3 if ppo_clip > 0.0 else 1,
+            lr=5e-4,
         )
 
         # Print current hyper parameters before episode start
 
-        gym_env = gym.make("CartPole-v1")
+        gym_env = gym.make("LunarLander-v2", continuous=config_id % 2 == 0)
         obs, _ = gym_env.reset()
         obs_ = obs + 0.1
-        batch_size = 64
         rewards = [0.0]
         ep_num = 0
+        ep_step = 0
 
-        for i in range(5000):
+        for i in range(50000):
             with torch.no_grad():
                 env_action = 0
                 default_dact = np.zeros((1), dtype=np.int64)
-                default_cact = np.zeros((1), dtype=np.float32) - 0.5
+                default_cact = np.zeros((2), dtype=np.float32) - 0.5
+                cactivation = np.zeros((2), dtype=np.float32) - 0.5
                 default_clp = np.ones((1), dtype=np.float32)
                 default_dlp = np.ones((1, 1), dtype=np.float32)
-                dact, cact, dlp, clp, v = model.train_actions(
+                dact, cact, dlp, clp, cactivation, v = model.train_actions(
                     obs, step=True, debug=False
                 )
 
@@ -348,9 +361,10 @@ def PG_integration():
                 # print(model.actor.forward(obs))
                 # print(model.action_clamp_type)
 
-                env_action = int(cact[0] > 0.5)
-                default_cact[0] = cact[0]
-                default_clp[0] = clp
+                env_action = cact  # int(cact[0] > 0.5)
+                default_cact = cact
+                default_clp = clp
+                # print(clp)
             else:
                 assert (
                     dact is not None and dlp is not None
@@ -368,10 +382,15 @@ def PG_integration():
                 "obs_": [obs_.copy()],
                 "discrete_log_probs": default_dlp.copy(),
                 "continuous_log_probs": default_clp.copy(),
-                "discrete_actions": default_dact.copy(),
-                "continuous_actions": default_cact.copy(),
+                "discrete_actions": (default_dact.copy()),
+                "continuous_actions": (
+                    default_cact.copy()
+                    if model.action_clamp_type != "clamp"
+                    else cactivation
+                ),
             }
             # print(rv)
+            ep_step += 1
             mem_buff.save_transition(
                 terminated=terminated,
                 registered_vals=rv,
@@ -382,19 +401,27 @@ def PG_integration():
                 obs, _ = gym_env.reset()
                 obs = obs.copy()
                 rewards.append(0.0)
+                ep_step = 0
                 print(f"Episode {ep_num}, total reward: {rewards[-2]}")
                 ep_num += 1
 
-            if mem_buff.steps_recorded > batch_size:
-                print(model.action_clamp_type)
+            if mem_buff.steps_recorded == batch_size:
+                # print(model.action_clamp_type)
                 mb = mem_buff.sample_transitions(
                     idx=np.arange(0, batch_size), as_torch=True, device=model.device
                 )
                 aloss, closs = model.reinforcement_learn(mb, 0, debug=False)
                 print(f"Iteration {i}, aloss: {aloss}, closs: {closs}")
                 mem_buff.reset()
+        print(model)
+
+        for i in range(1, len(rewards)):
+            rewards[i] = 0.9 * rewards[i - 1] + 0.1 * rewards[i]
+        plt.plot(rewards)
+        plt.title("Rewards")
+        plt.show()
 
 
 if __name__ == "__main__":
-    PG_integration()
+    # PG_integration()
     PG_test()

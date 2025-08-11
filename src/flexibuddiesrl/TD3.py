@@ -297,6 +297,7 @@ class TD3(Agent):
                 continuous_actions_noisy,
                 discrete_logprobs,
                 continuous_logprobs,
+                continuous_actions.detach().cpu().numpy(),
                 0,  # value.detach().cpu().numpy(),
             )
 
