@@ -21,7 +21,7 @@ class PG(nn.Module, Agent):
         max_actions=None,
         min_actions=None,
         discrete_action_dims=None,
-        lr=2.5e-3,
+        lr=1e-4,
         gamma=0.99,
         n_epochs=2,
         device="cpu",
@@ -193,6 +193,7 @@ class PG(nn.Module, Agent):
             gumbel_tau=0,
             action_head_hidden_dims=action_head_hidden_dims,
             std_type=st,
+            clamp_type=self.action_clamp_type,
         ).to(self.device)
 
         self.critic = ValueS(
@@ -257,7 +258,7 @@ class PG(nn.Module, Agent):
             continuous_logits, continuous_log_std_logits, discrete_action_logits = (
                 self.actor(x=observations, action_mask=action_mask, debug=debug)
             )
-            # print(continuous_log_std_logits)
+
             if continuous_log_std_logits is None and self.continuous_action_dim > 0:
                 assert (
                     self.std_type == "stateless"
@@ -267,6 +268,13 @@ class PG(nn.Module, Agent):
                 print(
                     f"  After actor: clog {continuous_logits}, dlog{discrete_action_logits}"
                 )
+
+            # clpstd = None
+            # if continuous_log_std_logits is not None:
+            #     clpstd = torch.exp(continuous_log_std_logits)
+            # print(
+            #     f"c_logits {continuous_logits} d_logits: {discrete_action_logits} c_std: {clpstd}"
+            # )
 
             try:
                 (
@@ -292,6 +300,9 @@ class PG(nn.Module, Agent):
                 print(self.actor.device)
                 print(e)
                 raise (e)
+        # print("train actions: ")
+        # print(continuous_logits)
+        # print(continuous_actions)
         return (
             self._to_numpy(discrete_actions),
             self._to_numpy(continuous_actions),
@@ -562,19 +573,25 @@ class PG(nn.Module, Agent):
             ), "If the actor doesnt generate logits then it needs to have a global logstd"
             lstd = lstd_logits.expand_as(logits)
 
+        # print(lstd)
+        # print(self.std_type)
+
         dist = torch.distributions.Normal(
-            loc=logits, scale=torch.clip(torch.exp(lstd), min=1e-6)
+            loc=logits, scale=torch.clip(torch.exp(lstd), min=1e-4)
         )
         if self.action_clamp_type == "tanh":
             # dist = TransformedDistribution(dist, TanhTransform())
             # print("actions were tanhed so we need to get form raw to dist activations")
-            # print(actions)
+            # print(f"actions: {actions[:,0]}")
             activations = minmaxnorm(actions, self.min_actions, self.max_actions)
             eps = 1e-6
             activations = torch.clamp(activations, -1 + eps, 1 - eps)
-            # print(f"normed actions: {activations}")
+            # print(f"normed actions: {activations[:,0]}")
             activations = torch.atanh(activations)
-            # print(f"inverse tanh actions: {activations}")
+            # print(f"inverse tanh actions: {activations[:,0]}")
+            # print(
+            #    f"from raw logit means: {logits} and scale {torch.clip(torch.exp(lstd), min=1e-6)}"
+            # )
         else:
             activations = actions
 
@@ -583,13 +600,15 @@ class PG(nn.Module, Agent):
 
         if self.action_clamp_type == "tanh":
             log_probs -= 2 * (np.log(2) - activations - F.softplus(-2 * activations))
-        if torch.min(log_probs) < -1000:
+        if torch.min(log_probs) < -100:
             print(
                 f"{self.action_clamp_type} Warning: log_probs has very low values: {torch.min(log_probs)}. "
                 "This might cause numerical instability."
             )
             input(f"print the rest? {self.action_clamp_type}")
-            print(f"loc: {logits}, scale: {torch.exp(lstd)} actions: {activations}")
+            print(
+                f"loc: {logits}, scale: {torch.exp(lstd)} actions: {actions} activations {activations}"
+            )
             log_probs = torch.clamp(log_probs, -1000, 2)
         return log_probs, dist.entropy().mean()
 
@@ -847,7 +866,7 @@ class PG(nn.Module, Agent):
         bsize = len(batch.terminated)
         nbatch = bsize // self.mini_batch_size
         mini_batch_indices = np.arange(len(batch.terminated))
-        np.random.shuffle(mini_batch_indices)
+        # np.random.shuffle(mini_batch_indices)
 
         if debug:
             print(
@@ -936,7 +955,37 @@ class PG(nn.Module, Agent):
                         foreach=True,
                     )
 
+                # with torch.no_grad():
+                #     (
+                #         old_continuous_means,
+                #         old_continuous_log_std_logits,
+                #         old_discrete_logits,
+                #     ) = self.actor(
+                #         x=batch.__getattr__(self.batch_name_map["obs"])[
+                #             agent_num, indices
+                #         ],
+                #     )
+                #     print(
+                #         f"old logits before update: {old_continuous_means[:,0]} and std: {torch.exp(old_continuous_log_std_logits)[:,0]}"
+                #     )
+
                 self.optimizer.step()
+
+                # if debug:
+                #     with torch.no_grad():
+                #         continuous_means, continuous_log_std_logits, discrete_logits = (
+                #             self.actor(
+                #                 x=batch.__getattr__(self.batch_name_map["obs"])[
+                #                     agent_num, indices
+                #                 ],
+                #             )
+                #         )
+
+                #         print(
+                #             f"new logits after update: {continuous_means[:,0]} and std: {torch.exp(continuous_log_std_logits)[:,0]}"
+                #         )
+                #         print(self.optimizer.param_groups[0]["lr"])
+                #         input()
 
                 avg_actor_loss += actor_loss.to("cpu").item()
                 avg_critic_loss += critic_loss.to("cpu").item()

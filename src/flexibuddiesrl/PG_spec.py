@@ -313,7 +313,10 @@ def PG_integration():
             action_clamp_type=param_grid["action_clamp_type"][random.randint(0, 2)],
             advantage_type=param_grid["adv_type"][random.randint(0, 4)],
             n_epochs=2,
+            lr=2e-4,
         )
+
+        # Print current hyper parameters before episode start
 
         gym_env = gym.make("CartPole-v1")
         obs, _ = gym_env.reset()
@@ -337,7 +340,9 @@ def PG_integration():
                 assert (
                     cact is not None and clp is not None
                 ), f"Continuous action and log prob {cact} {clp} should not be None when cdim [{cdim}] is not 0"
-                print(f"Continuous action: {cact}, log prob: {clp}")
+                # print(f"Continuous action: {cact}, log prob: {clp}")
+                # print()
+                # input()
                 # print(cact.shape, clp.shape)
                 # print("from logits look like:")
                 # print(model.actor.forward(obs))
@@ -350,7 +355,7 @@ def PG_integration():
                 assert (
                     dact is not None and dlp is not None
                 ), f"Discrete action and log prob {dact} {dlp} should not be None when cdim [{cdim}] is 0"
-                print(dact.shape, dlp.shape, dact, dlp)
+                # print(dact.shape, dlp.shape, dact, dlp)
                 env_action = dact[0]
                 default_dact[0] = dact[0]
                 default_dlp[0][0] = dlp[0]
@@ -385,7 +390,7 @@ def PG_integration():
                 mb = mem_buff.sample_transitions(
                     idx=np.arange(0, batch_size), as_torch=True, device=model.device
                 )
-                aloss, closs = model.reinforcement_learn(mb, 0)
+                aloss, closs = model.reinforcement_learn(mb, 0, debug=False)
                 print(f"Iteration {i}, aloss: {aloss}, closs: {closs}")
                 mem_buff.reset()
 

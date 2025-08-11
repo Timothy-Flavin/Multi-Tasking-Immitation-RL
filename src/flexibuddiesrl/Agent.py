@@ -562,7 +562,7 @@ class StochasticActor(nn.Module):
 
             if self.clamp_type == "tanh":
                 continuous_actions = (
-                    torch.tanh(torch.clamp(continuous_activations, -1 + 1e-6, 1 - 1e-6))
+                    torch.tanh(continuous_activations)  # torch.clamp()?
                     * self.action_scales
                     + self.action_biases
                 )
@@ -603,13 +603,13 @@ class StochasticActor(nn.Module):
                     assert (
                         c_dist is not None
                     ), "Somehow we want log probs from a distirbution that doesn't exist"
-                    print(c_dist.log_prob(continuous_activations))
+                    # print(c_dist.log_prob(continuous_activations))
                     continuous_log_probs = c_dist.log_prob(continuous_activations).sum(
                         axis=-1
                     )
-            print(
-                f"{self.clamp_type} Continuous actions: {continuous_actions}, log probs: {continuous_log_probs} from  {c_dist.log_prob(continuous_activations) if c_dist is not None else None} continuous_activations: {continuous_activations}, means: {continuous_means}, stds: {torch.exp(continuous_log_std_logits) if continuous_log_std_logits is not None else None}"
-            )
+            # print(
+            #    f"{self.clamp_type} Continuous actions: {continuous_actions}, log probs: {continuous_log_probs} from  {c_dist.log_prob(continuous_activations) if c_dist is not None else None} continuous_activations: {continuous_activations}, means: {continuous_means}, stds: {torch.exp(continuous_log_std_logits) if continuous_log_std_logits is not None else None}"
+            # )
         if self.discrete_action_dims is not None and len(self.discrete_action_dims) > 0:
             assert (
                 discrete_logits is not None
