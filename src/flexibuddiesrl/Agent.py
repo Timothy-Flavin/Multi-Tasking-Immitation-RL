@@ -924,11 +924,13 @@ class QS(nn.Module):
     def forward(self, x, action_mask=None):
         # TODO: action mask implementation
         x = T(x, self.device)
+        # print(f"starting x shape: {x.shape} {len(x.shape)}")
         if self.encoder is not None:
             x = self.encoder(x)
         values = 0
 
         single_dim = False
+        # print(f" x shape: {x.shape} {len(x.shape)}")
         if len(x.shape) == 1:
             single_dim = True
             x = x.unsqueeze(0)
@@ -936,7 +938,7 @@ class QS(nn.Module):
         # If the heads have their own hidden layers for a 2 layer dueling network
         if self.joint_head_layers is not None:
             for li in self.joint_head_layers:
-                x = torch.relu(li(x))
+                x = torch.tanh(li(x))
         if self.dueling and self.value_head is not None:
             values = self.value_head(x[:, : self.last_hidden_dim // 2])
             if single_dim:
@@ -981,6 +983,7 @@ class QS(nn.Module):
                     dim=-1, keepdim=True
                 )
             if single_dim:
+                # print(f"single dim: {cont_advantages.shape}")
                 cont_advantages = cont_advantages.squeeze(0)
 
         return values, disc_advantages, cont_advantages

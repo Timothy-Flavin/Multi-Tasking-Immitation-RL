@@ -345,6 +345,8 @@ def PG_integration():
                 cactivation = np.zeros((2), dtype=np.float32) - 0.5
                 default_clp = np.ones((1), dtype=np.float32)
                 default_dlp = np.ones((1, 1), dtype=np.float32)
+
+                # input(f"ob shape: {obs.shape}")
                 dact, cact, dlp, clp, cactivation, v = model.train_actions(
                     obs, step=True, debug=False
                 )
@@ -423,5 +425,5 @@ def PG_integration():
 
 
 if __name__ == "__main__":
-    # PG_integration()
+    PG_integration()
     PG_test()

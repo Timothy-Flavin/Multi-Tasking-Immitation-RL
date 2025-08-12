@@ -51,8 +51,10 @@ class DQN(nn.Module, Agent):
         encoder=None,
         conservative=False,
         imitation_type="cross_entropy",  # or "reward"
+        value_per_head=False,
     ):
         super(DQN, self).__init__()
+        self.device = device
         self.clip_grad = clip_grad
         if load_from_checkpoint_path is not None:
             self.load(load_from_checkpoint_path)
@@ -116,15 +118,51 @@ class DQN(nn.Module, Agent):
                 if head_hidden_dim is not None
                 else None
             ),  # if None then no head hidden layer
+            value_per_head=value_per_head,
         )
 
         self.Q1.to(device)
 
+        self.Q2 = QS(
+            obs_dim=obs_dim,
+            continuous_action_dim=continuous_action_dims,
+            discrete_action_dims=discrete_action_dims,
+            hidden_dims=hidden_dims,
+            activation=activation,
+            orthogonal=orthogonal,
+            dueling=dueling,
+            n_c_action_bins=n_c_action_bins,
+            device=device,
+            encoder=encoder,  # pass encoder if using one for observations (like in visual DQN)
+            head_hidden_dims=(
+                np.copy(np.array(head_hidden_dim))
+                if head_hidden_dim is not None
+                else None
+            ),  # if None then no head hidden layer
+            value_per_head=value_per_head,
+        )
+        self.Q2.to(self.device)
+        with torch.no_grad():
+            self.Q2.load_state_dict(self.Q1.state_dict())
+
+        self.update_num = 0
         self.conservative = conservative
-        self.device = device
-        self.optimizer = torch.optim.Adam(self.Q1.parameters(), lr=lr)
+        # self.optimizer = torch.optim.Adam(self.Q1.parameters(), lr=0.1)
         self.to(device)
 
+        # for i in range(50):
+        #     obs = torch.rand(size=(128, obs_dim), device=self.device) - 0.5
+        #     values, disc_yhat, cont_yhat = self.Q1(obs)
+        #     print(
+        #         f"vs: {values.shape if isinstance(values, torch.Tensor) else 0.0} dy: {[len(disc_yhat),disc_yhat[0].shape] if disc_yhat is not None else None} cy: {cont_yhat.shape if cont_yhat is not None else None}"
+        #     )
+        #     targ = torch.rand_like(yhat) / 10
+        #     loss = ((yhat - targ) ** 2).mean()
+        #     self.optimizer.zero_grad()
+        #     loss.backward()
+        #     self.optimizer.step()
+        #     print(loss.item())
+        self.optimizer = torch.optim.Adam(self.Q1.parameters(), lr=lr)
         # These can be saved to remake the same DQN
         # TODO: check that this is suffucuent
         self.attrs = [
@@ -153,8 +191,11 @@ class DQN(nn.Module, Agent):
         ) * self.action_ranges + self.action_means
 
     def _cont_from_soft_q(self, cont_act):
+        # print(Categorical(logits=cont_act / self.entropy_loss_coef).probs)
         return (
-            Categorical(logits=cont_act).sample() / (self.n_c_action_bins - 1) - 0.5
+            Categorical(logits=cont_act / self.entropy_loss_coef).sample()
+            / (self.n_c_action_bins - 1)
+            - 0.5
         ) * self.action_ranges + self.action_means
 
     def _discretize_actions(self, continuous_actions):
@@ -178,6 +219,7 @@ class DQN(nn.Module, Agent):
             )
         value = 0
         if self.init_eps > 0.0 and np.random.rand() < self.eps:
+            # print("Random action")
             if (
                 self.discrete_action_dims is not None
                 and len(self.discrete_action_dims) > 0
@@ -194,6 +236,7 @@ class DQN(nn.Module, Agent):
                 ) * self.np_action_ranges + self.np_action_means
             # print(disc_act)
         else:
+            # print("Not random action")
             with torch.no_grad():
                 # print("Getting value from Q1 for soft action selection")
                 value, disc_act, cont_act = self.Q1(observations, action_mask)
@@ -222,7 +265,6 @@ class DQN(nn.Module, Agent):
     def _soft_train_action(self, observations, action_mask, step, debug):
         disc_act, cont_act = None, None
         with torch.no_grad():
-
             value, disc_act, cont_act = self.Q1(observations, action_mask)
             # print("Done with that")
             if (
@@ -245,8 +287,16 @@ class DQN(nn.Module, Agent):
         return disc_act, cont_act
 
     def train_actions(self, observations, action_mask=None, step=False, debug=False):
-        if len(observations.shape) == 1:
-            observations = np.expand_dims(observations, axis=0)
+        # if len(observations.shape) == 1:
+        #    observations = np.expand_dims(observations, axis=0)
+        # if self.dqn_type == dqntype.Munchausen or self.dqn_type == dqntype.Soft:
+        #     disc_act, cont_act = self._soft_train_action(
+        #         observations, action_mask, step, debug
+        #     )
+        #     # print(disc_act)
+        #     # print(cont_act)
+        #     # print()
+        # else:
         disc_act, cont_act = self._e_greedy_train_action(
             observations, action_mask, step, debug
         )
@@ -356,7 +406,7 @@ class DQN(nn.Module, Agent):
             if debug:
                 print(f"value: {value}, dac: {dac}, cac: {cac}, eps: {self.eps}")
             if self.dueling:
-                return value  # TODO make sure this doesnt need to be item()
+                return value.mean()  # TODO make sure this doesnt need to be item()
 
             dq = 0
             n = 0
@@ -678,12 +728,16 @@ class DQN(nn.Module, Agent):
         jagged=True,
         debug=True,
     ):
-        # print(f"advantages {advantages.shape} jagged: {jagged}")
+        # print(
+        #     f"advantages {advantages.shape if isinstance(advantages, torch.Tensor) else [len(advantages),advantages[0].shape]} jagged: {jagged} values: {values.shape if isinstance(values,torch.Tensor) else 0}"
+        # )
+        vals = values
+
         if jagged:  # discrete action bins are jagget
             assert (
                 action_dim is not None
             ), "Cant be jagged=True with no action dim passed to _target()"
-            vals = values.squeeze(-1) if self.dueling else 0  # make it a column vector
+            # vals = values.squeeze(-1) if self.dueling else 0  # make it a column vector
             # action_dim = len(self.discrete_action_dims)
             Q_ = torch.zeros(
                 size=(advantages[0].shape[0], len(action_dim)),
@@ -709,17 +763,28 @@ class DQN(nn.Module, Agent):
                         print(
                             f"  M-DQN or Soft DQN: adv(max_a): {torch.max(advantages[i], dim=-1).values.shape}, vals: {vals.shape if self.dueling and isinstance(vals, torch.Tensor) else values}"
                         )
-
-                    q_vals = vals + advantages[i]
+                    # print(
+                    #    f"adv {i}: {advantages[i].shape} vals: {vals.shape if isinstance(vals,torch.Tensor) else 0} lp: {lprobs.shape}"
+                    # )
 
                     Q_[:, i] = torch.sum(
-                        probs * (q_vals - self.entropy_loss_coef * lprobs), dim=-1
-                    )
+                        probs * (advantages[i] - self.entropy_loss_coef * lprobs),
+                        dim=-1,
+                    ) + vals.squeeze(-1)
                 else:
                     if debug:
                         print(
                             f"  Standard DQN: adv(max_a): {torch.max(advantages[:,i], dim=-1).values.shape}, vals: {vals.shape if self.dueling and isinstance(vals, torch.Tensor) else values}"
                         )
+
+                    if isinstance(vals, torch.Tensor):
+                        vals = vals.squeeze(-1)
+                        if debug and len(vals.shape) != len(advantages[i].shape) - 1:
+                            print(
+                                f"adv {i}: {torch.max(advantages[i], dim=-1).values.shape} vals: {vals.shape if isinstance(vals,torch.Tensor) else 0}"
+                            )
+                            input("oh noes: ")
+
                     Q_[:, i] = torch.max(advantages[i], dim=-1).values + vals
 
         else:  # continuous bins are not jagged
@@ -734,16 +799,31 @@ class DQN(nn.Module, Agent):
                     print(
                         f"  M-DQN or Soft DQN: adv(max_a): {torch.max(advantages, dim=-1).values.shape}, vals: {values.shape if self.dueling else values}"
                     )
-                if self.dueling:
-                    vals = values.unsqueeze(-1).expand(
-                        advantages.shape
-                    )  # make it a column vector
-                else:
-                    vals = 0
-                q_vals = vals + advantages
-                Q_ = torch.sum(
-                    probs * (q_vals - self.entropy_loss_coef * lprobs), dim=-1
+
+                # if isinstance(vals, torch.Tensor):
+                #     vals = vals.unsqueeze(-1)
+                #     if len(vals.shape) != len(advantages.shape):
+                #         print(
+                #             f"max advs: {advantages.shape} + vals {vals.shape if isinstance(vals,torch.Tensor) else 0}"
+                #         )
+                #         input("hmm this looks bad: ")
+
+                # q_vals = vals + advantages
+                print(vals.shape)
+                print(probs.shape)
+                print(
+                    torch.sum(
+                        probs * (advantages - self.entropy_loss_coef * lprobs), dim=-1
+                    ).shape
                 )
+                input("hiya")
+                Q_ = (
+                    torch.sum(
+                        probs * (advantages - self.entropy_loss_coef * lprobs), dim=-1
+                    )
+                    + vals
+                )
+
                 if debug:
                     print(
                         f"  vals shape: {vals.shape if self.dueling and isinstance(vals, torch.Tensor) else 0} Q_: {Q_.shape}, rewards: {rewards.unsqueeze(-1).shape}, terminated: {terminated.unsqueeze(-1).shape}"
@@ -760,12 +840,28 @@ class DQN(nn.Module, Agent):
                 # print(
                 #     f"max advs: {torch.max(advantages, dim=-1).values.shape} + vals {vals.shape if isinstance(vals,torch.Tensor) else 0}"
                 # )
-                Q_ = torch.max(advantages, dim=-1).values + vals
+                if isinstance(vals, torch.Tensor):
+                    if len(vals.shape) != len(
+                        torch.max(advantages, dim=-1).values.shape
+                    ):
+                        print(
+                            f"max advs: {advantages.shape} + vals {vals.shape if isinstance(vals,torch.Tensor) else 0}"
+                        )
+                        input("uh oh: ")
+                print(
+                    f"advmax: {torch.max(advantages, dim=-1).values.shape} + vals {vals.shape if isinstance(vals,torch.Tensor) else 0.0}"
+                )
+                Q_ = (
+                    torch.max(advantages, dim=-1).values.sum(dim=-1) + vals.squeeze(-1)
+                    if isinstance(vals, torch.Tensor)
+                    else 0.0
+                )
 
-        if debug:
+        if True:
             print(
                 f"  Q_: {Q_.shape}, rewards: {rewards.unsqueeze(-1).shape}, terminated: {terminated.unsqueeze(-1).shape}"
             )
+            input()
 
         targets = (
             rewards.unsqueeze(-1) + (self.gamma * (1 - terminated)).unsqueeze(-1) * Q_
@@ -777,32 +873,51 @@ class DQN(nn.Module, Agent):
     def reinforcement_learn(
         self, batch: FlexiBatch, agent_num=0, critic_only=False, debug=False
     ):
+        self.update_num += 1
         if self.eval_mode:
             return float(0.0), float(0.0)
 
         dqloss, cqloss = 0, 0
-        discrete_actions = batch.discrete_actions[agent_num]  # type: ignore
-        continuous_actions = self._discretize_actions(
-            batch.continuous_actions[agent_num]  # type: ignore
-        )
-        if debug:
-            print(
-                f"Discrete actions: {discrete_actions.shape}, Continuous actions: {continuous_actions.shape}"
+        continuous_actions = None
+        discrete_actions = None
+        if self.discrete_action_dims is not None:
+            discrete_actions = batch.discrete_actions[agent_num]  # type: ignore
+        if self.continuous_action_dims is not None and self.continuous_action_dims > 0:
+            continuous_actions = self._discretize_actions(
+                batch.continuous_actions[agent_num]  # type: ignore
             )
+            # print("Discretized ")
+            # print(continuous_actions)
+            # print(batch.continuous_actions[agent_num])
+            # print()
+        if debug:
+            if continuous_actions is not None:
+                print(f"Continuous actions: {continuous_actions.shape}")
+            if discrete_actions is not None:
+                print(f"Discrete actions: {discrete_actions.shape}")
             print(
                 f"Batch obs: {batch.obs[agent_num].shape}, Batch obs_: {batch.obs_[agent_num].shape}"
             )
         discrete_target = 0
         continuous_target = 0
         values, disc_adv, cont_adv = self.Q1(batch.obs[agent_num])
+        # print(batch.obs[agent_num])
         # if cont_adv is not None:
         #    cont_adv = cont_adv.transpose(0, 1)
         with torch.no_grad():
-            next_values, next_disc_adv, next_cont_adv = self.Q1(batch.obs_[agent_num])
+            next_values, next_disc_adv, next_cont_adv = self.Q2(batch.obs_[agent_num])
+
+            # print(
+            #     f" in rl learn: next_vals: {next_values.shape if isinstance(next_values, torch.Tensor) else 0} nextdadv: {next_disc_adv} nextcadv: {next_cont_adv}"
+            # )
+
             if (
                 self.discrete_action_dims is not None
                 and len(self.discrete_action_dims) > 0
             ):
+                assert (
+                    discrete_actions is not None
+                ), "Cant learn on discrete actions if they are None"
                 if debug:
                     print("Testing discrete Targets")
                 discrete_target = self._target(
@@ -815,20 +930,24 @@ class DQN(nn.Module, Agent):
                     debug=debug,
                 )
                 if self.dqn_type == dqntype.Munchausen:
-                    for i in range(len(self.discrete_action_dims)):
-                        temp_disc_adv = disc_adv[i].detach()
-                        # if munchausen add tau*alpha*lp(a|s) to target
-                        discrete_target[:, i] = discrete_target[
-                            :, i
-                        ] + self.entropy_loss_coef * self.munchausen * (
-                            Categorical(
-                                logits=temp_disc_adv / self.entropy_loss_coef
-                            ).log_prob(discrete_actions[:, i])
-                        )
+                    with torch.no_grad():
+                        for i in range(len(self.discrete_action_dims)):
+                            # temp_disc_adv = disc_adv[i].detach()
+                            # if munchausen add tau*alpha*lp(a|s) to target
+                            discrete_target[:, i] = discrete_target[
+                                :, i
+                            ] + self.entropy_loss_coef * self.munchausen * (
+                                Categorical(
+                                    logits=disc_adv[i] / self.entropy_loss_coef
+                                ).log_prob(discrete_actions[:, i])
+                            )
             if (
                 self.continuous_action_dims is not None
                 and self.continuous_action_dims > 0
             ):
+                assert (
+                    continuous_actions is not None
+                ), "Cant learn on continuous actions if they are None"
                 if debug:
                     print("Testing continuous Targets")
                 if cont_adv is not None:
@@ -843,20 +962,34 @@ class DQN(nn.Module, Agent):
                 )
                 cont_adv = cont_adv.transpose(0, 1)
                 if self.dqn_type == dqntype.Munchausen:
-                    temp_cont_adv = cont_adv.detach()
-
-                    continuous_target = (
-                        continuous_target
-                        + self.entropy_loss_coef
-                        * self.munchausen
-                        * torch.log_softmax(
-                            temp_cont_adv / self.entropy_loss_coef, dim=-1
+                    with torch.no_grad():
+                        # THESE DO THE EXACT SAME THING
+                        # temp_cont_adv = cont_adv.detach()
+                        # print(f"cont adv shape: {cont_adv.shape}")
+                        # print(f"cact shape: {continuous_actions.shape}")
+                        # catprobs = Categorical(
+                        #     logits=cont_adv / self.entropy_loss_coef
+                        # ).log_prob(continuous_actions)
+                        # otherprobs = (
+                        #     torch.log_softmax(cont_adv / self.entropy_loss_coef, dim=-1)
+                        #     .gather(dim=-1, index=continuous_actions.unsqueeze(-1))
+                        #     .squeeze(-1)
+                        # )
+                        continuous_target = (
+                            continuous_target
+                            + self.entropy_loss_coef
+                            * self.munchausen
+                            * torch.log_softmax(
+                                cont_adv / self.entropy_loss_coef, dim=-1
+                            )
+                            .gather(dim=-1, index=continuous_actions.unsqueeze(-1))
+                            .squeeze(-1)
                         )
-                        .gather(dim=-1, index=continuous_actions.unsqueeze(-1))
-                        .squeeze(-1)
-                    )
         cQ = torch.zeros(1, device=self.device)
         if self.continuous_action_dims is not None and self.continuous_action_dims > 0:
+            assert (
+                continuous_actions is not None
+            ), "Cant do continuous action update if actions are None"
             assert isinstance(
                 continuous_target, torch.Tensor
             ), "Need a target tensor if continuous action dims are to be used"
@@ -865,7 +998,10 @@ class DQN(nn.Module, Agent):
                     f"Calculating cQ: cont_advs.shape: {cont_adv.shape}, continuous_actions: {continuous_actions.unsqueeze(-1).shape}, vals: {values.shape if self.dueling else 0}"
                 )
             # print(
-            #     f"cont adv: {cont_adv.shape} cactions: {continuous_actions.shape} vals: {values.shape if isinstance(values,torch.Tensor) else 0}"
+            #     f"cont adv: {cont_adv.shape} cactions: {continuous_actions.unsqueeze(-1).shape} vals: {values.shape if isinstance(values,torch.Tensor) else 0}"
+            # )
+            # input(
+            #     f"cQ; {torch.gather(input=cont_adv,dim=-1,index=continuous_actions.unsqueeze(-1),).squeeze(-1).shape} vals: {values.shape if isinstance(values,torch.Tensor) else 0.0}"
             # )
             cQ = torch.gather(
                 input=cont_adv,
@@ -878,6 +1014,9 @@ class DQN(nn.Module, Agent):
 
         dQ = torch.zeros(1, device=self.device)
         if self.discrete_action_dims is not None and len(self.discrete_action_dims) > 0:
+            assert (
+                discrete_actions is not None
+            ), "Cant do discrete update if discrete actions are None"
             dQ = torch.zeros(
                 size=(batch.global_rewards.shape[0], len(self.discrete_action_dims)),
                 device=self.device,
@@ -888,6 +1027,9 @@ class DQN(nn.Module, Agent):
                     print(
                         f"  disc_adv: {disc_adv[d].shape}, disc_act: {discrete_actions[:, d].unsqueeze(-1).shape}"
                     )
+                # input(
+                #    f"dQ[{d}]; {torch.gather(disc_adv[d],dim=-1,index=discrete_actions[:, d].unsqueeze(-1),).shape} vals: {values.shape if isinstance(values,torch.Tensor) else 0.0}"
+                # )
                 dQ[:, d] = (
                     torch.gather(
                         disc_adv[d],
@@ -900,14 +1042,19 @@ class DQN(nn.Module, Agent):
         dqloss, cqloss = 0, 0
         trainable = False
         if self.discrete_action_dims is not None and len(self.discrete_action_dims) > 0:
+            # print(dQ.shape)
+            # print(discrete_target.shape)
             dqloss = (dQ - discrete_target) ** 2
             dqloss = dqloss.mean()
             trainable = True
 
         if self.continuous_action_dims is not None and self.continuous_action_dims > 0:
+            # print(cQ.shape)
+            # print(continuous_target.shape)
             cqloss = (cQ - continuous_target) ** 2
             cqloss = cqloss.mean()
             trainable = True
+            # input("mm")
 
         if trainable:
             loss = dqloss + cqloss
@@ -931,6 +1078,13 @@ class DQN(nn.Module, Agent):
             dqloss = dqloss.item()
         if cqloss != 0:
             cqloss = cqloss.item()
+
+        if self.update_num > 8:
+            # print("updating delayed network")
+            self.update_num = 0
+            with torch.no_grad():
+                self.Q2.load_state_dict(self.Q1.state_dict())
+
         return float(dqloss), float(cqloss)  # actor loss, critic loss
 
     def _dump_attr(self, attr, path):
@@ -990,9 +1144,26 @@ class DQN(nn.Module, Agent):
                 dueling=self.dueling,
                 n_c_action_bins=self.n_c_action_bins,
                 device=self.device,
+                value_per_head=False,
             )
+            self.Q2 = QS(
+                obs_dim=self.obs_dim,
+                continuous_action_dim=self.continuous_action_dims,
+                discrete_action_dims=self.discrete_action_dims,
+                hidden_dims=self.hidden_dims,
+                activation=self.activation,
+                orthogonal=self.orthogonal,
+                dueling=self.dueling,
+                n_c_action_bins=self.n_c_action_bins,
+                device=self.device,
+                value_per_head=False,
+            )
+
         self.Q1.load_state_dict(torch.load(checkpoint_path + "/Q1", weights_only=True))
         self.Q1.to(self.device)
+        with torch.no_grad():
+            self.Q2.load_state_dict(self.Q1.state_dict())
+            self.Q2.to(self.device)
 
         self.optimizer = torch.optim.Adam(self.Q1.parameters(), lr=self.lr)
         self.to(self.device)
@@ -1003,7 +1174,7 @@ class DQN(nn.Module, Agent):
         st = ""
 
         for i in self.__dict__.keys():
-            st += f"i: {self.__dict__[i]}"
+            st += f"{i}: {self.__dict__[i]}\n"
 
         return st
 

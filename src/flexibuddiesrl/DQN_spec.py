@@ -107,7 +107,7 @@ def DQN_test():
     current_iter = 0
     for vals in product(*param_grid.values()):
         h = dict(zip(p_keys, vals))
-        print(h)
+        # print(h)
         if h["continuous_action_dim"] == 0 and h["discrete_action_dims"] is None:
             continue
         if h["munchausen"] > 0.0 and h["entropy"] == 0.0:
@@ -177,29 +177,11 @@ def DQN_test():
         )
         run_times["train_action_single"] += time.time() - _s
 
-        # if (d_acts is not None and d_acts.shape[0] != 2) or (
-        #     c_acts is not None and c_acts.shape[0] != 5
-        # ):
-        #     print(
-        #         f"Training actions: c: {c_acts}, d: {d_acts}, d_log: {d_log}, c_log: {c_log}"
-        #     )
-
         _s = time.time()
         d_acts, c_acts, d_log, c_log, _1, _ = model.train_actions(
             obs_batch, step=True, debug=False
         )
         run_times["train_action_batch"] += time.time() - _s
-
-        # if (
-        #     d_acts is not None
-        #     and (d_acts.shape[0] != batch_size or d_acts.shape[1] != 2)
-        # ) or (
-        #     c_acts is not None
-        #     and (c_acts.shape[0] != batch_size or c_acts.shape[1] != 5)
-        # ):
-        #     print(
-        #         f"Training batch actions: c: {c_acts}, d: {d_acts}, d_log: {d_log}, c_log: {c_log}"
-        #     )
         mb = mem_buff.sample_transitions(
             batch_size=batch_size, as_torch=True, device=h["device"]
         )
@@ -229,9 +211,206 @@ def DQN_test():
             print(h)
             raise e
         run_times["reinforcement_learn"] += time.time() - _s
-        print(f"time: {time.time()-t}")
+        # print(f"time: {time.time()-t}")
     print(tot)
 
 
+def DQN_integration():
+
+    param_grid = {
+        "discrete_action_dims": [None, [3, 4]],  # np.array([2]),
+        "continuous_action_dim": [2, 0],  # 2,
+        "head_hidden_dim": [None, [32]],  # if None then no head hidden layer
+        "dueling": [True, False],
+        "munchausen": [0.0, 0.9],  # turns it into munchausen dqn
+        "entropy": [0.0, 0.1],  # turns it into soft-dqn
+        "device": ["cpu", "cuda"],
+        "conservative": [False, True],
+        "imitation_type": ["cross_entropy", "reward"],  # or "reward"
+    }
+
+    for config_id in range(10):
+        dfirst = 0
+        cdim = 0
+        ddim = None
+        if config_id % 2 == dfirst:
+            cdim = 2
+        else:
+            ddim = [4]
+
+        batch_size = 512
+
+        mem_buff = FlexibleBuffer(
+            num_steps=10000,
+            n_agents=1,
+            discrete_action_cardinalities=[4],
+            track_action_mask=False,
+            path="./test_buffer",
+            name="spec_buffer",
+            memory_weights=False,
+            global_registered_vars={
+                "global_rewards": (None, np.float32),
+            },
+            individual_registered_vars={
+                "obs": ([8], np.float32),
+                "obs_": ([8], np.float32),
+                "discrete_actions": ([1], np.int64),
+                "continuous_actions": ([2], np.float32),
+            },
+        )
+        mem_buff.reset()
+        munch = param_grid["munchausen"][random.randint(0, 1)]
+        munch = 0.0
+        print(f"munch: {munch}")
+        model = DQN(
+            obs_dim=8,
+            discrete_action_dims=ddim,
+            continuous_action_dims=cdim,
+            min_actions=(None if cdim == 0 else -np.ones(2)),  # np.array([-1,-1]),
+            max_actions=(None if cdim == 0 else np.ones(2)),  # ,np.array([1,1]),
+            hidden_dims=[64, 64],  # first is obs dim if encoder provded
+            head_hidden_dim=param_grid["head_hidden_dim"][
+                random.randint(0, 1)
+            ],  # if None then no head hidden layer
+            gamma=0.99,
+            lr=3e-5,
+            imitation_lr=1e-5,
+            dueling=True,  # param_grid["dueling"][random.randint(0, 1)],
+            n_c_action_bins=3,
+            munchausen=munch,  # turns it into munchausen dqn
+            entropy=0.0,  # param_grid["entropy"][random.randint(0, 1) or munch > 0.1],  # turns it into soft-dqn
+            activation="tanh",
+            orthogonal=False,
+            init_eps=1.0,
+            eps_decay_half_life=15000,
+            device=param_grid["device"][random.randint(0, 1)],
+            eval_mode=False,
+            name="DQN",
+            clip_grad=0.5,
+            load_from_checkpoint_path=None,
+            encoder=None,
+            conservative=param_grid["conservative"][random.randint(0, 1)],
+            imitation_type=param_grid["imitation_type"][
+                random.randint(0, 1)
+            ],  # or "reward"
+        )
+        print(model)
+        # Print current hyper parameters before episode start
+
+        gym_env = gym.make(
+            "LunarLander-v2",
+            continuous=config_id % 2 == dfirst,  # render_mode="human"
+        )
+        obs, _ = gym_env.reset()
+        obs_ = obs + 0.1
+        rewards = [0.0]
+        ep_num = 0
+        ep_step = 0
+        tot_closs = [0.0]
+
+        for i in range(100000):
+            with torch.no_grad():
+                env_action = 0
+                default_dact = np.zeros((1), dtype=np.int64)
+                default_cact = np.zeros((2), dtype=np.float32)
+                # input(f"obs: {obs.shape}")
+                dact, cact, dlp, clp, cactivation, v = model.train_actions(
+                    obs, step=True, debug=False
+                )
+                # print(dact)
+                # print(cact)
+                # print(dlp)
+                # print(clp)
+                # print()
+
+            if cdim > 0:
+                assert (
+                    cact is not None
+                ), f"Continuous action and log prob {cact} {clp} should not be None when cdim [{cdim}] is not 0"
+                # print(f"Continuous action: {cact}, log prob: {clp}")
+                # print()
+                # input()
+                # print(cact.shape, clp.shape)
+                # print("from logits look like:")
+                # print(model.actor.forward(obs))
+                # print(model.action_clamp_type)
+
+                env_action = cact  # int(cact[0] > 0.5)
+                default_cact = cact
+                # print(clp)
+            else:
+                assert (
+                    dact is not None
+                ), f"Discrete action and log prob {dact} {dlp} should not be None when cdim [{cdim}] is 0"
+                # print(dact.shape, dlp.shape, dact, dlp)
+                env_action = dact[0]
+                default_dact[0] = dact[0]
+
+            obs_, reward, terminated, truncated, _ = gym_env.step(env_action)
+            if ep_step > 1000:
+                truncated = True
+            rewards[-1] = rewards[-1] + float(reward)
+            rv = {
+                "global_rewards": reward,
+                "obs": [obs.copy()],
+                "obs_": [obs_.copy()],
+                "discrete_actions": (default_dact.copy()),
+                "continuous_actions": (default_cact.copy()),
+            }
+            # print(rv)
+            ep_step += 1
+            mem_buff.save_transition(
+                terminated=terminated,
+                registered_vals=rv,
+            )
+
+            obs = obs_.copy()
+            if terminated or truncated:
+                if ep_num % 50 == 0:
+                    gym_env = gym.make(
+                        "LunarLander-v2",
+                        continuous=config_id % 2 == dfirst,
+                        render_mode="human",
+                    )
+                else:
+                    gym_env = gym.make(
+                        "LunarLander-v2",
+                        continuous=config_id % 2 == dfirst,
+                    )
+                obs, _ = gym_env.reset()
+                obs = obs.copy()
+                rewards.append(0.0)
+                tot_closs.append(0.0)
+                if ep_num % 20 == 19:
+                    print(
+                        f"Episode {ep_num}, total reward: {sum(rewards[-12:-2])/10} eps: {model.eps}"
+                    )
+                ep_num += 1
+                ep_step = 0
+
+            if mem_buff.steps_recorded > batch_size * 10 and ep_step % 2 == 0:
+                # print(model.action_clamp_type)
+                mb = mem_buff.sample_transitions(
+                    batch_size=batch_size, as_torch=True, device=model.device
+                )
+                # for k in range(50):
+                aloss, closs = model.reinforcement_learn(mb, 0, debug=False)
+                tot_closs[-1] += closs
+                # print(f"Iteration {i}, aloss: {aloss}, closs: {closs}")
+                # input()
+                # mem_buff.reset()
+
+        for i in range(1, len(rewards)):
+            rewards[i] = 0.9 * rewards[i - 1] + 0.1 * rewards[i]
+        plt.plot(rewards)
+        plt.title("Rewards")
+        plt.show()
+
+        plt.plot(tot_closs)
+        plt.title("continuous loss")
+        plt.show()
+
+
 if __name__ == "__main__":
+    DQN_integration()
     DQN_test()
