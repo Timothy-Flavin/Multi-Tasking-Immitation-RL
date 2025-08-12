@@ -223,7 +223,7 @@ def test_hyperparams(args, verbose=False):
     )
     x = ""
     train_action_passes = 0
-    immitation_learn_passes = 0
+    imitation_learn_passes = 0
     reinforcement_learn_passes = 0
 
     failed_agents = []
@@ -281,7 +281,7 @@ def test_hyperparams(args, verbose=False):
             )
             if verbose:
                 print(f"Imitation learn losses: aloss: {aloss}, closs: {closs}")
-            immitation_learn_passes += 1
+            imitation_learn_passes += 1
 
         except Exception as e:
             print(f"Agent {i} failed during imitation_learn: {e}")
@@ -302,7 +302,7 @@ def test_hyperparams(args, verbose=False):
         f"Train actions passed: {train_action_passes}, coverage: {train_action_passes / len(agents) * 100:.2f}%"
     )
     print(
-        f"Imitation learn passed: {immitation_learn_passes}, coverage: {immitation_learn_passes / len(agents) * 100:.2f}%"
+        f"Imitation learn passed: {imitation_learn_passes}, coverage: {imitation_learn_passes / len(agents) * 100:.2f}%"
     )
     print(
         f"Reinforcement learn passed: {reinforcement_learn_passes}, coverage: {reinforcement_learn_passes / len(agents) * 100:.2f}%"

@@ -44,7 +44,7 @@ class PG(nn.Module, Agent):
         encoder=None,
         action_head_hidden_dims=None,
         std_type="stateless",  # ['full' 'diagonal' or 'stateless']
-        naive_immitation=False,  # if true, do MSE instead of MLE
+        naive_imitation=False,  # if true, do MSE instead of MLE
         action_clamp_type="tanh",
         batch_name_map={
             "discrete_actions": "discrete_actions",
@@ -86,7 +86,7 @@ class PG(nn.Module, Agent):
             "eval_mode",
             "action_head_hidden_dims",
             "std_type",
-            "naive_immitation",
+            "naive_imitation",
             "action_clamp_type",
         ]
         self.run_times = {
@@ -120,7 +120,7 @@ class PG(nn.Module, Agent):
         self.name = name
         self.encoder = encoder
         self.action_clamp_type = action_clamp_type
-        self.naive_immitation = naive_immitation
+        self.naive_imitation = naive_imitation
         if load_from_checkpoint is not None:
             self.load(load_from_checkpoint)
             return
@@ -363,7 +363,7 @@ class PG(nn.Module, Agent):
 
         return total_loss
 
-    def _continuous_mle_immitation_loss(
+    def _continuous_mle_imitation_loss(
         self, continuous_mean_logits, continuous_log_std_logits, continuous_actions
     ):
         # if self.std_type == 'stateless' then we have a single nn parameter
@@ -377,7 +377,7 @@ class PG(nn.Module, Agent):
             continuous_log_std_logits = self.actor_logstd
         assert (
             continuous_log_std_logits is not None
-        ), f"Inside _continuous_mle_immitation_loss: log std logits is none for type: {self.std_type}"
+        ), f"Inside _continuous_mle_imitation_loss: log std logits is none for type: {self.std_type}"
 
         continuous_log_std_logits.expand_as(continuous_mean_logits)
 
@@ -412,7 +412,7 @@ class PG(nn.Module, Agent):
         )  # TODO: dist.entropy() to stop it from overfitting
         return loss
 
-    def _continuous_naive_immitation_loss(
+    def _continuous_naive_imitation_loss(
         self,
         continuous_mean_logits: torch.Tensor,
         continuous_log_std_logits: torch.Tensor,
@@ -437,7 +437,7 @@ class PG(nn.Module, Agent):
 
         assert (
             continuous_log_std_logits is not None
-        ), f"Inside _continuous_naive_immitation_loss: log std logits is none for type: {self.std_type}"
+        ), f"Inside _continuous_naive_imitation_loss: log std logits is none for type: {self.std_type}"
 
         continuous_log_std_logits = continuous_log_std_logits.expand_as(
             continuous_mean_logits
@@ -514,38 +514,38 @@ class PG(nn.Module, Agent):
         continuous_mean_logits, continuous_log_std_logits, discrete_logits = self.actor(
             x=observations, action_mask=action_mask, debug=False
         )
-        continuous_immitation_loss = torch.zeros(1, device=self.device)
-        discrete_immitation_loss = torch.zeros(1, device=self.device)
+        continuous_imitation_loss = torch.zeros(1, device=self.device)
+        discrete_imitation_loss = torch.zeros(1, device=self.device)
 
         if self.continuous_action_dim > 0 and continuous_actions is not None:
-            if self.naive_immitation:
-                continuous_immitation_loss = self._continuous_mle_immitation_loss(
+            if self.naive_imitation:
+                continuous_imitation_loss = self._continuous_mle_imitation_loss(
                     continuous_mean_logits,
                     continuous_log_std_logits,
                     continuous_actions,
                 )
             else:
-                continuous_immitation_loss = self._continuous_naive_immitation_loss(
+                continuous_imitation_loss = self._continuous_naive_imitation_loss(
                     continuous_mean_logits,
                     continuous_log_std_logits,
                     continuous_actions,
                     0.1,
                 )
         if self.discrete_action_dims is not None and discrete_actions is not None:
-            discrete_immitation_loss = self._discrete_imitation_loss(
+            discrete_imitation_loss = self._discrete_imitation_loss(
                 discrete_logits, discrete_actions
             )
 
-        loss = discrete_immitation_loss + continuous_immitation_loss
+        loss = discrete_imitation_loss + continuous_imitation_loss
         self.optimizer.zero_grad()
         loss.backward()  # type:ignore  started as a float
         self.optimizer.step()
 
-        if isinstance(discrete_immitation_loss, torch.Tensor):
-            discrete_immitation_loss = discrete_immitation_loss.to("cpu").item()
-        if isinstance(continuous_immitation_loss, torch.Tensor):
-            continuous_immitation_loss = continuous_immitation_loss.to("cpu").item()
-        return discrete_immitation_loss, continuous_immitation_loss
+        if isinstance(discrete_imitation_loss, torch.Tensor):
+            discrete_imitation_loss = discrete_imitation_loss.to("cpu").item()
+        if isinstance(continuous_imitation_loss, torch.Tensor):
+            continuous_imitation_loss = continuous_imitation_loss.to("cpu").item()
+        return discrete_imitation_loss, continuous_imitation_loss
 
     def utility_function(self, observations, actions=None):
         if not torch.is_tensor(observations):
@@ -611,17 +611,17 @@ class PG(nn.Module, Agent):
             ).sum(dim=-1)
 
         eloss = dist.entropy().mean()
-        if torch.min(log_probs) < -100:
-            print(
-                f"{self.action_clamp_type} Warning: log_probs has very low values: {torch.min(log_probs)}. "
-                "This might cause numerical instability."
-            )
-            input(f"print the rest? {self.action_clamp_type}")
-            print(
-                f"loc: {logits}, scale: {torch.exp(lstd)} actions: {actions} activations {activations}"
-            )
-            # log_probs = torch.clamp(log_probs, -100, 2)
-            # eloss = eloss * 100
+        # if torch.min(log_probs) < -100:
+        #     print(
+        #         f"{self.action_clamp_type} Warning: log_probs has very low values: {torch.min(log_probs)}. "
+        #         "This might cause numerical instability."
+        #     )
+        #     input(f"print the rest? {self.action_clamp_type}")
+        #     print(
+        #         f"loc: {logits}, scale: {torch.exp(lstd)} actions: {actions} activations {activations}"
+        #     )
+        # log_probs = torch.clamp(log_probs, -100, 2)
+        # eloss = eloss * 100
 
         return log_probs, eloss
 

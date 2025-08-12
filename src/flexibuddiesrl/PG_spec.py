@@ -16,7 +16,7 @@ def PG_test():
         "create_model": 0.0,
         "train_action_single": 0.0,
         "train_action_batch": 0.0,
-        "immitation_learn": 0.0,
+        "imitation_learn": 0.0,
         "reinforcement_learn": 0.0,
     }
     rl_times = {
@@ -219,14 +219,14 @@ def PG_test():
                 mb.__getattr__("discrete_actions")[0],
             )
         except Exception as e:
-            print("Couldn't immitation learn ")
+            print("Couldn't imitation learn ")
             print(mb.__getattr__("obs"))
             print(
                 f"obs: {mb.__getattr__('obs')}, ca: {mb.__getattr__('continuous_actions')}, da: {mb.__getattr__('discrete_actions')}"
             )
             print(h)
             raise e
-        run_times["immitation_learn"] += time.time() - _s
+        run_times["imitation_learn"] += time.time() - _s
 
         _s = time.time()
         try:
