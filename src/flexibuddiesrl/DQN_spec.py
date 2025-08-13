@@ -236,14 +236,14 @@ def DQN_integration():
         if config_id % 2 == dfirst:
             cdim = 2
         else:
-            ddim = [4]
+            ddim = [3, 3]
 
         batch_size = 512
 
         mem_buff = FlexibleBuffer(
             num_steps=10000,
             n_agents=1,
-            discrete_action_cardinalities=[4],
+            discrete_action_cardinalities=[3, 3],
             track_action_mask=False,
             path="./test_buffer",
             name="spec_buffer",
@@ -254,7 +254,7 @@ def DQN_integration():
             individual_registered_vars={
                 "obs": ([8], np.float32),
                 "obs_": ([8], np.float32),
-                "discrete_actions": ([1], np.int64),
+                "discrete_actions": ([2], np.int64),
                 "continuous_actions": ([2], np.float32),
             },
         )
@@ -299,7 +299,7 @@ def DQN_integration():
 
         gym_env = gym.make(
             "LunarLander-v3",
-            continuous=config_id % 2 == dfirst,  # render_mode="human"
+            continuous=True,  # config_id % 2 == dfirst,  # render_mode="human"
         )
         obs, _ = gym_env.reset()
         obs_ = obs + 0.1
@@ -311,7 +311,7 @@ def DQN_integration():
         for i in range(100000):
             with torch.no_grad():
                 env_action = 0
-                default_dact = np.zeros((1), dtype=np.int64)
+                default_dact = np.zeros((2), dtype=np.int64)
                 default_cact = np.zeros((2), dtype=np.float32)
                 # input(f"obs: {obs.shape}")
                 dact, cact, dlp, clp, cactivation, v = model.train_actions(
@@ -343,8 +343,9 @@ def DQN_integration():
                     dact is not None
                 ), f"Discrete action and log prob {dact} {dlp} should not be None when cdim [{cdim}] is 0"
                 # print(dact.shape, dlp.shape, dact, dlp)
-                env_action = dact[0]
+                env_action = np.array([float(dact[0] - 1), float(dact[1] - 1)])
                 default_dact[0] = dact[0]
+                default_dact[1] = dact[1]
 
             obs_, reward, terminated, truncated, _ = gym_env.step(env_action)
             if ep_step > 1000:
@@ -369,13 +370,13 @@ def DQN_integration():
                 if ep_num % 50 == 0:
                     gym_env = gym.make(
                         "LunarLander-v3",
-                        continuous=config_id % 2 == dfirst,
+                        continuous=True,
                         render_mode="human",
                     )
                 else:
                     gym_env = gym.make(
                         "LunarLander-v3",
-                        continuous=config_id % 2 == dfirst,
+                        continuous=True,
                     )
                 obs, _ = gym_env.reset()
                 obs = obs.copy()

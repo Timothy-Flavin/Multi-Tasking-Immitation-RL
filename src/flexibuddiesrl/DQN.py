@@ -914,12 +914,12 @@ class DQN(nn.Module, Agent):
                     for i in range(len(self.discrete_action_dims)):
                         # temp_disc_adv = disc_adv[i].detach()
                         # if munchausen add tau*alpha*lp(a|s) to target
-                        print(
-                            f"disc_adv shape {len(disc_adv)} {disc_adv[0].shape} {discrete_actions.shape}"
-                        )
-                        print(
-                            f"dtarg: {discrete_target.shape} dacts: {discrete_actions[:,i].shape} lp shape: {Categorical( logits=disc_adv[i] / self.entropy_loss_coef).log_prob(discrete_actions[:,i]).shape}"
-                        )
+                        # print(
+                        #     f"disc_adv shape {len(disc_adv)} {disc_adv[0].shape} {discrete_actions.shape}"
+                        # )
+                        # print(
+                        #     f"dtarg: {discrete_target.shape} dacts: {discrete_actions[:,i].shape} lp shape: {Categorical( logits=disc_adv[i] / self.entropy_loss_coef).log_prob(discrete_actions[:,i]).shape}"
+                        # )
                         discrete_target += (
                             self.entropy_loss_coef
                             * self.munchausen
