@@ -107,7 +107,7 @@ def DQN_test():
     current_iter = 0
     for vals in product(*param_grid.values()):
         h = dict(zip(p_keys, vals))
-        # print(h)
+        print(h)
         if h["continuous_action_dim"] == 0 and h["discrete_action_dims"] is None:
             continue
         if h["munchausen"] > 0.0 and h["entropy"] == 0.0:
@@ -220,7 +220,7 @@ def DQN_integration():
     param_grid = {
         "discrete_action_dims": [None, [3, 4]],  # np.array([2]),
         "continuous_action_dim": [2, 0],  # 2,
-        "head_hidden_dim": [None, [32]],  # if None then no head hidden layer
+        "head_hidden_dim": [None, None],  # if None then no head hidden layer
         "dueling": [True, False],
         "munchausen": [0.0, 0.9],  # turns it into munchausen dqn
         "entropy": [0.0, 0.1],  # turns it into soft-dqn
@@ -273,7 +273,7 @@ def DQN_integration():
                 random.randint(0, 1)
             ],  # if None then no head hidden layer
             gamma=0.99,
-            lr=3e-5,
+            lr=1e-4,
             imitation_lr=1e-5,
             dueling=True,  # param_grid["dueling"][random.randint(0, 1)],
             n_c_action_bins=3,
@@ -412,5 +412,5 @@ def DQN_integration():
 
 
 if __name__ == "__main__":
+    # DQN_test()
     DQN_integration()
-    DQN_test()
