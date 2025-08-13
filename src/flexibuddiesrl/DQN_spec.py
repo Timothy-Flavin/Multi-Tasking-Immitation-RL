@@ -230,7 +230,7 @@ def DQN_integration():
     }
 
     for config_id in range(10):
-        dfirst = 0
+        dfirst = 1
         cdim = 0
         ddim = None
         if config_id % 2 == dfirst:
@@ -260,7 +260,7 @@ def DQN_integration():
         )
         mem_buff.reset()
         munch = param_grid["munchausen"][random.randint(0, 1)]
-        munch = 0.0
+        munch = 0.9
         print(f"munch: {munch}")
         model = DQN(
             obs_dim=8,
@@ -278,7 +278,7 @@ def DQN_integration():
             dueling=True,  # param_grid["dueling"][random.randint(0, 1)],
             n_c_action_bins=3,
             munchausen=munch,  # turns it into munchausen dqn
-            entropy=0.0,  # param_grid["entropy"][random.randint(0, 1) or munch > 0.1],  # turns it into soft-dqn
+            entropy=0.1,  # param_grid["entropy"][random.randint(0, 1) or munch > 0.1],  # turns it into soft-dqn
             activation="tanh",
             orthogonal=False,
             init_eps=1.0,
@@ -298,7 +298,7 @@ def DQN_integration():
         # Print current hyper parameters before episode start
 
         gym_env = gym.make(
-            "LunarLander-v2",
+            "LunarLander-v3",
             continuous=config_id % 2 == dfirst,  # render_mode="human"
         )
         obs, _ = gym_env.reset()
@@ -368,13 +368,13 @@ def DQN_integration():
             if terminated or truncated:
                 if ep_num % 50 == 0:
                     gym_env = gym.make(
-                        "LunarLander-v2",
+                        "LunarLander-v3",
                         continuous=config_id % 2 == dfirst,
                         render_mode="human",
                     )
                 else:
                     gym_env = gym.make(
-                        "LunarLander-v2",
+                        "LunarLander-v3",
                         continuous=config_id % 2 == dfirst,
                     )
                 obs, _ = gym_env.reset()

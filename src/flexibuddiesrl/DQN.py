@@ -902,7 +902,7 @@ class DQN(nn.Module, Agent):
                 if debug:
                     print("Testing discrete Targets")
                 discrete_target = self._target(
-                    values=next_values,
+                    values=0.0,  # next_values,
                     advantages=next_disc_adv,
                     rewards=batch.global_rewards,
                     terminated=batch.terminated,
@@ -911,25 +911,24 @@ class DQN(nn.Module, Agent):
                     debug=debug,
                 )
                 if self.dqn_type == dqntype.Munchausen:
-                    with torch.no_grad():
-                        for i in range(len(self.discrete_action_dims)):
-                            # temp_disc_adv = disc_adv[i].detach()
-                            # if munchausen add tau*alpha*lp(a|s) to target
-                            print(
-                                f"disc_adv shape {len(disc_adv)} {disc_adv[0].shape} {discrete_actions.shape}"
+                    for i in range(len(self.discrete_action_dims)):
+                        # temp_disc_adv = disc_adv[i].detach()
+                        # if munchausen add tau*alpha*lp(a|s) to target
+                        print(
+                            f"disc_adv shape {len(disc_adv)} {disc_adv[0].shape} {discrete_actions.shape}"
+                        )
+                        print(
+                            f"dtarg: {discrete_target.shape} dacts: {discrete_actions[:,i].shape} lp shape: {Categorical( logits=disc_adv[i] / self.entropy_loss_coef).log_prob(discrete_actions[:,i]).shape}"
+                        )
+                        discrete_target += (
+                            self.entropy_loss_coef
+                            * self.munchausen
+                            * (
+                                Categorical(
+                                    logits=disc_adv[i] / self.entropy_loss_coef
+                                ).log_prob(discrete_actions[:, i])
                             )
-                            print(
-                                f"dtarg: {discrete_target.shape} dacts: {discrete_actions[:,i].shape} lp shape: {Categorical( logits=disc_adv[i] / self.entropy_loss_coef).log_prob(discrete_actions[:,i]).shape}"
-                            )
-                            discrete_target += (
-                                self.entropy_loss_coef
-                                * self.munchausen
-                                * (
-                                    Categorical(
-                                        logits=disc_adv[i] / self.entropy_loss_coef
-                                    ).log_prob(discrete_actions[:, i])
-                                )
-                            )
+                        )
             if (
                 self.continuous_action_dims is not None
                 and self.continuous_action_dims > 0
@@ -942,7 +941,7 @@ class DQN(nn.Module, Agent):
                 # if cont_adv is not None:
                 #    cont_adv = cont_adv.transpose(0, 1)
                 continuous_target = self._target(
-                    values=next_values,
+                    values=0.0,  # next_values,
                     advantages=next_cont_adv,
                     rewards=batch.global_rewards,
                     terminated=batch.terminated,
@@ -964,9 +963,9 @@ class DQN(nn.Module, Agent):
                         #     .gather(dim=-1, index=continuous_actions.unsqueeze(-1))
                         #     .squeeze(-1)
                         # )
-                        print(
-                            f"ct: {continuous_target.shape} log_soft shape: {torch.log_softmax(cont_adv / self.entropy_loss_coef, dim=-1).shape} gather sum shape: {torch.log_softmax(cont_adv / self.entropy_loss_coef, dim=-1).gather(dim=-1, index=continuous_actions.unsqueeze(-1)).squeeze(-1).sum(-1).shape}"
-                        )
+                        # print(
+                        #    f"ct: {continuous_target.shape} log_soft shape: {torch.log_softmax(cont_adv / self.entropy_loss_coef, dim=-1).shape} gather sum shape: {torch.log_softmax(cont_adv / self.entropy_loss_coef, dim=-1).gather(dim=-1, index=continuous_actions.unsqueeze(-1)).squeeze(-1).sum(-1).shape}"
+                        # )
                         continuous_target = (
                             continuous_target
                             + self.entropy_loss_coef
@@ -996,11 +995,15 @@ class DQN(nn.Module, Agent):
             # input(
             #     f"cQ; {torch.gather(input=cont_adv,dim=-1,index=continuous_actions.unsqueeze(-1),).shape} vals: {values.shape if isinstance(values,torch.Tensor) else 0.0}"
             # )
-            cQ = torch.gather(
-                input=cont_adv,
-                dim=-1,
-                index=continuous_actions.unsqueeze(-1),
-            ).squeeze(-1).sum(-1) + (values.squeeze(-1) if self.dueling else 0)
+            cQ = (
+                torch.gather(
+                    input=cont_adv,
+                    dim=-1,
+                    index=continuous_actions.unsqueeze(-1),
+                )
+                .squeeze(-1)
+                .sum(-1)
+            )  # + (values.squeeze(-1) if self.dueling else 0)
 
             if debug:
                 print(f"cQ: {cQ.shape}, continuous_target: {continuous_target.shape}")
@@ -1032,56 +1035,61 @@ class DQN(nn.Module, Agent):
             # print(
             #     f"dq before sum: {dQ.shape} v: {values.squeeze(-1).shape if isinstance(values,torch.Tensor) else 0.0}"
             # )
-            dQ = dQ.sum(-1) + (
-                values.squeeze(-1) if isinstance(values, torch.Tensor) else 0.0
-            )
+            dQ = dQ.sum(-1)
+            # + (
+            #     values.squeeze(-1) if isinstance(values, torch.Tensor) else 0.0
+            # )
             # print(f"new dq: {dQ.shape}")
-        dqloss, cqloss = 0, 0
-        trainable = False
-        if self.discrete_action_dims is not None and len(self.discrete_action_dims) > 0:
-            # print(dQ.shape)
-            # print(discrete_target.shape)
-            dqloss = (dQ - discrete_target) ** 2
-            dqloss = dqloss.mean()
-            trainable = True
+        # dqloss, cqloss = 0, 0
+        # trainable = False
+        # if self.discrete_action_dims is not None and len(self.discrete_action_dims) > 0:
+        #     # print(dQ.shape)
+        #     # print(discrete_target.shape)
+        #     dqloss = (dQ - discrete_target) ** 2
+        #     dqloss = dqloss.mean()
+        #     trainable = True
 
-        if self.continuous_action_dims is not None and self.continuous_action_dims > 0:
-            # print(cQ.shape)
-            # print(f"ctarg: {continuous_target.shape}")
-            # print(f"cQ: {cQ.shape}")
-            cqloss = (cQ - continuous_target) ** 2
-            cqloss = cqloss.mean()
-            trainable = True
-            # input("mm")
-
-        if trainable:
-            loss = dqloss + cqloss
-            # print(loss)
-            assert isinstance(loss, torch.Tensor)
-            self.optimizer.zero_grad()
-            loss.backward()
-            if self.clip_grad is not None and self.clip_grad > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    self.parameters(),
-                    self.clip_grad,
-                    error_if_nonfinite=True,
-                    foreach=True,
-                )
-            self.optimizer.step()
-        else:
-            warnings.warn(
-                "Action dims both zero so there is nothing to train. Not updating the model."
+        # if self.continuous_action_dims is not None and self.continuous_action_dims > 0:
+        #     # print(cQ.shape)
+        #     # print(f"ctarg: {continuous_target.shape}")
+        #     # print(f"cQ: {cQ.shape}")
+        #     cqloss = (cQ - continuous_target) ** 2
+        #     cqloss = cqloss.mean()
+        #     trainable = True
+        #     # input("mm")
+        loss = (
+            (
+                (dQ + cQ + values.squeeze(-1))
+                - (discrete_target + continuous_target + next_values.squeeze(-1))
             )
+            ** 2
+        ).mean()
+
+        assert isinstance(loss, torch.Tensor)
+        self.optimizer.zero_grad()
+        loss.backward()
+        if self.clip_grad is not None and self.clip_grad > 0:
+            torch.nn.utils.clip_grad_norm_(
+                self.parameters(),
+                self.clip_grad,
+                error_if_nonfinite=True,
+                foreach=True,
+            )
+        self.optimizer.step()
+
         if dqloss != 0:
             dqloss = dqloss.item()
         if cqloss != 0:
             cqloss = cqloss.item()
 
-        if self.update_num > 1:
-            # print("updating delayed network")
-            self.update_num = 0
-            with torch.no_grad():
-                self.Q2.load_state_dict(self.Q1.state_dict())
+        tau = 0.005  # A typical value
+        with torch.no_grad():
+            for target_param, online_param in zip(
+                self.Q2.parameters(), self.Q1.parameters()
+            ):
+                target_param.data.copy_(
+                    tau * online_param.data + (1.0 - tau) * target_param.data
+                )
 
         return float(dqloss), float(cqloss)  # actor loss, critic loss
 
