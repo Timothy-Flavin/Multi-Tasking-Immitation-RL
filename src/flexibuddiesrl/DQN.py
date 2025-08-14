@@ -749,8 +749,8 @@ class DQN(nn.Module, Agent):
                 target_param.data.copy_(
                     tau * online_param.data + (1.0 - tau) * target_param.data
                 )
-        l = loss.item()
-        return l, l  # actor loss, critic loss
+        l_ = loss.item()
+        return l_, l_  # actor loss, critic loss
 
     def _dump_attr(self, attr, path):
         f = open(path, "wb")

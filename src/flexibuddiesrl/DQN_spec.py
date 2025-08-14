@@ -1,12 +1,12 @@
 import numpy as np
 import torch
 from flexibuddiesrl.DQN import DQN
-from flexibuddiesrl.Agent import ffEncoder
+
+# from flexibuddiesrl.Agent import ffEncoder
 from itertools import product
 import time
-from flexibuff import FlexibleBuffer, FlexiBatch
+from flexibuff import FlexibleBuffer  # , FlexiBatch
 import random
-import time
 import gymnasium as gym
 import matplotlib.pyplot as plt
 
@@ -16,9 +16,9 @@ def DQN_test():
     continuous_action_dim = 5
     discrete_action_dims = [3, 5]
     batch_size = 16
-    mini_batch_size = 8
+    # mini_batch_size = 8
     obs = np.random.rand(obs_dim).astype(np.float32)
-    obs_ = np.random.rand(obs_dim).astype(np.float32)
+    # obs_ = np.random.rand(obs_dim).astype(np.float32)
     obs_batch = np.random.rand(batch_size, obs_dim).astype(np.float32)
     obs_batch_ = obs_batch + 0.1
 
