@@ -91,6 +91,7 @@ def DQN_test():
         "device": ["cpu", "cuda"],
         "conservative": [False, True],
         "imitation_type": ["cross_entropy", "reward"],  # or "reward"
+        "mix_type": [None, "VDN", "QMIX"],
     }
     p_keys = param_grid.keys()
     tot = 0
@@ -168,6 +169,7 @@ def DQN_test():
             encoder=None,
             conservative=h["conservative"],
             imitation_type=h["imitation_type"],  # or "reward"
+            mix_type=h["mix_type"],
         )
         run_times["create_model"] += time.time() - _s
 
@@ -227,6 +229,7 @@ def DQN_integration():
         "device": ["cpu", "cuda"],
         "conservative": [False, True],
         "imitation_type": ["cross_entropy", "reward"],  # or "reward"
+        "mix_type": [None, "VDN", "QMIX"],
     }
 
     for config_id in range(10):
@@ -278,7 +281,7 @@ def DQN_integration():
             dueling=True,  # param_grid["dueling"][random.randint(0, 1)],
             n_c_action_bins=3,
             munchausen=munch,  # turns it into munchausen dqn
-            entropy=0.1,  # param_grid["entropy"][random.randint(0, 1) or munch > 0.1],  # turns it into soft-dqn
+            entropy=0.03,  # param_grid["entropy"][random.randint(0, 1) or munch > 0.1],  # turns it into soft-dqn
             activation="tanh",
             orthogonal=False,
             init_eps=1.0,
@@ -290,9 +293,7 @@ def DQN_integration():
             load_from_checkpoint_path=None,
             encoder=None,
             conservative=param_grid["conservative"][random.randint(0, 1)],
-            imitation_type=param_grid["imitation_type"][
-                random.randint(0, 1)
-            ],  # or "reward"
+            mix_type=param_grid["mix_type"][random.randint(0, 2)],  # or "reward"
         )
         print(model)
         # Print current hyper parameters before episode start
