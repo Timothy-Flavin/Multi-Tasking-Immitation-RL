@@ -1,4 +1,4 @@
-from .Agent import ValueS, StochasticActor, Agent
+from .Agent import ValueS, StochasticActor, Agent, QMixer, QS
 from .Util import T, minmaxnorm
 import torch
 from flexibuff import FlexiBatch, FlexibleBuffer
@@ -55,9 +55,62 @@ class PG(nn.Module, Agent):
             "continuous_log_probs": "continuous_log_probs",
             "discrete_log_probs": "discrete_log_probs",
         },
+        mix_type=None,  # [None, 'VDN', 'QMIX']
     ):
         super(PG, self).__init__()
         self.eval_mode = eval_mode
+        if mix_type is not None:
+            if mix_type.lower() == "vdn":
+                mix_type = "VDN"
+                assert (
+                    advantage_type == "qv1"
+                ), "cant vdn if the advantage is expected to not be Q based or to be per-head adv"
+
+            elif mix_type.lower() == "qmix":
+                mix_type = "QMIX"
+                assert (
+                    advantage_type == "qv1"
+                ), "cant qmix  if the advantage is expected to not be Q based or to be per-head adv"
+                nagents = (
+                    len(discrete_action_dims) if discrete_action_dims is not None else 0
+                )
+                self.Q = QS(
+                    obs_dim + continuous_action_dim,
+                    0,
+                    discrete_action_dims,
+                    hidden_dims=[64, 64],
+                    head_hidden_dims=[32],
+                    QMIX=True,
+                )
+            elif mix_type.lower() == "none":
+                mix_type = None
+                if advantage_type == "qv1":
+                    ddim = (
+                        sum(discrete_action_dims)
+                        if discrete_action_dims is not None
+                        else 0
+                    )
+                    self.q_heads = QS(
+                        obs_dim + continuous_action_dim + ddim,
+                        0,
+                        [1],
+                        hidden_dims=[64, 64],
+                        head_hidden_dims=[32],
+                        QMIX=False,
+                    )
+                else:
+                    self.Q = QS(
+                        obs_dim + continuous_action_dim,
+                        0,
+                        discrete_action_dims,
+                        hidden_dims=[64, 64],
+                        head_hidden_dims=[32],
+                        QMIX=False,
+                    )
+
+        self.mix_type = mix_type
+        self.mixer = None
+
         self.attrs = [
             "obs_dim",
             "continuous_action_dim",
@@ -98,6 +151,7 @@ class PG(nn.Module, Agent):
             "backward": 0.0,
             "tot": 0.0001,
         }
+
         assert (
             continuous_action_dim > 0 or discrete_action_dims is not None
         ), "At least one action dim should be provided"
@@ -135,6 +189,8 @@ class PG(nn.Module, Agent):
             "constant",
             "gv",
             "g",
+            "qvhead",
+            "qv1",
         ], "Invalid advantage type"
         self.advantage_type = advantage_type
         self.clip_grad = clip_grad
@@ -1071,150 +1127,3 @@ class PG(nn.Module, Agent):
         for d in self.__dict__.keys():
             st += f"{d}: {self.__dict__[d]}\n"
         return st
-
-    def reinforcement_learn_perf(
-        self,
-        batch: FlexiBatch,
-        agent_num=0,
-        critic_only=False,
-        debug=False,
-    ):
-        __s = time.time()
-        if self.eval_mode:
-            return 0, 0
-        if debug:
-            print(f"Starting PG Reinforcement Learn for agent {agent_num}")
-        # self.run_times = {"advantage":0.0,"aloss":0.0,"closs":0.0,"backward":0.0,"total_time"}
-        _s = time.time()
-        with torch.no_grad():
-            G, advantages, values = self._calculate_advantages(batch, agent_num, debug)
-
-        # print(G.shape)
-        # input("hmm rl")
-        assert isinstance(
-            advantages, torch.Tensor
-        ), "Advantages has to be a tensor but it isn't, maybe batch was not called with as_torch=True?"
-        if self.norm_advantages:
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        self.run_times["advantage"] += time.time() - _s
-
-        avg_actor_loss = 0
-        avg_critic_loss = 0
-        # Update the actor
-        action_mask = None
-        if batch.action_mask is not None:
-            action_mask = batch.action_mask[agent_num]  # TODO: Unit test this later
-            if action_mask is not None:
-                print("Action mask Not implemented yet")
-
-        assert isinstance(
-            batch.terminated, torch.Tensor
-        ), "need to send batch to torch first"
-        bsize = len(batch.terminated)
-        nbatch = bsize // self.mini_batch_size
-        mini_batch_indices = np.arange(len(batch.terminated))
-        np.random.shuffle(mini_batch_indices)
-
-        if debug:
-            print(
-                f"  bsize: {bsize}, Mini batch indices: {mini_batch_indices}, nbatch: {nbatch}"
-            )
-
-        for epoch in range(self.n_epochs):
-            if debug:
-                print("  Starting epoch", epoch)
-            bnum = 0
-
-            while self.mini_batch_size * bnum < bsize:
-                # Get Critic Loss
-                bstart = self.mini_batch_size * bnum
-                bend = min(bstart + self.mini_batch_size, bsize - 1)
-                indices = mini_batch_indices[bstart:bend]
-                bnum += 1
-                if debug:
-                    print(
-                        f"    Mini batch: {bstart}:{bend}, Indices: {indices}, {len(indices)}"
-                    )
-                _s = time.time()
-                critic_loss = self._critic_loss(batch, indices, G, agent_num, debug)
-                self.run_times["critic_loss"] += time.time() - _s
-
-                actor_loss = torch.zeros(1, device=self.device)
-                # print(torch.abs(V_current - G[indices]).mean())
-                if not critic_only:
-                    mb_adv = advantages[torch.from_numpy(indices).to(self.device)]
-                    _s = time.time()
-                    continuous_means, continuous_log_std_logits, discrete_logits = (
-                        self.actor(
-                            x=batch.__getattr__(self.batch_name_map["obs"])[
-                                agent_num, indices
-                            ],
-                        )
-                    )
-                    self.run_times["act"] += time.time() - _s
-
-                    if self.continuous_action_dim > 0:
-                        _s = time.time()
-                        clp = batch.__getattr__(
-                            self.batch_name_map["continuous_log_probs"]
-                        )[agent_num, indices]
-                        cact = batch.__getattr__(
-                            self.batch_name_map["continuous_actions"]
-                        )[agent_num, indices]
-                        actor_loss += self._continuous_actor_loss(
-                            continuous_means,
-                            continuous_log_std_logits,
-                            clp,
-                            mb_adv,
-                            cact,
-                        )
-                        self.run_times["closs"] += time.time() - _s
-
-                    if self.discrete_action_dims is not None:
-                        _s = time.time()
-                        dact = batch.__getattr__(
-                            self.batch_name_map["discrete_actions"]
-                        )[agent_num, indices]
-                        dlp = batch.__getattr__(
-                            self.batch_name_map["discrete_log_probs"]
-                        )[agent_num, indices]
-                        actor_loss += self._discrete_actor_loss(
-                            dact, dlp, discrete_logits, mb_adv
-                        )
-                        self.run_times["dloss"] = time.time() - _s
-                    # print("actor")
-                    # self.optimizer.zero_grad()
-                    # loss = actor_loss
-                    # loss.backward()
-                    # self._print_grad_norm()
-                    # print("critic")
-                _s = time.time()
-                self.optimizer.zero_grad()
-                loss = actor_loss + critic_loss * self.critic_loss_coef
-                loss.backward()
-                # self._print_grad_norm()
-                # print(self.actor_logstd)
-                # print(self.actor_logstd.grad)
-                # self._print_grad_norm()
-
-                if self.clip_grad:
-                    torch.nn.utils.clip_grad_norm_(
-                        self.parameters(),
-                        0.5,
-                        error_if_nonfinite=True,
-                        foreach=False,
-                    )
-
-                self.optimizer.step()
-
-                self.run_times["backward"] += time.time() - _s
-
-                avg_actor_loss += actor_loss.to("cpu").item()
-                avg_critic_loss += critic_loss.to("cpu").item()
-            avg_actor_loss /= nbatch
-            avg_critic_loss /= nbatch
-        avg_actor_loss /= self.n_epochs
-        avg_critic_loss /= self.n_epochs
-
-        self.run_times["tot"] += time.time() - __s
-        return avg_actor_loss, avg_critic_loss
