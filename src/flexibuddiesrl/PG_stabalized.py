@@ -31,7 +31,7 @@ class PG(nn.Module, Agent):
         ppo_clip=0.2,
         value_loss_coef=0.5,
         value_clip=0.5,
-        advantage_type="gae",
+        advantage_type="gae",  # [g, gv, a2c, constant, gae, qv1, qvhead]
         norm_advantages=True,
         mini_batch_size=64,
         anneal_lr=200000,
@@ -58,7 +58,138 @@ class PG(nn.Module, Agent):
         mix_type=None,  # [None, 'VDN', 'QMIX']
     ):
         super(PG, self).__init__()
+
+        if self.load_from_checkpoint is not None:
+            self.load(self.load_from_checkpoint)
+            return
+
+        self.continuous_action_dim = continuous_action_dim
+        self.discrete_action_dims = discrete_action_dims
+        self.batch_name_map = batch_name_map
         self.eval_mode = eval_mode
+        self.mix_type = mix_type
+        self.mixer = None
+        self.name = name
+        self.encoder = encoder
+        self.action_clamp_type = action_clamp_type
+        self.naive_imitation = naive_imitation
+        self.ppo_clip = ppo_clip
+        self.value_clip = value_clip
+        self.gae_lambda = gae_lambda
+        self.value_loss_coef = value_loss_coef
+        self.mini_batch_size = mini_batch_size
+        self.advantage_type = advantage_type
+        self.clip_grad = clip_grad
+        self.device = device
+        self.gamma = gamma
+        self.obs_dim = obs_dim
+        self.n_epochs = n_epochs
+        self.activation = activation
+        self.norm_advantages = norm_advantages
+        self.policy_loss = 1.0
+        self.critic_loss_coef = value_loss_coef
+        self.entropy_loss = entropy_loss
+        self.min_actions = min_actions
+        self.max_actions = max_actions
+        self.hidden_dims = hidden_dims
+        self.orthogonal = orthogonal
+        self.std_type = std_type
+        self.g_mean = 0
+        self.steps = 0
+        self.anneal_lr = anneal_lr
+        self.lr = lr
+
+        self._sanitize_params()
+        self._create_mixer()
+        self._get_torch_params(encoder, action_head_hidden_dims)
+
+    def _sanitize_params(self):
+        if self.mix_type is not None and self.mix_type.lower() == "none":
+            self.mix_type = None
+        if (
+            self.discrete_action_dims is not None
+            and len(self.discrete_action_dims) == 0
+        ):
+            self.discrete_action_dims = None
+        if self.mix_type is not None and self.mix_type.lower() == "none":
+            self.mix_type = None
+        for k in ["VDN", "QMIX"]:
+            if self.mix_type is not None and self.mix_type.lower() == "vdn":
+                self.mix_type = "VDN"
+            if self.mix_type is not None and self.mix_type.lower() == "qmix":
+                self.mix_type = "QMIX"
+
+        if self.continuous_action_dim is not None and self.continuous_action_dim > 0:
+            if isinstance(self.max_actions, list):
+                self.max_actions = np.array(self.max_actions)
+            if isinstance(self.min_actions, list):
+                self.min_actions = np.array(self.min_actions)
+            if isinstance(self.min_actions, np.ndarray):
+                self.min_actions = torch.from_numpy(self.min_actions).to(self.device)
+            if isinstance(self.max_actions, np.ndarray):
+                self.max_actions = torch.from_numpy(self.max_actions).to(self.device)
+
+    def _assert_params(self):
+        assert (
+            self.continuous_action_dim > 0 or self.discrete_action_dims is not None
+        ), "At least one action dim should be provided"
+        for k in [
+            "rewards",
+            "obs",
+            "obs_",
+            "continuous_log_probs",
+            "discrete_log_probs",
+        ]:
+            assert (
+                k in self.batch_name_map
+            ), "PPO needs these names defined ['rewards','obs','obs_'] "
+        if self.discrete_action_dims is not None:
+            assert (
+                "discrete_actions" in self.batch_name_map
+                and "discrete_log_probs" in self.batch_name_map
+            ), 'discrete actions is not None but "discrete_actions" or "discrete_log_probs" does not appear in batch_name_map'
+        if self.continuous_action_dim > 0:
+            assert (
+                "continuous_actions" in self.batch_name_map
+                and "continuous_log_probs" in self.batch_name_map
+            ), 'continuous actions is not None but "continuous_actions" or "continuous_log_probs" does not appear in batch_name_map'
+        if self.continuous_action_dim > 0:
+            assert (
+                self.max_actions is not None or self.action_clamp_type is None
+            ), "Clamp type is not None, but max actions is None so no way to clamp"
+            assert (
+                self.min_actions is not None or self.action_clamp_type is None
+            ), "Clamp type is not None, but min actions is None so no way to clamp"
+
+            if self.action_clamp_type is not None:
+                assert (
+                    self.max_actions is not None
+                    and len(self.max_actions) >= self.continuous_action_dim
+                ), f"If Clamp type '{self.action_clamp_type}' is not None, len(max_actions): {len(self.max_actions) if self.max_actions is not None else None}, must be greater than continuous_action_dim: {self.continuous_action_dim}"
+                assert (
+                    self.min_actions is not None
+                    and len(self.min_actions) >= self.continuous_action_dim
+                ), f"If Clamp type '{self.action_clamp_type}' is not None, len(min_actions): {len(self.min_actions) if self.min_actions is not None else None}, must be greater than continuous_action_dim: {self.continuous_action_dim}"
+
+        assert self.advantage_type.lower() in [
+            "gae",
+            "a2c",
+            "constant",
+            "gv",
+            "g",
+            "qvhead",  # one value and one Q value per discrete head
+            "qv1",  # one valye and one Q value with all actions as input
+        ], "Invalid advantage type"
+
+    def _create_mixer(self):
+        self.critic = ValueS(
+            obs_dim=self.obs_dim,
+            hidden_dim=self.hidden_dims[0],
+            device=self.device,
+            orthogonal_init=self.orthogonal,
+            activation=self.activation,
+        ).to(self.device)
+
         if mix_type is not None:
             if mix_type.lower() == "vdn":
                 mix_type = "VDN"
@@ -108,129 +239,6 @@ class PG(nn.Module, Agent):
                         QMIX=False,
                     )
 
-        self.mix_type = mix_type
-        self.mixer = None
-
-        self.attrs = [
-            "obs_dim",
-            "continuous_action_dim",
-            "max_actions",
-            "min_actions",
-            "discrete_action_dims",
-            "lr",
-            "gamma",
-            "n_epochs",
-            "device",
-            "entropy_loss",
-            "hidden_dims",
-            "activation",
-            "ppo_clip",
-            "value_loss_coef",
-            "value_clip",
-            "advantage_type",
-            "norm_advantages",
-            "mini_batch_size",
-            "anneal_lr",
-            "orthogonal",
-            "clip_grad",
-            "gae_lambda",
-            "g_mean",
-            "steps",
-            "eval_mode",
-            "action_head_hidden_dims",
-            "std_type",
-            "naive_imitation",
-            "action_clamp_type",
-        ]
-        self.run_times = {
-            "advantage": 0.0,
-            "critic_loss": 0.0,
-            "act": 0.0,
-            "dloss": 0.0,
-            "closs": 0.0,
-            "backward": 0.0,
-            "tot": 0.0001,
-        }
-
-        assert (
-            continuous_action_dim > 0 or discrete_action_dims is not None
-        ), "At least one action dim should be provided"
-
-        self.batch_name_map = batch_name_map
-        for k in ["rewards", "obs", "obs_"]:
-            assert (
-                k in batch_name_map
-            ), "PPO needs these names defined ['rewards','obs','obs_'] "
-        if discrete_action_dims is not None:
-            assert (
-                "discrete_actions" in batch_name_map
-                and "discrete_log_probs" in batch_name_map
-            ), 'discrete actions is not None but "discrete_actions" or "discrete_log_probs" does not appear in batch_name_map'
-        if continuous_action_dim > 0:
-            assert (
-                "continuous_actions" in batch_name_map
-                and "continuous_log_probs" in batch_name_map
-            ), 'continuous actions is not None but "continuous_actions" or "continuous_log_probs" does not appear in batch_name_map'
-        self.name = name
-        self.encoder = encoder
-        self.action_clamp_type = action_clamp_type
-        self.naive_imitation = naive_imitation
-        if load_from_checkpoint is not None:
-            self.load(load_from_checkpoint)
-            return
-        self.ppo_clip = ppo_clip
-        self.value_clip = value_clip
-        self.gae_lambda = gae_lambda
-        self.value_loss_coef = value_loss_coef
-        self.mini_batch_size = mini_batch_size
-        assert advantage_type.lower() in [
-            "gae",
-            "a2c",
-            "constant",
-            "gv",
-            "g",
-            "qvhead",
-            "qv1",
-        ], "Invalid advantage type"
-        self.advantage_type = advantage_type
-        self.clip_grad = clip_grad
-        self.device = device
-        self.gamma = gamma
-        self.obs_dim = obs_dim
-        self.continuous_action_dim = continuous_action_dim
-        self.discrete_action_dims = discrete_action_dims
-        self.n_epochs = n_epochs
-        self.activation = activation
-        self.norm_advantages = norm_advantages
-
-        self.policy_loss = 1.0
-        self.critic_loss_coef = value_loss_coef
-        self.entropy_loss = entropy_loss
-
-        self.min_actions = min_actions
-        self.max_actions = max_actions
-        self.hidden_dims = hidden_dims
-        self.orthogonal = orthogonal
-
-        self.std_type = std_type
-        self.g_mean = 0
-        self.steps = 0
-        self.anneal_lr = anneal_lr
-        self.lr = lr
-
-        self._get_torch_params(encoder, action_head_hidden_dims)
-
-        if self.continuous_action_dim is not None and self.continuous_action_dim > 0:
-            if isinstance(self.max_actions, list):
-                self.max_actions = np.array(self.max_actions)
-            if isinstance(self.min_actions, list):
-                self.min_actions = np.array(self.min_actions)
-
-            if isinstance(self.min_actions, np.ndarray):
-                self.min_actions = torch.from_numpy(min_actions).to(self.device)
-            if isinstance(self.max_actions, np.ndarray):
-                self.max_actions = torch.from_numpy(max_actions).to(self.device)
-
     def _get_torch_params(self, encoder, action_head_hidden_dims=None):
         st = None
         if self.std_type in ["full", "diagonal"]:
@@ -252,13 +260,6 @@ class PG(nn.Module, Agent):
             clamp_type=self.action_clamp_type,
         ).to(self.device)
 
-        self.critic = ValueS(
-            obs_dim=self.obs_dim,
-            hidden_dim=self.hidden_dims[0],
-            device=self.device,
-            orthogonal_init=self.orthogonal,
-            activation=self.activation,
-        ).to(self.device)
         self.actor_logstd = None
         self.optimizer: torch.optim.Adam
         if self.std_type == "stateless":
@@ -1127,3 +1128,36 @@ class PG(nn.Module, Agent):
         for d in self.__dict__.keys():
             st += f"{d}: {self.__dict__[d]}\n"
         return st
+
+
+# self.attrs = [
+#             "obs_dim",
+#             "continuous_action_dim",
+#             "max_actions",
+#             "min_actions",
+#             "discrete_action_dims",
+#             "lr",
+#             "gamma",
+#             "n_epochs",
+#             "device",
+#             "entropy_loss",
+#             "hidden_dims",
+#             "activation",
+#             "ppo_clip",
+#             "value_loss_coef",
+#             "value_clip",
+#             "advantage_type",
+#             "norm_advantages",
+#             "mini_batch_size",
+#             "anneal_lr",
+#             "orthogonal",
+#             "clip_grad",
+#             "gae_lambda",
+#             "g_mean",
+#             "steps",
+#             "eval_mode",
+#             "action_head_hidden_dims",
+#             "std_type",
+#             "naive_imitation",
+#             "action_clamp_type",
+#         ]
