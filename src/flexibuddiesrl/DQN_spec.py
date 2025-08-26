@@ -263,7 +263,7 @@ def DQN_integration():
         )
         mem_buff.reset()
         munch = param_grid["munchausen"][random.randint(0, 1)]
-        munch = 0.9
+        munch = 0.0
         print(f"munch: {munch}")
         model = DQN(
             obs_dim=8,
@@ -276,12 +276,12 @@ def DQN_integration():
                 random.randint(0, 1)
             ],  # if None then no head hidden layer
             gamma=0.99,
-            lr=1e-4,
+            lr=3e-4,
             imitation_lr=1e-5,
             dueling=True,  # param_grid["dueling"][random.randint(0, 1)],
             n_c_action_bins=3,
             munchausen=munch,  # turns it into munchausen dqn
-            entropy=0.03,  # param_grid["entropy"][random.randint(0, 1) or munch > 0.1],  # turns it into soft-dqn
+            entropy=0.0,  # param_grid["entropy"][random.randint(0, 1) or munch > 0.1],  # turns it into soft-dqn
             activation="tanh",
             orthogonal=False,
             init_eps=1.0,
@@ -292,10 +292,11 @@ def DQN_integration():
             clip_grad=0.5,
             load_from_checkpoint_path=None,
             encoder=None,
-            conservative=param_grid["conservative"][random.randint(0, 1)],
-            mix_type=param_grid["mix_type"][random.randint(0, 2)],  # or "reward"
+            conservative=False,  # param_grid["conservative"][random.randint(0, 1)],
+            mix_type="None",  # param_grid["mix_type"][random.randint(0, 2)],  # or "reward"
         )
         print(model)
+        input("head hidden")
         # Print current hyper parameters before episode start
 
         gym_env = gym.make(
@@ -397,7 +398,6 @@ def DQN_integration():
                 )
                 # for k in range(50):
                 aloss, closs = model.reinforcement_learn(mb, 0, debug=False)
-                tot_closs[-1] += closs
                 # print(f"Iteration {i}, aloss: {aloss}, closs: {closs}")
                 # input()
                 # mem_buff.reset()

@@ -330,7 +330,7 @@ def PG_integration():
 
         # Print current hyper parameters before episode start
 
-        gym_env = gym.make("LunarLander-v2", continuous=config_id % 2 == 0)
+        gym_env = gym.make("LunarLander-v3", continuous=config_id % 2 == 0)
         obs, _ = gym_env.reset()
         obs_ = obs + 0.1
         rewards = [0.0]
@@ -425,5 +425,5 @@ def PG_integration():
 
 
 if __name__ == "__main__":
-    PG_integration()
     PG_test()
+    PG_integration()

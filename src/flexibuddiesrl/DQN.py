@@ -148,9 +148,12 @@ class DQN(nn.Module, Agent):
             ),  # if None then no head hidden layer
             QMIX=self.mix_type == "QMIX",
         )
+        self.head_hidden_dims = head_hidden_dim
         self.Q2.to(self.device)
         with torch.no_grad():
             self.Q2.load_state_dict(self.Q1.state_dict())
+        for param in self.Q2.parameters():
+            param.requires_grad = False
 
         self.update_num = 0
         self.conservative = conservative
@@ -500,6 +503,7 @@ class DQN(nn.Module, Agent):
         if self.mix_type == "VDN":
             Q_ = Q_.sum(dim=-1)
         elif self.mix_type is None:
+            # print(f"dQ_: {Q_.shape}, values: {values.shape}")
             Q_ = Q_ + values
         return Q_
 
@@ -513,6 +517,7 @@ class DQN(nn.Module, Agent):
         else:
             Q_ = torch.max(advantages, dim=-1).values
         if self.mix_type is None:
+            print(f"cQ_: {Q_.shape}, values: {values.shape}")
             Q_ = Q_ + values
         elif self.mix_type == "VDN":
             Q_ = Q_.sum(dim=-1)
@@ -548,13 +553,17 @@ class DQN(nn.Module, Agent):
             if self.has_discrete:
                 disc_targets = rewards.unsqueeze(-1) + (
                     self.gamma * (1 - terminated.unsqueeze(-1))
-                ) * (dQ_ + values)
+                ) * (dQ_)
+
+                # print(
+                #    f"In targ: rew: {rewards[0:5]}, terminated: {(1 - terminated.unsqueeze(-1))[0:5]}, dQ_: {dQ_[0:5]} values: {values[0:5]}"
+                # )
             else:
                 disc_targets = 0
             if self.has_continuous:
                 cont_targets = rewards.unsqueeze(-1) + (
                     self.gamma * (1 - terminated.unsqueeze(-1))
-                ) * (cQ_ + values)
+                ) * (cQ_)
             else:
                 cont_targets = 0
         else:
@@ -693,19 +702,23 @@ class DQN(nn.Module, Agent):
                 ).squeeze(-1)
             if self.mix_type == "VDN":
                 dQ = dQ.sum(-1)
-
         loss = 0
         if self.mix_type is None:
             dloss = 0
             closs = 0
             if self.has_discrete:
-                dloss = ((dQ + values - discrete_target) ** 2).mean()
+                dloss = (((dQ + values) - discrete_target) ** 2).mean()
             if self.has_continuous:
                 closs = (
                     ((cQ + values - continuous_target) ** 2).mean()
                     if self.has_continuous
                     else 0
                 )
+            # print(
+            #    f"dq {dQ[0:5]} target: {discrete_target[0:5]}, dq_v: {(dQ + values)[0:5]}, diff: {(dQ + values)[0:5] - discrete_target[0:5]}"
+            # )
+            # print(f"cq {cQ[0:5]} ctarget: {continuous_target[0:5]}")
+            # print(values[0:5])
             loss = closs + dloss
         else:
             v = values.squeeze(-1) if isinstance(values, torch.Tensor) else 0.0
@@ -740,6 +753,9 @@ class DQN(nn.Module, Agent):
                 error_if_nonfinite=True,
                 foreach=True,
             )
+        for name, param in self.Q2.named_parameters():
+            if param.grad is not None:
+                print(f"WARNING: Q2 param {name} has non-zero grad!")
         self.optimizer.step()
         tau = 0.005  # A typical value
         with torch.no_grad():
@@ -749,6 +765,7 @@ class DQN(nn.Module, Agent):
                 target_param.data.copy_(
                     tau * online_param.data + (1.0 - tau) * target_param.data
                 )
+        # input("\n\nNew iter?")
         l_ = loss.item()
         return l_, l_  # actor loss, critic loss
 
