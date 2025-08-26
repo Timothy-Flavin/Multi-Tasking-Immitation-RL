@@ -114,7 +114,7 @@ def PG_test():
         if h["continuous_action_dim"] == 0 and h["discrete_action_dims"] is None:
             continue
         tot += 1
-    print(tot)
+    # print(tot)
     start_time = time.time()
     current_time = time.time()
     current_iter = 0

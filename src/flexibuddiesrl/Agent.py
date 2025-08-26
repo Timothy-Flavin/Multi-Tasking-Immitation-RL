@@ -72,6 +72,10 @@ class Agent(ABC):
     def load(self, checkpoint_path):
         print("Load not implemented")
 
+    @abstractmethod
+    def param_count(self) -> tuple[int, int]:
+        return 0, 0  # train and execute param count
+
 
 def _orthogonal_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)

@@ -858,6 +858,19 @@ class DQN(nn.Module, Agent):
             st += f"{i}: {self.__dict__[i]}\n"
         return st
 
+    def param_count(self):
+        total_params = sum(p.numel() for p in self.Q1.parameters()) + sum(
+            p.numel() for p in self.Q2.parameters()
+        )
+        exec_params = sum(p.numel() for p in self.Q1.parameters())
+        if self.mix_type == "QMIX":
+            assert (
+                self.Q1.mixing_network is not None
+            ), "If we are a q mixer then our q network needs a mixer"
+            exec_params -= sum(p.numel() for p in self.Q1.mixing_network.parameters())
+
+        return total_params, exec_params
+
 
 # %%
 
