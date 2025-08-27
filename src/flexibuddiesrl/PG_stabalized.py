@@ -209,7 +209,7 @@ class PG(nn.Module, Agent):
         elif self.mix_type == "VDN":
             self.mixer = VDNMixer(
                 self.total_action_dims, self.obs_dim, mixing_embed_dim=self.mixer_dim
-            )
+            ).to(self.device)
             self.critic = QS(
                 obs_dim=self.obs_dim,
                 continuous_action_dim=self.continuous_action_dim,
@@ -223,11 +223,11 @@ class PG(nn.Module, Agent):
                 head_hidden_dims=[64],
                 QMIX=False,
                 QMIX_hidden_dim=0,
-            )
+            ).to(self.device)
         elif self.mix_type == "QMIX":
             self.mixer = QMixer(
                 self.total_action_dims, self.obs_dim, mixing_embed_dim=self.mixer_dim
-            )
+            ).to(self.device)
             self.critic = QS(
                 obs_dim=self.obs_dim,
                 continuous_action_dim=self.continuous_action_dim,
@@ -241,7 +241,7 @@ class PG(nn.Module, Agent):
                 head_hidden_dims=[64],
                 QMIX=False,
                 QMIX_hidden_dim=0,
-            )
+            ).to(self.device)
 
     def _get_torch_params(self, encoder, action_head_hidden_dims=None):
         st = None
@@ -1164,6 +1164,25 @@ class PG(nn.Module, Agent):
         advantages = torch.cat(advantages, dim=-1)
         return advantages
 
+    def _gather_importance(self, d_adv, c_adv):
+        importance = []
+        if d_adv is not None:
+            for h in range(len(d_adv)):
+                adv_h = d_adv[h].detach()
+                assert isinstance(adv_h, torch.Tensor)
+                importance.append(
+                    adv_h.max(dim=-1).values.unsqueeze(-1)
+                    - adv_h.min(dim=-1).values.unsqueeze(-1)
+                )
+        if c_adv is not None:
+            assert isinstance(c_adv, torch.Tensor)
+            importance.append(c_adv.max(dim=-1).values - c_adv.min(dim=-1).values)
+        for i in importance:
+            print(f" importance shape: {i.shape}")
+        importance = torch.cat(importance, dim=-1)
+        print(f"total importance shape: {importance.shape}")
+        return importance
+
     def _mix_reinforcement_learn(self, batch, agent_num, critic_only, debug):
         """If we have QMIX going on then we need to do everything different so might as well make a new function"""
         assert self.mixer is not None, "Can't mix rl without a mixer..."
@@ -1177,13 +1196,28 @@ class PG(nn.Module, Agent):
         ]
         values, d_adv, c_adv = self.critic(obs)
         adv = self._gather_observed_advantages(d_adv, c_adv, d_actions, c_actions)
-        Q = self.mixer(adv, obs) + values
+        grad_free_adv = adv.detach()
+        grad_free_adv.requires_grad = True
+        __q, adv_grad = self.mixer(grad_free_adv, obs, with_grad=True)
+
+        Q = self.mixer(adv, obs)[0] + values
         with torch.no_grad():
+            raw_importance = self._gather_importance(d_adv, c_adv.detach())
             next_values, next_d_adv, next_c_adv = self.critic(obs_)
             next_adv = self._max_advantages(
                 next_d_adv,
                 next_c_adv,
             )
+            next_Q = self.mixer(next_adv, obs_)[0] + next_values
+
+            scaled_importance = raw_importance * adv_grad
+            print(f"scaled importance: {scaled_importance}")
+            scaled_importance /= scaled_importance.sum(dim=-1).unsqueeze(-1)
+            print(f"scaled importance after: {scaled_importance}")
+        print(f"adv_grad shape: {adv_grad.shape}")
+        print(f"raw importance shape {raw_importance.shape}")
+        scaled_importance
+        input(f"makes sense?")
         credit_weights = 0  # self.
         return 0, 0
 

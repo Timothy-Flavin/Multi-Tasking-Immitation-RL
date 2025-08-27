@@ -889,20 +889,20 @@ class QMixer(nn.Module):
         b2 = b2.view(batch_size, 1, 1)
 
         # Reshape agent Q-values for mixing
-        agent_qs = agent_qs.view(batch_size, 1, self.n_agents)
+        agent_qs_view = agent_qs.view(batch_size, 1, self.n_agents)
 
         # --- Perform the mixing ---
 
         # First mixing layer
         # Use ELU activation, as is common in QMIX implementations
-        hidden = F.elu(torch.bmm(agent_qs, w1) + b1)
+        hidden = F.elu(torch.bmm(agent_qs_view, w1) + b1)
 
         # Second mixing layer
         q_total = torch.bmm(hidden, w2) + b2
 
         q_grads = None
         if with_grad:
-            q_total.backward()
+            q_total.sum().backward()
             q_grads = agent_qs.grad
 
         return q_total.view(batch_size, -1), q_grads
