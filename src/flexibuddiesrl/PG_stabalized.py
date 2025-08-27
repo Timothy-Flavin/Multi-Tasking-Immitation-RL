@@ -177,8 +177,7 @@ class PG(nn.Module, Agent):
             "constant",
             "gv",
             "g",
-            "qvhead",  # one value and one Q value per discrete head
-            "qv1",  # one valye and one Q value with all actions as input
+            "qvhead",  # one value and one A/U value per discrete head
         ], "Invalid advantage type"
 
     def _create_mixer(self):
