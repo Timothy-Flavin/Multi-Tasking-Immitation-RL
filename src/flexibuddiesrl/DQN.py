@@ -517,7 +517,7 @@ class DQN(nn.Module, Agent):
         else:
             Q_ = torch.max(advantages, dim=-1).values
         if self.mix_type is None:
-            print(f"cQ_: {Q_.shape}, values: {values.shape}")
+            # print(f"cQ_: {Q_.shape}, values: {values.shape}")
             Q_ = Q_ + values
         elif self.mix_type == "VDN":
             Q_ = Q_.sum(dim=-1)
