@@ -577,7 +577,7 @@ class DQN(nn.Module, Agent):
                 if self.has_continuous:
                     qlist.append(cQ_)
                 Q_ = (
-                    self.Q2.factorize_Q(torch.cat(qlist, dim=1), state).squeeze(-1)
+                    self.Q2.factorize_Q(torch.cat(qlist, dim=1), state)[0].squeeze(-1)
                     + vals
                 )
             else:
@@ -733,9 +733,9 @@ class DQN(nn.Module, Agent):
                     qs.append(cQ)
 
                 Q = (
-                    self.Q1.factorize_Q(
-                        torch.cat(qs, dim=1), batch.obs[agent_num]
-                    ).squeeze(-1)
+                    self.Q1.factorize_Q(torch.cat(qs, dim=1), batch.obs[agent_num])[
+                        0
+                    ].squeeze(-1)
                     + v
                 )
             assert isinstance(

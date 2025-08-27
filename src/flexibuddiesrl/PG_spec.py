@@ -104,7 +104,8 @@ def PG_test():
         "clip_grad": (False, True),
         "eval_mode": (False, True),
         "action_head_hidden_dims": (None, [8, 4]),
-        "adv_type": ["gae", "gv", "a2c", "g", "constant"],
+        "adv_type": ["qmix", "gae", "gv", "a2c", "g", "constant"],
+        "mix_type": ["QMIX", None, "VDN"],
     }
 
     p_keys = param_grid.keys()
@@ -112,6 +113,10 @@ def PG_test():
     for vals in product(*param_grid.values()):
         h = dict(zip(p_keys, vals))
         if h["continuous_action_dim"] == 0 and h["discrete_action_dims"] is None:
+            continue
+        if h["mix_type"] is not None and h["adv_type"] != "qmix":
+            continue
+        if h["adv_type"] == "qmix" and h["mix_type"] not in ["VDN", "QMIX"]:
             continue
         tot += 1
     # print(tot)
@@ -122,6 +127,11 @@ def PG_test():
         h = dict(zip(p_keys, vals))
         if h["continuous_action_dim"] == 0 and h["discrete_action_dims"] is None:
             continue
+        if h["mix_type"] is not None and h["adv_type"] != "qmix":
+            continue
+        if h["adv_type"] == "qmix" and h["mix_type"] not in ["VDN", "QMIX"]:
+            continue
+        # print("We continued??")
         # print(h)
         t = time.time()
         if t - current_time > 5.0:
@@ -174,6 +184,7 @@ def PG_test():
             action_clamp_type=h["action_clamp_type"],
             advantage_type=h["adv_type"],
             n_epochs=1,
+            mix_type=h["mix_type"],
         )
         run_times["create_model"] += time.time() - _s
 

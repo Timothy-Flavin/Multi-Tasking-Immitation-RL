@@ -330,9 +330,9 @@ class StochasticActor(nn.Module):
             assert (
                 max_actions is not None
                 and min_actions is not None
-                and len(max_actions) == continuous_action_dim
-                and len(min_actions) == continuous_action_dim
-            ), f"max_actions should be provided for each continuous action dim len(max): {len(max_actions) if max_actions is not None else None}, continuous_action_dim: {continuous_action_dim}"
+                and len(max_actions) >= continuous_action_dim
+                and len(min_actions) >= continuous_action_dim
+            ), f"max_actions should be provided for each continuous action dim len(max): {len(max_actions) if max_actions is not None else None}, continuous_action_dim: {continuous_action_dim} min: {len(min_actions) if min_actions is not None else None}, continuous_action_dim: {continuous_action_dim}"
 
         # print(
         #    f"Min actions: {min_actions}, max actions: {max_actions}, torch {torch.from_numpy(max_actions - min_actions)}"
@@ -850,7 +850,9 @@ class QMixer(nn.Module):
             nn.Linear(self.embed_dim, 1),
         )
 
-    def forward(self, agent_qs: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, agent_qs: torch.Tensor, state: torch.Tensor, with_grad: bool = False
+    ) -> tuple[torch.Tensor, None | torch.Tensor]:
         """
         Forward pass for the QMixer.
 
@@ -898,7 +900,22 @@ class QMixer(nn.Module):
         # Second mixing layer
         q_total = torch.bmm(hidden, w2) + b2
 
-        return q_total.view(batch_size, -1)
+        q_grads = None
+        if with_grad:
+            q_total.backward()
+            q_grads = agent_qs.grad
+
+        return q_total.view(batch_size, -1), q_grads
+
+
+class VDNMixer(nn.Module):
+    def __init__(self, n_agents: int, state_dim: int, mixing_embed_dim: int = 32):
+        super(VDNMixer, self).__init__()
+
+    def forward(
+        self, agent_qs: torch.Tensor, state: torch.Tensor, with_grad: bool = False
+    ) -> tuple[torch.Tensor, None | torch.Tensor]:
+        return agent_qs.sum(dim=-1), torch.ones_like(agent_qs)
 
 
 class QS(nn.Module):

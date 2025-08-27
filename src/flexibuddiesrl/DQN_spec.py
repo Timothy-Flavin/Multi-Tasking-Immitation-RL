@@ -293,7 +293,7 @@ def DQN_integration():
             load_from_checkpoint_path=None,
             encoder=None,
             conservative=False,  # param_grid["conservative"][random.randint(0, 1)],
-            mix_type="None",  # param_grid["mix_type"][random.randint(0, 2)],  # or "reward"
+            mix_type="QMIX",  # param_grid["mix_type"][random.randint(0, 2)],  # or "reward"
         )
         print(model)
         input("head hidden")

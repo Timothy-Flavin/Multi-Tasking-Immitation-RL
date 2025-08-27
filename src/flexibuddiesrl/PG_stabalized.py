@@ -1,4 +1,4 @@
-from .Agent import ValueS, StochasticActor, Agent, QMixer, QS
+from .Agent import ValueS, StochasticActor, Agent, QMixer, QS, VDNMixer
 from .Util import T, minmaxnorm
 import torch
 from flexibuff import FlexiBatch, FlexibleBuffer
@@ -31,7 +31,7 @@ class PG(nn.Module, Agent):
         ppo_clip=0.2,
         value_loss_coef=0.5,
         value_clip=0.5,
-        advantage_type="gae",  # [g, gv, a2c, constant, gae, qv1, qvhead]
+        advantage_type="gae",  # [g, gv, a2c, constant, gae, qmix]
         norm_advantages=True,
         mini_batch_size=64,
         anneal_lr=200000,
@@ -56,13 +56,15 @@ class PG(nn.Module, Agent):
             "discrete_log_probs": "discrete_log_probs",
         },
         mix_type=None,  # [None, 'VDN', 'QMIX']
+        mixer_dim=256,
     ):
         super(PG, self).__init__()
-
+        self.load_from_checkpoint = load_from_checkpoint
         if self.load_from_checkpoint is not None:
             self.load(self.load_from_checkpoint)
             return
 
+        self.mixer_dim = mixer_dim
         self.continuous_action_dim = continuous_action_dim
         self.discrete_action_dims = discrete_action_dims
         self.batch_name_map = batch_name_map
@@ -100,10 +102,11 @@ class PG(nn.Module, Agent):
         self.lr = lr
 
         self._sanitize_params()
-        self._create_mixer()
+        self._create_mixer()  # This needs to be before _get_torch_params for Adam to work
         self._get_torch_params(encoder, action_head_hidden_dims)
 
     def _sanitize_params(self):
+        self.total_action_dims = 0
         if self.mix_type is not None and self.mix_type.lower() == "none":
             self.mix_type = None
         if (
@@ -116,8 +119,10 @@ class PG(nn.Module, Agent):
         for k in ["VDN", "QMIX"]:
             if self.mix_type is not None and self.mix_type.lower() == "vdn":
                 self.mix_type = "VDN"
+                self.advantage_type = "qmix"
             if self.mix_type is not None and self.mix_type.lower() == "qmix":
                 self.mix_type = "QMIX"
+                self.advantage_type = "qmix"
 
         if self.continuous_action_dim is not None and self.continuous_action_dim > 0:
             if isinstance(self.max_actions, list):
@@ -128,6 +133,11 @@ class PG(nn.Module, Agent):
                 self.min_actions = torch.from_numpy(self.min_actions).to(self.device)
             if isinstance(self.max_actions, np.ndarray):
                 self.max_actions = torch.from_numpy(self.max_actions).to(self.device)
+
+        if self.discrete_action_dims is not None:
+            self.total_action_dims += len(self.discrete_action_dims)
+        if self.continuous_action_dim > 0:
+            self.total_action_dims += self.continuous_action_dim
 
     def _assert_params(self):
         assert (
@@ -170,84 +180,85 @@ class PG(nn.Module, Agent):
                     self.min_actions is not None
                     and len(self.min_actions) >= self.continuous_action_dim
                 ), f"If Clamp type '{self.action_clamp_type}' is not None, len(min_actions): {len(self.min_actions) if self.min_actions is not None else None}, must be greater than continuous_action_dim: {self.continuous_action_dim}"
-
+        if self.mix_type == "QMIX":
+            assert self.mixer_dim is not None and isinstance(
+                self.mixer_dim, int
+            ), "mixer_dim must be an integer embedding size to use QMIX e.i. 256"
+            assert (
+                self.advantage_type == "qmix"
+            ), "Cane have mixtype QMIX without advantage tyype qmix"
         assert self.advantage_type.lower() in [
             "gae",
             "a2c",
             "constant",
             "gv",
             "g",
-            "qvhead",  # one value and one A/U value per discrete head
+            "qmix",  # one value and one A/U value per discrete head
         ], "Invalid advantage type"
 
     def _create_mixer(self):
-        self.critic = ValueS(
-            obs_dim=self.obs_dim,
-            hidden_dim=self.hidden_dims[0],
-            device=self.device,
-            orthogonal_init=self.orthogonal,
-            activation=self.activation,
-        ).to(self.device)
+        if self.mix_type is None:
+            self.critic = ValueS(
+                obs_dim=self.obs_dim,
+                hidden_dim=self.hidden_dims[0],
+                device=self.device,
+                orthogonal_init=self.orthogonal,
+                activation=self.activation,
+            ).to(self.device)
 
-        if mix_type is not None:
-            if mix_type.lower() == "vdn":
-                mix_type = "VDN"
-                assert (
-                    advantage_type == "qv1"
-                ), "cant vdn if the advantage is expected to not be Q based or to be per-head adv"
-
-            elif mix_type.lower() == "qmix":
-                mix_type = "QMIX"
-                assert (
-                    advantage_type == "qv1"
-                ), "cant qmix  if the advantage is expected to not be Q based or to be per-head adv"
-                nagents = (
-                    len(discrete_action_dims) if discrete_action_dims is not None else 0
-                )
-                self.Q = QS(
-                    obs_dim + continuous_action_dim,
-                    0,
-                    discrete_action_dims,
-                    hidden_dims=[64, 64],
-                    head_hidden_dims=[32],
-                    QMIX=True,
-                )
-            elif mix_type.lower() == "none":
-                mix_type = None
-                if advantage_type == "qv1":
-                    ddim = (
-                        sum(discrete_action_dims)
-                        if discrete_action_dims is not None
-                        else 0
-                    )
-                    self.q_heads = QS(
-                        obs_dim + continuous_action_dim + ddim,
-                        0,
-                        [1],
-                        hidden_dims=[64, 64],
-                        head_hidden_dims=[32],
-                        QMIX=False,
-                    )
-                else:
-                    self.Q = QS(
-                        obs_dim + continuous_action_dim,
-                        0,
-                        discrete_action_dims,
-                        hidden_dims=[64, 64],
-                        head_hidden_dims=[32],
-                        QMIX=False,
-                    )
+        elif self.mix_type == "VDN":
+            self.mixer = VDNMixer(
+                self.total_action_dims, self.obs_dim, mixing_embed_dim=self.mixer_dim
+            )
+            self.critic = QS(
+                obs_dim=self.obs_dim,
+                continuous_action_dim=self.continuous_action_dim,
+                discrete_action_dims=self.discrete_action_dims,
+                hidden_dims=[self.mixer_dim, self.mixer_dim],
+                encoder=None,
+                activation="tanh",
+                dueling=True,
+                device=self.device,
+                n_c_action_bins=5,
+                head_hidden_dims=[64],
+                QMIX=False,
+                QMIX_hidden_dim=0,
+            )
+        elif self.mix_type == "QMIX":
+            self.mixer = QMixer(
+                self.total_action_dims, self.obs_dim, mixing_embed_dim=self.mixer_dim
+            )
+            self.critic = QS(
+                obs_dim=self.obs_dim,
+                continuous_action_dim=self.continuous_action_dim,
+                discrete_action_dims=self.discrete_action_dims,
+                hidden_dims=[self.mixer_dim, self.mixer_dim],
+                encoder=None,
+                activation="tanh",
+                dueling=True,
+                device=self.device,
+                n_c_action_bins=5,
+                head_hidden_dims=[64],
+                QMIX=False,
+                QMIX_hidden_dim=0,
+            )
 
     def _get_torch_params(self, encoder, action_head_hidden_dims=None):
         st = None
         if self.std_type in ["full", "diagonal"]:
             st = self.std_type
+        np_maxes = None
+        np_mins = None
+        if isinstance(self.max_actions, torch.Tensor):
+            np_maxes = self.max_actions.to("cpu").numpy()
+        if isinstance(self.min_actions, torch.Tensor):
+            np_mins = self.min_actions.to("cpu").numpy()
         self.actor = StochasticActor(
             obs_dim=self.obs_dim,
             continuous_action_dim=self.continuous_action_dim,
             discrete_action_dims=self.discrete_action_dims,
-            max_actions=self.max_actions,
-            min_actions=self.min_actions,
+            max_actions=np_maxes,
+            min_actions=np_mins,
             hidden_dims=self.hidden_dims,
             device=self.device,
             orthogonal_init=self.orthogonal,
@@ -613,7 +624,11 @@ class PG(nn.Module, Agent):
         # If actions are none then V(s)
 
     def expected_V(self, obs, legal_action=None):
-        return self.critic(obs)
+        if self.mix_type is None:
+            return self.critic(obs)
+        else:
+            values, disc_advantages, cont_advantages = self.critic(obs)
+            return values
 
     def _get_disc_log_probs_entropy(self, logits, actions):
         log_probs = torch.zeros_like(actions, dtype=torch.float)
@@ -799,7 +814,7 @@ class PG(nn.Module, Agent):
                 gamma=self.gamma,
             )
             advantages = G
-        else:
+        elif self.advantage_type in ["gae", "a2c"]:
             with torch.no_grad():
                 if "values" in self.batch_name_map.keys():
                     values = batch.__getattr__(self.batch_name_map["values"])[agent_num]
@@ -835,6 +850,27 @@ class PG(nn.Module, Agent):
                 )
             else:
                 raise ValueError("Invalid advantage type")
+        # elif self.advantage_type == "qmix":
+        #     with torch.no_grad():
+        #         if "values" in self.batch_name_map.keys():
+        #             values = batch.__getattr__(self.batch_name_map["values"])[agent_num]
+        #         elif hasattr(batch, "values"):
+        #             values = batch.__getattr__("values")[agent_num]
+        #         else:
+        #             values, da, ca = self.critic(
+        #                 batch.__getattr__(self.batch_name_map["obs"])[agent_num]
+        #             ).squeeze(-1)
+
+        #     G, advantages = FlexibleBuffer.GAE(
+        #         rewards,
+        #         values,
+        #         batch.terminated,
+        #         last_val,
+        #         self.gamma,
+        #         self.gae_lambda,
+        #     )
+        else:
+            raise Exception(f"advantage type {self.advantage_type} not allowed")
         if debug:
             print(
                 f"  batch rewards: {batch.__getattr__(self.batch_name_map['rewards'])}"
@@ -925,6 +961,9 @@ class PG(nn.Module, Agent):
     ):
         if self.eval_mode:
             return 0, 0
+        print(f"mix type: {self.mix_type}, adv type: {self.advantage_type}")
+        if self.mix_type == "QMIX" or self.mix_type == "VDN":
+            return self._mix_reinforcement_learn(batch, agent_num, critic_only, debug)
         if debug:
             print(f"Starting PG Reinforcement Learn for agent {agent_num}")
         with torch.no_grad():
@@ -977,12 +1016,11 @@ class PG(nn.Module, Agent):
                 # print(torch.abs(V_current - G[indices]).mean())
                 if not critic_only:
                     mb_adv = advantages[torch.from_numpy(indices).to(self.device)]
+                    mb_obs = batch.__getattr__(self.batch_name_map["obs"])[
+                        agent_num, indices
+                    ]
                     continuous_means, continuous_log_std_logits, discrete_logits = (
-                        self.actor(
-                            x=batch.__getattr__(self.batch_name_map["obs"])[
-                                agent_num, indices
-                            ],
-                        )
+                        self.actor(x=mb_obs)
                     )
                     if self.continuous_action_dim > 0:
                         clp = batch.__getattr__(
@@ -997,6 +1035,7 @@ class PG(nn.Module, Agent):
                             clp,
                             mb_adv,
                             cact,
+                            mb_obs,
                         )
                     if self.discrete_action_dims is not None:
                         dact = batch.__getattr__(
@@ -1013,7 +1052,7 @@ class PG(nn.Module, Agent):
                             self.batch_name_map["discrete_log_probs"]
                         )[agent_num, indices]
                         actor_loss += self._discrete_actor_loss(
-                            dact, dlp, discrete_logits, mb_adv
+                            dact, dlp, discrete_logits, mb_adv, mb_obs
                         )
 
                     # print("actor")
@@ -1081,6 +1120,73 @@ class PG(nn.Module, Agent):
         # print(avg_actor_loss, critic_loss.item())
         return avg_actor_loss, avg_critic_loss
 
+    def _bin_continuous_actions(self, c_actions):
+        """Given continuous actions we return the discretized bins that the critic is using"""
+        assert (
+            self.min_actions is not None and self.max_actions is not None
+        ), "Can't bin actions with no max and min action"
+        n_bins = 5
+        n_actions = c_actions.shape[-1]
+        min_actions = self.min_actions.unsqueeze(0)  # type:ignore
+        max_actions = self.max_actions.unsqueeze(0)  # type:ignore
+        bin_width = (max_actions - min_actions) / (n_bins - 1)
+        bin_indices = torch.round((c_actions - min_actions) / bin_width)
+        return bin_indices.long()
+
+    def _gather_observed_advantages(self, d_adv, c_adv, d_actions, c_actions):
+        advantages = []
+        if d_adv is not None:
+            for h in range(len(d_adv)):
+                adv_h = d_adv[h]
+                assert isinstance(adv_h, torch.Tensor)
+                advantages.append(
+                    adv_h.gather(dim=-1, index=d_actions[:, h].unsqueeze(-1))
+                )
+        if c_adv is not None:
+            c_indices = self._bin_continuous_actions(c_actions)
+            assert isinstance(c_adv, torch.Tensor)
+            advantages.append(
+                c_adv.gather(dim=-1, index=c_indices.unsqueeze(-1)).squeeze(-1)
+            )
+        advantages = torch.cat(advantages, dim=-1)
+        return advantages
+
+    def _max_advantages(self, d_adv, c_adv):
+        advantages = []
+        if d_adv is not None:
+            for h in range(len(d_adv)):
+                adv_h = d_adv[h]
+                assert isinstance(adv_h, torch.Tensor)
+                advantages.append(adv_h.max(dim=-1).values.unsqueeze(-1))
+        if c_adv is not None:
+            assert isinstance(c_adv, torch.Tensor)
+            advantages.append(c_adv.max(dim=-1).values)
+        advantages = torch.cat(advantages, dim=-1)
+        return advantages
+
+    def _mix_reinforcement_learn(self, batch, agent_num, critic_only, debug):
+        """If we have QMIX going on then we need to do everything different so might as well make a new function"""
+        assert self.mixer is not None, "Can't mix rl without a mixer..."
+        obs = batch.__getattr__(self.batch_name_map["obs"])[agent_num]
+        obs_ = batch.__getattr__(self.batch_name_map["obs_"])[agent_num]
+        d_actions = batch.__getattr__(self.batch_name_map["discrete_actions"])[
+            agent_num
+        ]
+        c_actions = batch.__getattr__(self.batch_name_map["continuous_actions"])[
+            agent_num
+        ]
+        values, d_adv, c_adv = self.critic(obs)
+        adv = self._gather_observed_advantages(d_adv, c_adv, d_actions, c_actions)
+        Q = self.mixer(adv, obs) + values
+        with torch.no_grad():
+            next_values, next_d_adv, next_c_adv = self.critic(obs_)
+            next_adv = self._max_advantages(
+                next_d_adv,
+                next_c_adv,
+            )
+        credit_weights = 0  # self.
+        return 0, 0
+
     def _dump_attr(self, attr, path):
         f = open(path, "wb")
         pickle.dump(attr, f)
@@ -1103,19 +1209,19 @@ class PG(nn.Module, Agent):
         torch.save(self.actor.state_dict(), checkpoint_path + "/PI")
         torch.save(self.critic.state_dict(), checkpoint_path + "/V")
         torch.save(self.actor_logstd, checkpoint_path + "/actor_logstd")
-        for i in range(len(self.attrs)):
-            self._dump_attr(
-                self.__dict__[self.attrs[i]], checkpoint_path + f"/{self.attrs[i]}"
-            )
+        # for i in range(len(self.attrs)):
+        #    self._dump_attr(
+        #        self.__dict__[self.attrs[i]], checkpoint_path + f"/{self.attrs[i]}"
+        #    )
 
     def load(self, checkpoint_path):
         if checkpoint_path is None:
             checkpoint_path = "./" + self.name + "/"
 
-        for i in range(len(self.attrs)):
-            self.__dict__[self.attrs[i]] = self._load_attr(
-                checkpoint_path + f"/{self.attrs[i]}"
-            )
+        # for i in range(len(self.attrs)):
+        #    self.__dict__[self.attrs[i]] = self._load_attr(
+        #        checkpoint_path + f"/{self.attrs[i]}"
+        #    )
         self._get_torch_params(self.starting_actorlogstd)
         self.policy_loss = 5.0
         self.actor.load_state_dict(torch.load(checkpoint_path + "/PI"))
@@ -1127,6 +1233,9 @@ class PG(nn.Module, Agent):
         for d in self.__dict__.keys():
             st += f"{d}: {self.__dict__[d]}\n"
         return st
+
+    def param_count(self) -> tuple[int, int]:
+        return super().param_count()
 
 
 # self.attrs = [
