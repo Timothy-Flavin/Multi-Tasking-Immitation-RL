@@ -62,6 +62,7 @@ class PG(nn.Module, Agent):
         importance_schedule=[10.0, 1.0, 10000],  # start end nsteps
         importance_from_grad=True,
         softmax_importance_scale=True,
+        on_policy_mixer=False,
     ):
         super(PG, self).__init__()
         self.load_from_checkpoint = load_from_checkpoint
@@ -69,6 +70,7 @@ class PG(nn.Module, Agent):
             self.load(self.load_from_checkpoint)
             return
 
+        # Set up the params for Qmixed PPO
         self.importance_temperature = importance_schedule[0]
         self.max_importance_temperature = importance_schedule[0]
         self.min_importance_temperature = importance_schedule[1]
@@ -76,8 +78,10 @@ class PG(nn.Module, Agent):
         self.importance_step = 0
         self.importance_from_grad = importance_from_grad
         self.softmax_importance_scale = softmax_importance_scale
-
+        self.on_policy_mixer = on_policy_mixer
         self.mixer_dim = mixer_dim
+
+        # Set up the normal PPO params
         self.continuous_action_dim = continuous_action_dim
         self.discrete_action_dims = discrete_action_dims
         self.batch_name_map = batch_name_map
@@ -1225,7 +1229,7 @@ class PG(nn.Module, Agent):
             else:
                 next_value = gamma * bootstrap_values[step]
 
-            ep_not_over = float((terminated < 0.1) and (truncated < 0.1))
+            ep_not_over = float((terminated[step] < 0.1) and (truncated[step] < 0.1))
             delta = rewards[step] + next_value - values[step]
             weighted_delta = delta * advantage_weights[step]
             last_gae_lam = (
@@ -1235,6 +1239,13 @@ class PG(nn.Module, Agent):
             advantages[step] = last_gae_lam
         G = advantages + values.unsqueeze(-1)
         return G, advantages
+
+    def _log_probs_per_dim(self, obs, discrete_actions, continuous_actions):
+        cmean, clogstd, dlogit = self.actor(obs)
+        pass
+
+    def _expected_target_value(self, obs):
+        pass
 
     def _mix_reinforcement_learn(
         self, batch: FlexiBatch, agent_num, critic_only, debug
@@ -1264,6 +1275,8 @@ class PG(nn.Module, Agent):
         Q = (self.mixer(adv, obs)[0] + values).squeeze(-1)
         with torch.no_grad():
             next_values, next_d_adv, next_c_adv = self.critic(obs_)
+
+            # TODO: on_policy_mixer then do weighted sum instead of max
             next_adv = self._max_advantages(
                 next_d_adv,
                 next_c_adv,
@@ -1289,6 +1302,7 @@ class PG(nn.Module, Agent):
                 )
                 scaled_importance /= scaled_importance.sum(dim=-1).unsqueeze(-1)
 
+            print(f"scaled importance after normalize: {scaled_importance}")
             # So learning rate doesn't shrink with number of agents
             scaled_importance *= grad_free_adv.shape[-1]
 
@@ -1302,11 +1316,24 @@ class PG(nn.Module, Agent):
                 gamma=self.gamma,
                 gae_lambda=self.gae_lambda,
             )
+            print(f"dim-wise GAE: {gae}\nDim-wise G: {G}")
+
+            global_G, global_GAE = self._weighted_gae(
+                rewards=rewards,
+                values=Q,
+                bootstrap_values=next_Q,
+                terminated=terminated,  # type:ignore
+                truncated=truncated,  # type:ignore
+                advantage_weights=torch.ones_like(rewards).unsqueeze(-1),
+                gamma=self.gamma,
+                gae_lambda=self.gae_lambda,
+            )
+            print(f"global GAE: {global_GAE}\nglobal G: {global_G}")
 
             print(f"scaled importance after: {scaled_importance}")
         print(f"adv_grad shape: {adv_grad.shape}")
         print(f"raw importance shape {grad_free_adv.shape}")
-        critic_loss = ((Q - G) ** 2).mean()
+        critic_loss = ((Q - global_G) ** 2).mean()
         self.optimizer.zero_grad()
         critic_loss.backward()
         self.optimizer.step()
