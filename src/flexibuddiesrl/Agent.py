@@ -817,7 +817,7 @@ class QMixer(nn.Module):
     Monotonicity is enforced by constraining these weights to be non-negative.
     """
 
-    def __init__(self, n_agents: int, state_dim: int, mixing_embed_dim: int = 32):
+    def __init__(self, n_agents: int, state_dim: int, mixing_embed_dim: int = 64):
         """
         Initializes the QMixer network.
 

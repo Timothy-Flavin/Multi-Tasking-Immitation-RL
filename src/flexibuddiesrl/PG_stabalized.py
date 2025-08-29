@@ -54,15 +54,28 @@ class PG(nn.Module, Agent):
             "obs_": "obs_",
             "continuous_log_probs": "continuous_log_probs",
             "discrete_log_probs": "discrete_log_probs",
+            "truncated": "truncated",
+            "terminated": "terminated",
         },
         mix_type=None,  # [None, 'VDN', 'QMIX']
-        mixer_dim=256,
+        mixer_dim=128,
+        importance_schedule=[10.0, 1.0, 10000],  # start end nsteps
+        importance_from_grad=True,
+        softmax_importance_scale=True,
     ):
         super(PG, self).__init__()
         self.load_from_checkpoint = load_from_checkpoint
         if self.load_from_checkpoint is not None:
             self.load(self.load_from_checkpoint)
             return
+
+        self.importance_temperature = importance_schedule[0]
+        self.max_importance_temperature = importance_schedule[0]
+        self.min_importance_temperature = importance_schedule[1]
+        self.importance_temperature_steps = importance_schedule[2]
+        self.importance_step = 0
+        self.importance_from_grad = importance_from_grad
+        self.softmax_importance_scale = softmax_importance_scale
 
         self.mixer_dim = mixer_dim
         self.continuous_action_dim = continuous_action_dim
@@ -1183,7 +1196,49 @@ class PG(nn.Module, Agent):
         print(f"total importance shape: {importance.shape}")
         return importance
 
-    def _mix_reinforcement_learn(self, batch, agent_num, critic_only, debug):
+    def _update_importance(self):
+        # based on importance step, max and min, and nsteps, scale importance temperature
+        frac = min(self.importance_step / self.importance_temperature_steps, 1.0)
+        self.importance_temperature = (
+            self.max_importance_temperature * (1.0 - frac)
+            + self.min_importance_temperature * frac
+        )
+        self.importance_step += 1
+
+    def _weighted_gae(
+        self,
+        rewards: torch.Tensor,  # shape = [n_steps]
+        values: torch.Tensor,  # shape = [n_steps]
+        bootstrap_values: torch.Tensor,  # shape = [n_steps]
+        terminated: torch.Tensor,  # shape = [n_steps]
+        truncated: torch.Tensor,  # shape = [n_steps]
+        advantage_weights: torch.Tensor,  # shape = [n_steps, n_agents]
+        gamma=0.99,
+        gae_lambda=0.95,
+    ):
+        advantages = torch.zeros_like(advantage_weights).to(advantage_weights.device)
+        num_steps = len(rewards)
+        last_gae_lam = torch.zeros(advantage_weights.shape[1]).to(self.device)
+        for step in reversed(range(num_steps)):
+            if terminated[step] > 0.1:
+                next_value = 0.0
+            else:
+                next_value = gamma * bootstrap_values[step]
+
+            ep_not_over = float((terminated < 0.1) and (truncated < 0.1))
+            delta = rewards[step] + next_value - values[step]
+            weighted_delta = delta * advantage_weights[step]
+            last_gae_lam = (
+                weighted_delta + gamma * gae_lambda * ep_not_over * last_gae_lam
+            )
+
+            advantages[step] = last_gae_lam
+        G = advantages + values.unsqueeze(-1)
+        return G, advantages
+
+    def _mix_reinforcement_learn(
+        self, batch: FlexiBatch, agent_num, critic_only, debug
+    ):
         """If we have QMIX going on then we need to do everything different so might as well make a new function"""
         assert self.mixer is not None, "Can't mix rl without a mixer..."
         obs = batch.__getattr__(self.batch_name_map["obs"])[agent_num]
@@ -1194,31 +1249,69 @@ class PG(nn.Module, Agent):
         c_actions = batch.__getattr__(self.batch_name_map["continuous_actions"])[
             agent_num
         ]
+        rewards = batch.__getattr__(self.batch_name_map["rewards"])
+        terminated = batch.terminated
+        truncated = batch.truncated
+        if truncated is None:
+            truncated = torch.zeros_like(rewards)
         values, d_adv, c_adv = self.critic(obs)
         adv = self._gather_observed_advantages(d_adv, c_adv, d_actions, c_actions)
         grad_free_adv = adv.detach()
         grad_free_adv.requires_grad = True
         __q, adv_grad = self.mixer(grad_free_adv, obs, with_grad=True)
 
-        Q = self.mixer(adv, obs)[0] + values
+        self.mixer.zero_grad()
+        Q = (self.mixer(adv, obs)[0] + values).squeeze(-1)
         with torch.no_grad():
-            raw_importance = self._gather_importance(d_adv, c_adv.detach())
             next_values, next_d_adv, next_c_adv = self.critic(obs_)
             next_adv = self._max_advantages(
                 next_d_adv,
                 next_c_adv,
             )
-            next_Q = self.mixer(next_adv, obs_)[0] + next_values
+            next_Q = (self.mixer(next_adv, obs_)[0] + next_values).squeeze(-1)
+            # critic_target = rewards + self.gamma * (1.0 - terminated) * next_Q
+            if self.importance_from_grad:
+                scaled_importance = grad_free_adv * adv_grad
+            else:
+                raw_importance = self._gather_importance(d_adv, c_adv.detach())
+                scaled_importance = raw_importance * adv_grad
 
-            scaled_importance = raw_importance * adv_grad
             print(f"scaled importance: {scaled_importance}")
-            scaled_importance /= scaled_importance.sum(dim=-1).unsqueeze(-1)
+            self._update_importance()
+
+            if self.softmax_importance_scale:
+                scaled_importance = torch.softmax(
+                    scaled_importance / self.importance_temperature, dim=-1
+                )
+            else:
+                scaled_importance = (
+                    scaled_importance.abs() + self.importance_temperature
+                )
+                scaled_importance /= scaled_importance.sum(dim=-1).unsqueeze(-1)
+
+            # So learning rate doesn't shrink with number of agents
+            scaled_importance *= grad_free_adv.shape[-1]
+
+            G, gae = self._weighted_gae(
+                rewards=rewards,
+                values=Q,
+                bootstrap_values=next_Q,
+                terminated=terminated,  # type:ignore
+                truncated=truncated,  # type:ignore
+                advantage_weights=scaled_importance,
+                gamma=self.gamma,
+                gae_lambda=self.gae_lambda,
+            )
+
             print(f"scaled importance after: {scaled_importance}")
         print(f"adv_grad shape: {adv_grad.shape}")
-        print(f"raw importance shape {raw_importance.shape}")
-        scaled_importance
+        print(f"raw importance shape {grad_free_adv.shape}")
+        critic_loss = ((Q - G) ** 2).mean()
+        self.optimizer.zero_grad()
+        critic_loss.backward()
+        self.optimizer.step()
+
         input(f"makes sense?")
-        credit_weights = 0  # self.
         return 0, 0
 
     def _dump_attr(self, attr, path):

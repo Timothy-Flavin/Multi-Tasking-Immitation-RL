@@ -272,11 +272,11 @@ def DQN_integration():
             min_actions=(None if cdim == 0 else -np.ones(2)),  # np.array([-1,-1]),
             max_actions=(None if cdim == 0 else np.ones(2)),  # ,np.array([1,1]),
             hidden_dims=[64, 64],  # first is obs dim if encoder provded
-            head_hidden_dim=param_grid["head_hidden_dim"][
-                random.randint(0, 1)
-            ],  # if None then no head hidden layer
+            head_hidden_dim=[32],  # param_grid["head_hidden_dim"][
+            # random.randint(0, 1)
+            # ],  # if None then no head hidden layer
             gamma=0.99,
-            lr=3e-4,
+            lr=1e-4,
             imitation_lr=1e-5,
             dueling=True,  # param_grid["dueling"][random.randint(0, 1)],
             n_c_action_bins=3,
@@ -286,7 +286,7 @@ def DQN_integration():
             orthogonal=False,
             init_eps=1.0,
             eps_decay_half_life=15000,
-            device=param_grid["device"][random.randint(0, 1)],
+            device="cpu",  # param_grid["device"][random.randint(0, 1)],
             eval_mode=False,
             name="DQN",
             clip_grad=0.5,
@@ -296,7 +296,7 @@ def DQN_integration():
             mix_type="QMIX",  # param_grid["mix_type"][random.randint(0, 2)],  # or "reward"
         )
         print(model)
-        input("head hidden")
+        # input("head hidden")
         # Print current hyper parameters before episode start
 
         gym_env = gym.make(
