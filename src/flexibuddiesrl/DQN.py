@@ -582,6 +582,9 @@ class DQN(nn.Module, Agent):
                 )
             else:
                 raise Exception("Mix type needs to be None VDN or QMIX")
+            # print(
+            #    f"combined shapes: {rewards.shape} 1-term: {(1-terminated).shape} Q_.shape: {Q_.shape}"
+            # )
             combined_targets = rewards + (self.gamma * (1 - terminated)) * Q_
         return disc_targets, cont_targets, combined_targets
 
@@ -600,8 +603,8 @@ class DQN(nn.Module, Agent):
             continuous_actions = self._discretize_actions(
                 batch.continuous_actions[agent_num]  # type: ignore
             )
-        discrete_target = torch.zeros(1, device=self.device)
-        continuous_target = torch.zeros(1, device=self.device)
+        discrete_target = 0  # torch.zeros(1, device=self.device)
+        continuous_target = 0  # torch.zeros(1, device=self.device)
         values, disc_adv, cont_adv = self.Q1(batch.obs[agent_num])
         with torch.no_grad():
             next_values, next_disc_adv, next_cont_adv = self.Q2(batch.obs_[agent_num])
@@ -669,7 +672,7 @@ class DQN(nn.Module, Agent):
                         ), "If mixing is enabled then combined target needs to be tensor"
                         combined_target += munchausen_reward.sum(-1)
 
-        cQ = torch.zeros(1, device=self.device)
+        cQ = 0
         if self.has_continuous:
             assert (
                 continuous_actions is not None
@@ -684,7 +687,7 @@ class DQN(nn.Module, Agent):
             if self.mix_type == "VDN":
                 cQ = cQ.sum(-1)
 
-        dQ = torch.zeros(1, device=self.device)
+        dQ = 0
         if self.has_discrete:
             assert (
                 discrete_actions is not None and self.discrete_action_dims is not None
@@ -714,11 +717,6 @@ class DQN(nn.Module, Agent):
                     if self.has_continuous
                     else 0
                 )
-            # print(
-            #    f"dq {dQ[0:5]} target: {discrete_target[0:5]}, dq_v: {(dQ + values)[0:5]}, diff: {(dQ + values)[0:5] - discrete_target[0:5]}"
-            # )
-            # print(f"cq {cQ[0:5]} ctarget: {continuous_target[0:5]}")
-            # print(values[0:5])
             loss = closs + dloss
         else:
             v = values.squeeze(-1) if isinstance(values, torch.Tensor) else 0.0
@@ -733,11 +731,12 @@ class DQN(nn.Module, Agent):
                     qs.append(cQ)
 
                 Q = (
-                    self.Q1.factorize_Q(torch.cat(qs, dim=1), batch.obs[agent_num])[
+                    self.Q1.factorize_Q(torch.cat(qs, dim=-1), batch.obs[agent_num])[
                         0
                     ].squeeze(-1)
                     + v
                 )
+
             assert isinstance(
                 Q, torch.Tensor
             ), "Can't learn when the current q values don't exist"

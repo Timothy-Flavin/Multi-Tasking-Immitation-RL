@@ -233,7 +233,7 @@ def DQN_integration():
     }
 
     for config_id in range(10):
-        dfirst = 1
+        dfirst = 0
         cdim = 0
         ddim = None
         if config_id % 2 == dfirst:
@@ -272,7 +272,7 @@ def DQN_integration():
             min_actions=(None if cdim == 0 else -np.ones(2)),  # np.array([-1,-1]),
             max_actions=(None if cdim == 0 else np.ones(2)),  # ,np.array([1,1]),
             hidden_dims=[64, 64],  # first is obs dim if encoder provded
-            head_hidden_dim=[32],  # param_grid["head_hidden_dim"][
+            head_hidden_dim=[64],  # param_grid["head_hidden_dim"][
             # random.randint(0, 1)
             # ],  # if None then no head hidden layer
             gamma=0.99,
@@ -365,6 +365,8 @@ def DQN_integration():
             mem_buff.save_transition(
                 terminated=terminated,
                 registered_vals=rv,
+                truncated=truncated,
+                bootstrap_values=0,
             )
 
             obs = obs_.copy()
@@ -398,7 +400,7 @@ def DQN_integration():
                 )
                 # for k in range(50):
                 aloss, closs = model.reinforcement_learn(mb, 0, debug=False)
-                # print(f"Iteration {i}, aloss: {aloss}, closs: {closs}")
+                print(f"Iteration {i}, aloss: {aloss}, closs: {closs}")
                 # input()
                 # mem_buff.reset()
 

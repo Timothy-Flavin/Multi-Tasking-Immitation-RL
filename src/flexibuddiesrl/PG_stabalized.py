@@ -255,7 +255,7 @@ class PG(nn.Module, Agent):
                 dueling=True,
                 device=self.device,
                 n_c_action_bins=5,
-                head_hidden_dims=[64],
+                head_hidden_dims=[self.mixer_dim],
                 QMIX=False,
                 QMIX_hidden_dim=0,
             ).to(self.device)
@@ -1148,6 +1148,7 @@ class PG(nn.Module, Agent):
         max_actions = self.max_actions.unsqueeze(0)  # type:ignore
         bin_width = (max_actions - min_actions) / (n_bins - 1)
         bin_indices = torch.round((c_actions - min_actions) / bin_width)
+        bin_indices.clamp(0, n_bins - 1)
         return bin_indices.long()
 
     def _gather_observed_advantages(self, d_adv, c_adv, d_actions, c_actions):
@@ -1240,12 +1241,51 @@ class PG(nn.Module, Agent):
         G = advantages + values.unsqueeze(-1)
         return G, advantages
 
-    def _log_probs_per_dim(self, obs, discrete_actions, continuous_actions):
-        cmean, clogstd, dlogit = self.actor(obs)
-        pass
+    def _log_probs_per_dim(self, obs, d_actions, c_actions):
+        continuous_means, continuous_log_std_logits, discrete_logits = self.actor(obs)
+        discrete_log_probs = None
+        continuous_log_probs = None
+        if self.continuous_action_dim > 0:
+            log_std = continuous_log_std_logits
+            log_std = log_std.expand_as(continuous_means)
+            c_dist = torch.distributions.Normal(
+                continuous_means,
+                torch.clip(torch.exp(log_std), min=0.05),
+            )
+            continuous_log_probs = c_dist.log_prob(c_actions)
 
-    def _expected_target_value(self, obs):
-        pass
+        if self.discrete_action_dims is not None and len(self.discrete_action_dims) > 0:
+            discrete_log_probs = torch.zeros(
+                discrete_logits[0].shape[0],
+                len(self.discrete_action_dims),
+                device=self.device,
+            )
+            for i, logits in enumerate(discrete_logits):
+                d_dist = torch.distributions.Categorical(logits=logits)
+                discrete_log_probs[:, i] = d_dist.log_prob(d_actions[:, i])
+
+        return discrete_log_probs, continuous_log_probs
+
+    def _expected_target_value(self, obs, d_adv, c_adv):
+        continuous_means, continuous_log_std_logits, discrete_logits = self.actor(obs)
+        if self.continuous_action_dim > 0:
+            log_std = continuous_log_std_logits
+            log_std = log_std.expand_as(continuous_means)
+            c_dist = torch.distributions.Normal(
+                continuous_means,
+                torch.clip(torch.exp(log_std), min=0.05),
+            )
+            continuous_log_probs = c_dist.pr
+
+        if self.discrete_action_dims is not None and len(self.discrete_action_dims) > 0:
+            discrete_log_probs = torch.zeros(
+                discrete_logits[0].shape[0],
+                len(self.discrete_action_dims),
+                device=self.device,
+            )
+            for i, logits in enumerate(discrete_logits):
+                d_dist = torch.distributions.Categorical(logits=logits)
+                discrete_log_probs[:, i] = d_dist.log_prob(d_actions[:, i])
 
     def _mix_reinforcement_learn(
         self, batch: FlexiBatch, agent_num, critic_only, debug
@@ -1276,11 +1316,17 @@ class PG(nn.Module, Agent):
         with torch.no_grad():
             next_values, next_d_adv, next_c_adv = self.critic(obs_)
 
-            # TODO: on_policy_mixer then do weighted sum instead of max
-            next_adv = self._max_advantages(
-                next_d_adv,
-                next_c_adv,
-            )
+            if self.on_policy_mixer:
+                next_adv = self._expected_target_value(
+                    obs_,
+                    next_d_adv,
+                    next_c_adv,
+                )
+            else:
+                next_adv = self._max_advantages(
+                    next_d_adv,
+                    next_c_adv,
+                )
             next_Q = (self.mixer(next_adv, obs_)[0] + next_values).squeeze(-1)
             # critic_target = rewards + self.gamma * (1.0 - terminated) * next_Q
             if self.importance_from_grad:
@@ -1318,7 +1364,7 @@ class PG(nn.Module, Agent):
             )
             print(f"dim-wise GAE: {gae}\nDim-wise G: {G}")
 
-            global_G, global_GAE = self._weighted_gae(
+            global_Q, global_GAE = self._weighted_gae(
                 rewards=rewards,
                 values=Q,
                 bootstrap_values=next_Q,
@@ -1328,12 +1374,12 @@ class PG(nn.Module, Agent):
                 gamma=self.gamma,
                 gae_lambda=self.gae_lambda,
             )
-            print(f"global GAE: {global_GAE}\nglobal G: {global_G}")
+            print(f"global GAE: {global_GAE}\nglobal G: {global_Q}")
 
             print(f"scaled importance after: {scaled_importance}")
         print(f"adv_grad shape: {adv_grad.shape}")
         print(f"raw importance shape {grad_free_adv.shape}")
-        critic_loss = ((Q - global_G) ** 2).mean()
+        critic_loss = ((Q - global_Q) ** 2).mean()
         self.optimizer.zero_grad()
         critic_loss.backward()
         self.optimizer.step()
