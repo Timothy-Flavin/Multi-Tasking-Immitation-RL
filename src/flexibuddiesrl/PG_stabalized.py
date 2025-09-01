@@ -1241,19 +1241,47 @@ class PG(nn.Module, Agent):
         G = advantages + values.unsqueeze(-1)
         return G, advantages
 
+    def _continuous_log_probs_per_dim(self, logits, lstd_logits, actions):
+        lstd = -1.0
+        if self.actor_logstd is not None:
+            lstd = self.actor_logstd.expand_as(logits)
+        else:
+            assert (
+                lstd_logits is not None
+            ), "If the actor doesnt generate logits then it needs to have a global logstd"
+            lstd = lstd_logits.expand_as(logits)
+        dist = torch.distributions.Normal(
+            loc=logits, scale=torch.clip(torch.exp(lstd), min=0.05)
+        )
+        if self.action_clamp_type == "tanh":
+            activations = minmaxnorm(actions, self.min_actions, self.max_actions)
+            eps = 1e-6
+            activations = torch.clamp(activations, -1 + eps, 1 - eps)
+            activations = torch.atanh(activations)
+        else:
+            activations = actions
+
+        log_probs = dist.log_prob(activations)
+
+        if self.action_clamp_type == "tanh":
+            log_probs -= 2 * (
+                np.log(2) - activations - F.softplus(-2 * activations)
+            ).sum(dim=-1)
+        return log_probs, dist.entropy()
+
     def _log_probs_per_dim(self, obs, d_actions, c_actions):
         continuous_means, continuous_log_std_logits, discrete_logits = self.actor(obs)
         discrete_log_probs = None
         continuous_log_probs = None
+        lp = []
+        c_entropy = 0
         if self.continuous_action_dim > 0:
-            log_std = continuous_log_std_logits
-            log_std = log_std.expand_as(continuous_means)
-            c_dist = torch.distributions.Normal(
-                continuous_means,
-                torch.clip(torch.exp(log_std), min=0.05),
+            continuous_log_probs, c_entropy = self._continuous_log_probs_per_dim(
+                continuous_means, continuous_log_std_logits, c_actions
             )
-            continuous_log_probs = c_dist.log_prob(c_actions)
+            lp.append(continuous_log_probs)
 
+        d_entropy = 0
         if self.discrete_action_dims is not None and len(self.discrete_action_dims) > 0:
             discrete_log_probs = torch.zeros(
                 discrete_logits[0].shape[0],
@@ -1263,29 +1291,27 @@ class PG(nn.Module, Agent):
             for i, logits in enumerate(discrete_logits):
                 d_dist = torch.distributions.Categorical(logits=logits)
                 discrete_log_probs[:, i] = d_dist.log_prob(d_actions[:, i])
+                d_entropy += d_dist.entropy()
+            lp.append(discrete_log_probs)
+        lp = torch.cat(lp, dim=-1)
+        return lp, c_entropy + d_entropy
 
-        return discrete_log_probs, continuous_log_probs
+    def _mix_actor_loss(self, old_log_probs, new_log_probs, advantages, entropy):
+        print(
+            f"mix_actor_loss newlp: {new_log_probs.shape} oldlp: {old_log_probs.shape} adv: {advantages.shape}"
+        )
+        logratio = new_log_probs - old_log_probs
+        ratio = torch.exp(logratio)
 
-    def _expected_target_value(self, obs, d_adv, c_adv):
-        continuous_means, continuous_log_std_logits, discrete_logits = self.actor(obs)
-        if self.continuous_action_dim > 0:
-            log_std = continuous_log_std_logits
-            log_std = log_std.expand_as(continuous_means)
-            c_dist = torch.distributions.Normal(
-                continuous_means,
-                torch.clip(torch.exp(log_std), min=0.05),
-            )
-            continuous_log_probs = c_dist.pr
+        # Clipped surrogate objective
+        pg_loss1 = advantages * ratio
+        pg_loss2 = advantages * torch.clamp(ratio, 1 - self.ppo_clip, 1 + self.ppo_clip)
+        policy_loss = -torch.min(pg_loss1, pg_loss2).mean()
 
-        if self.discrete_action_dims is not None and len(self.discrete_action_dims) > 0:
-            discrete_log_probs = torch.zeros(
-                discrete_logits[0].shape[0],
-                len(self.discrete_action_dims),
-                device=self.device,
-            )
-            for i, logits in enumerate(discrete_logits):
-                d_dist = torch.distributions.Categorical(logits=logits)
-                discrete_log_probs[:, i] = d_dist.log_prob(d_actions[:, i])
+        # Optional: entropy bonus (if you want to add it here)
+        policy_loss -= self.entropy_loss * entropy.mean()
+
+        return policy_loss
 
     def _mix_reinforcement_learn(
         self, batch: FlexiBatch, agent_num, critic_only, debug
@@ -1313,21 +1339,19 @@ class PG(nn.Module, Agent):
 
         self.mixer.zero_grad()
         Q = (self.mixer(adv, obs)[0] + values).squeeze(-1)
+
         with torch.no_grad():
             next_values, next_d_adv, next_c_adv = self.critic(obs_)
-
+            old_log_probs = self._log_probs_per_dim(obs, d_actions, c_actions)
             if self.on_policy_mixer:
-                next_adv = self._expected_target_value(
-                    obs_,
-                    next_d_adv,
-                    next_c_adv,
-                )
+                next_adv = 0
+                next_Q = next_values
             else:
                 next_adv = self._max_advantages(
                     next_d_adv,
                     next_c_adv,
                 )
-            next_Q = (self.mixer(next_adv, obs_)[0] + next_values).squeeze(-1)
+                next_Q = (self.mixer(next_adv, obs_)[0] + next_values).squeeze(-1)
             # critic_target = rewards + self.gamma * (1.0 - terminated) * next_Q
             if self.importance_from_grad:
                 scaled_importance = grad_free_adv * adv_grad
@@ -1375,16 +1399,25 @@ class PG(nn.Module, Agent):
                 gae_lambda=self.gae_lambda,
             )
             print(f"global GAE: {global_GAE}\nglobal G: {global_Q}")
-
             print(f"scaled importance after: {scaled_importance}")
         print(f"adv_grad shape: {adv_grad.shape}")
         print(f"raw importance shape {grad_free_adv.shape}")
-        critic_loss = ((Q - global_Q) ** 2).mean()
-        self.optimizer.zero_grad()
-        critic_loss.backward()
-        self.optimizer.step()
 
-        input(f"makes sense?")
+        for k in range(self.n_epochs):
+            critic_loss = ((Q - global_Q) ** 2).mean()
+            self.optimizer.zero_grad()
+            critic_loss.backward()
+            self.optimizer.step()
+
+            new_log_probs, entropy = self._log_probs_per_dim(obs, d_actions, c_actions)
+            actor_loss = self._mix_actor_loss(
+                old_log_probs, new_log_probs, gae, entropy
+            )
+            self.optimizer.zero_grad()
+            actor_loss.backward()
+            self.optimizer.step()
+
+            input(f"makes sense? k {k}")
         return 0, 0
 
     def _dump_attr(self, attr, path):
