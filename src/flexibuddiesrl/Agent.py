@@ -915,7 +915,7 @@ class VDNMixer(nn.Module):
     def forward(
         self, agent_qs: torch.Tensor, state: torch.Tensor, with_grad: bool = False
     ) -> tuple[torch.Tensor, None | torch.Tensor]:
-        return agent_qs.sum(dim=-1), torch.ones_like(agent_qs)
+        return agent_qs.sum(dim=-1, keepdim=True), torch.ones_like(agent_qs)
 
 
 class QS(nn.Module):

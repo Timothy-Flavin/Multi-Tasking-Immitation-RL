@@ -20,13 +20,13 @@ def PG_test():
         "reinforcement_learn": 0.0,
     }
     rl_times = {
-        "advantage": 0.0,
-        "critic_loss": 0.0,
-        "act": 0.0,
-        "dloss": 0.0,
-        "closs": 0.0,
-        "backward": 0.0,
-        "tot": 0.0,
+        "advantage": 0.1,
+        "critic_loss": 0.1,
+        "act": 0.1,
+        "dloss": 0.1,
+        "closs": 0.1,
+        "backward": 0.1,
+        "tot": 0.1,
     }
     obs_dim = 3
     continuous_action_dim = 5
@@ -247,8 +247,8 @@ def PG_test():
             raise e
         run_times["reinforcement_learn"] += time.time() - _s
 
-        for k in rl_times:
-            rl_times[k] += model.run_times[k]
+        # for k in rl_times:
+        #    rl_times[k] += model.run_times[k]
 
     print(tot)
 

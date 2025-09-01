@@ -62,7 +62,7 @@ class PG(nn.Module, Agent):
         importance_schedule=[10.0, 1.0, 10000],  # start end nsteps
         importance_from_grad=True,
         softmax_importance_scale=True,
-        on_policy_mixer=False,
+        on_policy_mixer=True,
     ):
         super(PG, self).__init__()
         self.load_from_checkpoint = load_from_checkpoint
@@ -939,9 +939,6 @@ class PG(nn.Module, Agent):
             entropy = dist.entropy().mean()
             selected_log_probs = dist.log_prob(actions[:, head])
             if self.ppo_clip > 0:
-                # print(
-                #     f"disc shapes sel_lp {selected_log_probs.shape} lphead: {log_probs[:, head].shape}"
-                # )
                 logratio = (
                     selected_log_probs
                     - log_probs[
@@ -953,14 +950,8 @@ class PG(nn.Module, Agent):
                 pg_loss2 = advantages.squeeze(-1) * torch.clamp(
                     ratio, 1 - self.ppo_clip, 1 + self.ppo_clip
                 )
-                # print(
-                #     f"advsq {advantages.squeeze(-1).shape} ratio: {ratio.shape} pg1: {pg_loss1.shape} pg2: {pg_loss2.shape}"
-                # )
                 discrete_policy_gradient = torch.min(pg_loss1, pg_loss2)
             else:
-                # print(
-                #     f"adv {advantages.squeeze(-1).shape} slp: {selected_log_probs.shape}"
-                # )
                 discrete_policy_gradient = selected_log_probs * advantages.squeeze(-1)
 
             actor_loss += (
@@ -978,7 +969,7 @@ class PG(nn.Module, Agent):
     ):
         if self.eval_mode:
             return 0, 0
-        print(f"mix type: {self.mix_type}, adv type: {self.advantage_type}")
+        # print(f"mix type: {self.mix_type}, adv type: {self.advantage_type}")
         if self.mix_type == "QMIX" or self.mix_type == "VDN":
             return self._mix_reinforcement_learn(batch, agent_num, critic_only, debug)
         if debug:
@@ -1052,7 +1043,6 @@ class PG(nn.Module, Agent):
                             clp,
                             mb_adv,
                             cact,
-                            mb_obs,
                         )
                     if self.discrete_action_dims is not None:
                         dact = batch.__getattr__(
@@ -1069,7 +1059,7 @@ class PG(nn.Module, Agent):
                             self.batch_name_map["discrete_log_probs"]
                         )[agent_num, indices]
                         actor_loss += self._discrete_actor_loss(
-                            dact, dlp, discrete_logits, mb_adv, mb_obs
+                            dact, dlp, discrete_logits, mb_adv
                         )
 
                     # print("actor")
@@ -1195,10 +1185,7 @@ class PG(nn.Module, Agent):
         if c_adv is not None:
             assert isinstance(c_adv, torch.Tensor)
             importance.append(c_adv.max(dim=-1).values - c_adv.min(dim=-1).values)
-        for i in importance:
-            print(f" importance shape: {i.shape}")
         importance = torch.cat(importance, dim=-1)
-        print(f"total importance shape: {importance.shape}")
         return importance
 
     def _update_importance(self):
@@ -1262,12 +1249,9 @@ class PG(nn.Module, Agent):
             activations = actions
 
         log_probs = dist.log_prob(activations)
-
         if self.action_clamp_type == "tanh":
-            log_probs -= 2 * (
-                np.log(2) - activations - F.softplus(-2 * activations)
-            ).sum(dim=-1)
-        return log_probs, dist.entropy()
+            log_probs -= 2 * (np.log(2) - activations - F.softplus(-2 * activations))
+        return log_probs, dist.entropy().sum(-1)
 
     def _log_probs_per_dim(self, obs, d_actions, c_actions):
         continuous_means, continuous_log_std_logits, discrete_logits = self.actor(obs)
@@ -1291,15 +1275,12 @@ class PG(nn.Module, Agent):
             for i, logits in enumerate(discrete_logits):
                 d_dist = torch.distributions.Categorical(logits=logits)
                 discrete_log_probs[:, i] = d_dist.log_prob(d_actions[:, i])
-                d_entropy += d_dist.entropy()
+                d_entropy += d_dist.entropy().squeeze(-1)
             lp.append(discrete_log_probs)
         lp = torch.cat(lp, dim=-1)
         return lp, c_entropy + d_entropy
 
     def _mix_actor_loss(self, old_log_probs, new_log_probs, advantages, entropy):
-        print(
-            f"mix_actor_loss newlp: {new_log_probs.shape} oldlp: {old_log_probs.shape} adv: {advantages.shape}"
-        )
         logratio = new_log_probs - old_log_probs
         ratio = torch.exp(logratio)
 
@@ -1342,7 +1323,7 @@ class PG(nn.Module, Agent):
 
         with torch.no_grad():
             next_values, next_d_adv, next_c_adv = self.critic(obs_)
-            old_log_probs = self._log_probs_per_dim(obs, d_actions, c_actions)
+            old_log_probs, old_ent = self._log_probs_per_dim(obs, d_actions, c_actions)
             if self.on_policy_mixer:
                 next_adv = 0
                 next_Q = next_values
@@ -1359,7 +1340,6 @@ class PG(nn.Module, Agent):
                 raw_importance = self._gather_importance(d_adv, c_adv.detach())
                 scaled_importance = raw_importance * adv_grad
 
-            print(f"scaled importance: {scaled_importance}")
             self._update_importance()
 
             if self.softmax_importance_scale:
@@ -1372,7 +1352,6 @@ class PG(nn.Module, Agent):
                 )
                 scaled_importance /= scaled_importance.sum(dim=-1).unsqueeze(-1)
 
-            print(f"scaled importance after normalize: {scaled_importance}")
             # So learning rate doesn't shrink with number of agents
             scaled_importance *= grad_free_adv.shape[-1]
 
@@ -1386,7 +1365,6 @@ class PG(nn.Module, Agent):
                 gamma=self.gamma,
                 gae_lambda=self.gae_lambda,
             )
-            print(f"dim-wise GAE: {gae}\nDim-wise G: {G}")
 
             global_Q, global_GAE = self._weighted_gae(
                 rewards=rewards,
@@ -1398,10 +1376,6 @@ class PG(nn.Module, Agent):
                 gamma=self.gamma,
                 gae_lambda=self.gae_lambda,
             )
-            print(f"global GAE: {global_GAE}\nglobal G: {global_Q}")
-            print(f"scaled importance after: {scaled_importance}")
-        print(f"adv_grad shape: {adv_grad.shape}")
-        print(f"raw importance shape {grad_free_adv.shape}")
 
         for k in range(self.n_epochs):
             critic_loss = ((Q - global_Q) ** 2).mean()
@@ -1417,7 +1391,6 @@ class PG(nn.Module, Agent):
             actor_loss.backward()
             self.optimizer.step()
 
-            input(f"makes sense? k {k}")
         return 0, 0
 
     def _dump_attr(self, attr, path):
