@@ -1378,6 +1378,8 @@ class PG(nn.Module, Agent):
             )
 
         for k in range(self.n_epochs):
+            if k > 0:
+                Q = (self.mixer(adv, obs)[0] + values).squeeze(-1)
             critic_loss = ((Q - global_Q) ** 2).mean()
             self.optimizer.zero_grad()
             critic_loss.backward()
