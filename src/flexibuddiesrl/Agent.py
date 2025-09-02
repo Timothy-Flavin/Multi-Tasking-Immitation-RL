@@ -564,7 +564,7 @@ class StochasticActor(nn.Module):
                 log_std = log_std.expand_as(continuous_means)
                 c_dist = torch.distributions.Normal(
                     continuous_means,
-                    torch.clip(torch.exp(log_std), min=0.05),
+                    torch.exp(log_std),
                 )
                 continuous_activations = c_dist.rsample()
 
