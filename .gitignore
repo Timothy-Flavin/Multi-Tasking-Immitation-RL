@@ -168,3 +168,4 @@ share/
 include/
 sanity.py
 sanity2.py
+testvenv

@@ -1,0 +1,6 @@
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128
+pip install gymnasium
+pip install matplotlib
+pip install --upgrade flexibuff flexibuddiesrl
+pip install numpy
+pip install build

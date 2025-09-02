@@ -11,6 +11,7 @@ import time
 from torch.distributions import TransformedDistribution, TanhTransform
 import torch.nn.functional as F
 from typing import Any, cast
+import collections
 
 
 class PG(nn.Module, Agent):
@@ -1242,37 +1243,37 @@ class PG(nn.Module, Agent):
             loc=torch.clip(logits, min=-4.0, max=4.0), scale=torch.exp(lstd)
         )
         if self.action_clamp_type == "tanh":
-            print(f"    action 0:3 {actions[0:3]}")
+            # print(f"    action 0:3 {actions[0:3]}")
             activations = minmaxnorm(actions, self.min_actions, self.max_actions)
-            print(f"mmn action 0:3 {activations[0:3]}")
+            # print(f"mmn action 0:3 {activations[0:3]}")
             eps = 1.0 - 0.999329299739
             activations = torch.clamp(activations, -1 + eps, 1 - eps)
-            print(f"clp action 0:3 {activations[0:3]}")
+            # print(f"clp action 0:3 {activations[0:3]}")
             activations = torch.atanh(activations)
-            print(f"ath action 0:3 {activations[0:3]}")
+            # print(f"ath action 0:3 {activations[0:3]}")
         else:
             activations = actions
-        print(f"logits: {logits[0:5]}")
-        print(f"continuous activations: {activations}")
-        print(f"loc: {torch.clip(logits,min=-4.0,max=4.0)}")
-        print(f"scale: {torch.exp(lstd)[0:5]}")
+        # print(f"logits: {logits[0:5]}")
+        # print(f"continuous activations: {activations}")
+        # print(f"loc: {torch.clip(logits,min=-4.0,max=4.0)}")
+        # print(f"scale: {torch.exp(lstd)[0:5]}")
         log_probs = dist.log_prob(activations)
-        print(f"log prob: {log_probs}")
-        print(f"at step: {self.steps/64}")
+        # print(f"log prob: {log_probs}")
+        # print(f"at step: {self.steps/64}")
         # print(f"What the heck? {log_probs}")
         if self.action_clamp_type == "tanh":
             log_probs -= 2 * (np.log(2) - activations - F.softplus(-2 * activations))
         # print(f"What the heck? {log_probs}")
         # if torch.min(log_probs)<-100:
-        input(f"min lp... :{torch.min(log_probs)}")
+        # input(f"min lp... :{torch.min(log_probs)}")
         return log_probs, dist.entropy().sum(-1)
 
     def _log_probs_per_dim(self, obs, d_actions, c_actions):
         continuous_means, continuous_log_std_logits, discrete_logits = self.actor(obs)
 
-        print(
-            f"continuous_means: {continuous_means}\nclstdl: {continuous_log_std_logits}"
-        )
+        # print(
+        #     f"continuous_means: {continuous_means}\nclstdl: {continuous_log_std_logits}"
+        # )
         discrete_log_probs = None
         continuous_log_probs = None
         lp = []
@@ -1282,7 +1283,7 @@ class PG(nn.Module, Agent):
                 continuous_means, continuous_log_std_logits, c_actions
             )
             lp.append(continuous_log_probs)
-            print(f"continuous lp: {continuous_log_probs}")
+            # print(f"continuous lp: {continuous_log_probs}")
         d_entropy = 0
         if self.discrete_action_dims is not None and len(self.discrete_action_dims) > 0:
             discrete_log_probs = torch.zeros(
@@ -1311,7 +1312,7 @@ class PG(nn.Module, Agent):
         policy_loss = -torch.min(pg_loss1, pg_loss2).mean()
 
         # Optional: entropy bonus (if you want to add it here)
-        # policy_loss -= self.entropy_loss * entropy.mean()
+        policy_loss -= self.entropy_loss * entropy.mean()
 
         return policy_loss
 
@@ -1416,19 +1417,16 @@ class PG(nn.Module, Agent):
             new_log_probs, entropy, logit_regulrization = self._log_probs_per_dim(
                 obs, d_actions, c_actions
             )
-            if torch.min(new_log_probs) < -12:
-                # print(f"min lp: {torch.min(new_log_probs) }")
+            if torch.min(new_log_probs) < -15:
+                print("Bad log prob")
+                self.optimizer.state = collections.defaultdict(dict)
                 continuous_means, continuous_log_std_logits, discrete_logits = (
                     self.actor(obs)
                 )
-                # print(f"means before: {torch.mean(torch.abs(continuous_means))}")
                 logit_regulrization = 0.1 * (continuous_means**2).mean()
                 self.optimizer.zero_grad()
                 logit_regulrization.backward()
                 self.optimizer.step()
-                continuous_means, continuous_log_std_logits, discrete_logits = (
-                    self.actor(obs)
-                )
                 break
             actor_loss = (
                 self._mix_actor_loss(old_log_probs, new_log_probs, gae, entropy)
