@@ -65,9 +65,11 @@ class PG(nn.Module, Agent):
         softmax_importance_scale=True,
         on_policy_mixer=True,
         logit_reg=0.05,
+        relative_entropy_loss=0.05,
     ):
         super(PG, self).__init__()
         self.load_from_checkpoint = load_from_checkpoint
+        self.relative_entropy_loss = relative_entropy_loss
         if self.load_from_checkpoint is not None:
             self.load(self.load_from_checkpoint)
             return
@@ -914,21 +916,17 @@ class PG(nn.Module, Agent):
             lstd_logits=action_log_std,
         )
         if self.ppo_clip > 0:
-            # print(f"cont lp shape: {cont_log_probs.shape}")
-            # print(f"old lp shape: {old_log_probs.shape}")
             logratio = (
                 cont_log_probs
                 - old_log_probs  # batch.continuous_log_probs[agent_num, indices]
             )
             ratio = logratio.exp()
-            # print(f" ratio shape: {ratio.shape} adv shape: {advantages.shape}")
             pg_loss1 = advantages * ratio
             pg_loss2 = advantages * torch.clamp(
                 ratio, 1 - self.ppo_clip, 1 + self.ppo_clip
             )
             continuous_policy_gradient = torch.min(pg_loss1, pg_loss2)
         else:
-            # print(f" lp shape: {cont_log_probs.shape} adv shape: {advantages.shape}")
             continuous_policy_gradient = cont_log_probs * advantages
         actor_loss = (
             -self.policy_loss * continuous_policy_gradient.mean()
@@ -1026,7 +1024,6 @@ class PG(nn.Module, Agent):
 
                 critic_loss = self._critic_loss(batch, indices, G, agent_num, debug)
                 actor_loss = torch.zeros(1, device=self.device)
-                # print(torch.abs(V_current - G[indices]).mean())
                 if not critic_only:
                     mb_adv = advantages[torch.from_numpy(indices).to(self.device)]
                     mb_obs = batch.__getattr__(self.batch_name_map["obs"])[
@@ -1053,13 +1050,6 @@ class PG(nn.Module, Agent):
                         dact = batch.__getattr__(
                             self.batch_name_map["discrete_actions"]
                         )[agent_num, indices]
-                        # dlp = []
-                        # for head in range(len(self.discrete_action_dims)):
-                        #     dlp.append(
-                        #         batch.__getattr__(
-                        #             self.batch_name_map["discrete_log_probs"]
-                        #         )[head][agent_num, indices]
-                        #     )
                         dlp = batch.__getattr__(
                             self.batch_name_map["discrete_log_probs"]
                         )[agent_num, indices]
@@ -1067,19 +1057,9 @@ class PG(nn.Module, Agent):
                             dact, dlp, discrete_logits, mb_adv
                         )
 
-                    # print("actor")
-                    # self.optimizer.zero_grad()
-                    # loss = actor_loss
-                    # loss.backward()
-                    # self._print_grad_norm()
-                    # print("critic")
                 self.optimizer.zero_grad()
                 loss = actor_loss + critic_loss * self.critic_loss_coef
                 loss.backward()
-                # self._print_grad_norm()
-                # print(self.actor_logstd)
-                # print(self.actor_logstd.grad)
-                # self._print_grad_norm()
 
                 if self.clip_grad:
                     torch.nn.utils.clip_grad_norm_(
@@ -1089,37 +1069,7 @@ class PG(nn.Module, Agent):
                         foreach=True,
                     )
 
-                # with torch.no_grad():
-                #     (
-                #         old_continuous_means,
-                #         old_continuous_log_std_logits,
-                #         old_discrete_logits,
-                #     ) = self.actor(
-                #         x=batch.__getattr__(self.batch_name_map["obs"])[
-                #             agent_num, indices
-                #         ],
-                #     )
-                #     print(
-                #         f"old logits before update: {old_continuous_means[:,0]} and std: {torch.exp(old_continuous_log_std_logits)[:,0]}"
-                #     )
-
                 self.optimizer.step()
-
-                # if debug:
-                #     with torch.no_grad():
-                #         continuous_means, continuous_log_std_logits, discrete_logits = (
-                #             self.actor(
-                #                 x=batch.__getattr__(self.batch_name_map["obs"])[
-                #                     agent_num, indices
-                #                 ],
-                #             )
-                #         )
-
-                #         print(
-                #             f"new logits after update: {continuous_means[:,0]} and std: {torch.exp(continuous_log_std_logits)[:,0]}"
-                #         )
-                #         print(self.optimizer.param_groups[0]["lr"])
-                #         input()
 
                 avg_actor_loss += actor_loss.to("cpu").item()
                 avg_critic_loss += critic_loss.to("cpu").item()
@@ -1142,14 +1092,8 @@ class PG(nn.Module, Agent):
         min_actions = self.min_actions.unsqueeze(0)  # type:ignore
         max_actions = self.max_actions.unsqueeze(0)  # type:ignore
         bin_width = (max_actions - min_actions) / (n_bins - 1)
-        # print(min_actions)
-        # print(max_actions)
-        # print(c_actions)
         bin_indices = torch.round((c_actions - min_actions) / bin_width)
-        # print(bin_indices[0:10])
         bin_indices = bin_indices.clamp(0, n_bins - 1)
-        # print(bin_indices[0:10])
-        # input("hmm")
         return bin_indices.long()
 
     def _gather_observed_advantages(self, d_adv, c_adv, d_actions, c_actions):
@@ -1164,8 +1108,6 @@ class PG(nn.Module, Agent):
         if c_adv is not None:
             c_indices = self._bin_continuous_actions(c_actions)
             assert isinstance(c_adv, torch.Tensor)
-            # print("continuous indices")
-            # print(c_indices)
             advantages.append(
                 c_adv.gather(dim=-1, index=c_indices.unsqueeze(-1)).squeeze(-1)
             )
@@ -1254,29 +1196,15 @@ class PG(nn.Module, Agent):
             loc=torch.clip(logits, min=-4.0, max=4.0), scale=torch.exp(lstd)
         )
         if self.action_clamp_type == "tanh":
-            # print(f"    action 0:3 {actions[0:3]}")
             activations = minmaxnorm(actions, self.min_actions, self.max_actions)
-            # print(f"mmn action 0:3 {activations[0:3]}")
             eps = 1.0 - 0.999329299739
             activations = torch.clamp(activations, -1 + eps, 1 - eps)
-            # print(f"clp action 0:3 {activations[0:3]}")
             activations = torch.atanh(activations)
-            # print(f"ath action 0:3 {activations[0:3]}")
         else:
             activations = actions
-        # print(f"logits: {logits[0:5]}")
-        # print(f"continuous activations: {activations}")
-        # print(f"loc: {torch.clip(logits,min=-4.0,max=4.0)}")
-        # print(f"scale: {torch.exp(lstd)[0:5]}")
         log_probs = dist.log_prob(activations)
-        # print(f"log prob: {log_probs}")
-        # print(f"at step: {self.steps/64}")
-        # print(f"What the heck? {log_probs}")
         if self.action_clamp_type == "tanh":
             log_probs -= 2 * (np.log(2) - activations - F.softplus(-2 * activations))
-        # print(f"What the heck? {log_probs}")
-        # if torch.min(log_probs)<-100:
-        # input(f"min lp... :{torch.min(log_probs)}")
         return log_probs, dist.entropy().sum(-1)
 
     def _log_probs_per_dim(self, obs, d_actions, c_actions):
@@ -1311,15 +1239,12 @@ class PG(nn.Module, Agent):
         logit_regularization_loss = 0
         if self.continuous_action_dim > 0:
             logit_regularization_loss = 0.01 * (continuous_means**2).mean()
-        return lp, 0.003 * c_entropy + d_entropy, logit_regularization_loss
+        return lp, d_entropy, c_entropy, logit_regularization_loss
 
     def _mix_actor_loss(self, old_log_probs, new_log_probs, advantages, entropy):
         logratio = new_log_probs - old_log_probs
         ratio = torch.exp(logratio)
 
-        # print(logratio)
-        # input()
-        # Clipped surrogate objective
         pg_loss1 = advantages * ratio
         pg_loss2 = advantages * torch.clamp(ratio, 1 - self.ppo_clip, 1 + self.ppo_clip)
         policy_loss = -torch.min(pg_loss1, pg_loss2).mean()
@@ -1328,11 +1253,7 @@ class PG(nn.Module, Agent):
         policy_loss -= self.entropy_loss * entropy.mean()
         return policy_loss
 
-    def _mix_reinforcement_learn(
-        self, batch: FlexiBatch, agent_num, critic_only, debug
-    ):
-        """If we have QMIX going on then we need to do everything different so might as well make a new function"""
-        assert self.mixer is not None, "Can't mix rl without a mixer..."
+    def _mix_critic_only(self, batch: FlexiBatch, agent_num):
         obs = batch.__getattr__(self.batch_name_map["obs"])[agent_num]
         obs_ = batch.__getattr__(self.batch_name_map["obs_"])[agent_num]
         d_actions = batch.__getattr__(self.batch_name_map["discrete_actions"])[
@@ -1347,20 +1268,76 @@ class PG(nn.Module, Agent):
         if truncated is None:
             truncated = torch.zeros_like(rewards)
         values, d_adv, c_adv = self.critic(obs)
-        # print(f": dadv {d_adv} cadv {c_adv}")
         adv = self._gather_observed_advantages(d_adv, c_adv, d_actions, c_actions)
-        grad_free_adv = adv.detach()
-        grad_free_adv.requires_grad = True
-        __q, adv_grad = self.mixer(grad_free_adv, obs, with_grad=True)
-
-        # print(f"adv grad shape out of mixer {adv_grad.shape} q shape: {__q.shape}")
-
-        self.mixer.zero_grad()
-        Q = (self.mixer(adv, obs)[0] + values).squeeze(-1)
+        Q = (self.mixer(adv, obs)[0] + values).squeeze(-1)  # type:ignore
 
         with torch.no_grad():
             next_values, next_d_adv, next_c_adv = self.critic(obs_)
-            old_log_probs, old_ent, _ = self._log_probs_per_dim(
+            if self.on_policy_mixer:
+                next_adv = 0
+                next_Q = next_values
+            else:
+                next_adv = self._max_advantages(
+                    next_d_adv,
+                    next_c_adv,
+                )
+                next_Q = (
+                    self.mixer(next_adv, obs_)[0] + next_values  # type:ignore
+                ).squeeze(-1)
+            global_Q, global_GAE = self._weighted_gae(
+                rewards=rewards,
+                values=Q,
+                bootstrap_values=next_Q,
+                terminated=terminated,  # type:ignore
+                truncated=truncated,  # type:ignore
+                advantage_weights=torch.ones_like(rewards).unsqueeze(-1),
+                gamma=self.gamma,
+                gae_lambda=self.gae_lambda,
+            )
+        critic_loss = ((Q - global_Q) ** 2).mean()
+        self.optimizer.zero_grad()
+        critic_loss.backward()
+        if self.clip_grad:
+            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
+            if self.mixer is not None:
+                torch.nn.utils.clip_grad_norm_(self.mixer.parameters(), 0.5)
+        self.optimizer.step()
+
+        return critic_loss.to("cpu").detach().item(), 0.0
+
+    def _mix_reinforcement_learn(
+        self, batch: FlexiBatch, agent_num, critic_only, debug
+    ):
+        """If we have QMIX going on then we need to do everything different so might as well make a new function"""
+        assert self.mixer is not None, "Can't mix rl without a mixer..."
+        if critic_only:
+            return self._mix_critic_only(batch, agent_num)
+        obs = batch.__getattr__(self.batch_name_map["obs"])[agent_num]
+        obs_ = batch.__getattr__(self.batch_name_map["obs_"])[agent_num]
+        d_actions = batch.__getattr__(self.batch_name_map["discrete_actions"])[
+            agent_num
+        ]
+        c_actions = batch.__getattr__(self.batch_name_map["continuous_actions"])[
+            agent_num
+        ]
+        rewards = batch.__getattr__(self.batch_name_map["rewards"])
+        terminated = batch.terminated
+        truncated = batch.truncated
+        if truncated is None:
+            truncated = torch.zeros_like(rewards)
+
+        with torch.no_grad():
+            values, d_adv, c_adv = self.critic(obs)
+            adv = self._gather_observed_advantages(d_adv, c_adv, d_actions, c_actions)
+        grad_free_adv = adv.detach()
+        grad_free_adv.requires_grad = True
+        __q, adv_grad = self.mixer(grad_free_adv, obs, with_grad=True)
+        self.mixer.zero_grad()
+
+        with torch.no_grad():
+            Q = (self.mixer(adv, obs)[0] + values).squeeze(-1)
+            next_values, next_d_adv, next_c_adv = self.critic(obs_)
+            old_log_probs, old_d_ent, old_c_end, _ = self._log_probs_per_dim(
                 obs, d_actions, c_actions
             )
             if self.on_policy_mixer:
@@ -1416,46 +1393,80 @@ class PG(nn.Module, Agent):
                 gae_lambda=self.gae_lambda,
             )
 
+        indices = np.arange(0, obs.shape[0])
+        avg_actor_loss = 0.0
+        avg_critic_loss = 0.0
+
+        if self.norm_advantages:
+            gae = (gae - gae.mean()) / (gae.std() + 1e-8)
+
         for k in range(self.n_epochs):
-            # print(f"mix rl K: {k}")
-            if k > 0:
-                values, d_adv, c_adv = self.critic(obs)
-                adv = self._gather_observed_advantages(
-                    d_adv, c_adv, d_actions, c_actions
+            # Shuffle indices at the start of each epoch
+            np.random.shuffle(indices)
+            # TODO: Loop through mini-batches
+            for start in range(0, len(indices), self.mini_batch_size):
+                # Get mini batch indices
+                end = start + self.mini_batch_size
+                mini_batch_indices = indices[start:end]
+
+                # Select mini-batch data
+                mb_obs = obs[mini_batch_indices]
+                mb_d_actions = d_actions[mini_batch_indices]
+                mb_c_actions = c_actions[mini_batch_indices]
+                mb_old_log_probs = old_log_probs[mini_batch_indices]
+                mb_gae = gae[mini_batch_indices]
+                mb_global_Q = global_Q[mini_batch_indices]
+
+                mb_values, mb_d_adv, mb_c_adv = self.critic(mb_obs)
+                mb_adv = self._gather_observed_advantages(
+                    mb_d_adv, mb_c_adv, mb_d_actions, mb_c_actions
                 )
-                Q = (self.mixer(adv, obs)[0] + values).squeeze(-1)
-            critic_loss = ((Q - global_Q) ** 2).mean()
-            self.optimizer.zero_grad()
-            critic_loss.backward()
-            self.optimizer.step()
+                mb_Q = (self.mixer(mb_adv, mb_obs)[0] + mb_values).squeeze(-1)
+                critic_loss = ((mb_Q - mb_global_Q) ** 2).mean()
 
-            new_log_probs, entropy, logit_regulrization = self._log_probs_per_dim(
-                obs, d_actions, c_actions
-            )
-            if torch.min(new_log_probs) < -15:
-                print("Bad log prob")
-                self.optimizer.state = collections.defaultdict(dict)
-                continuous_means, continuous_log_std_logits, discrete_logits = (
-                    self.actor(obs)
+                mb_new_log_probs, mb_d_entropy, mb_c_entropy, mb_logit_regulrization = (
+                    self._log_probs_per_dim(mb_obs, mb_d_actions, mb_c_actions)
                 )
-                if self.continuous_action_dim > 0:
-                    logit_regulrization = 0.1 * (continuous_means**2).mean()
-                    self.optimizer.zero_grad()
-                    logit_regulrization.backward()
-                    self.optimizer.step()
-                else:
-                    logit_regulrization = 0
+                mb_entropy = mb_d_entropy + self.relative_entropy_loss * mb_c_entropy
+                if torch.min(mb_new_log_probs) < -15:
+                    print("Bad log prob default to regularization only")
+                    # self.optimizer.state = collections.defaultdict(dict)
+                    # continuous_means, continuous_log_std_logits, discrete_logits = (
+                    #     self.actor(obs)
+                    # )
+                    # if self.continuous_action_dim > 0:
+                    #     logit_regulrization = 0.1 * (continuous_means**2).mean()
+                    #     self.optimizer.zero_grad()
+                    #     logit_regulrization.backward()
+                    #     self.optimizer.step()
+                    # else:
+                    #     logit_regulrization = 0
+                    continue
 
-                break
-            actor_loss = (
-                self._mix_actor_loss(old_log_probs, new_log_probs, gae, entropy)
-                + logit_regulrization
-            )
-            self.optimizer.zero_grad()
-            actor_loss.backward()
-            self.optimizer.step()
+                # Sum and Normalize loss grads
+                actor_loss = (
+                    self._mix_actor_loss(
+                        mb_old_log_probs, mb_new_log_probs, mb_gae, mb_entropy
+                    )
+                    + mb_logit_regulrization
+                )
+                loss = self.value_loss_coef * critic_loss + actor_loss
+                self.optimizer.zero_grad()
+                if self.clip_grad:
+                    torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
+                    torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
+                    if self.mixer is not None:
+                        torch.nn.utils.clip_grad_norm_(self.mixer.parameters(), 0.5)
+                loss.backward()
+                self.optimizer.step()
 
-        return 0, 0
+                avg_actor_loss += actor_loss.item()
+                avg_critic_loss += critic_loss.item()
+
+        num_updates = self.n_epochs * (len(indices) / self.mini_batch_size)
+        avg_actor_loss /= num_updates
+        avg_critic_loss /= num_updates
+        return avg_actor_loss, avg_critic_loss
 
     def _dump_attr(self, attr, path):
         f = open(path, "wb")
@@ -1506,36 +1517,3 @@ class PG(nn.Module, Agent):
 
     def param_count(self) -> tuple[int, int]:
         return super().param_count()
-
-
-# self.attrs = [
-#             "obs_dim",
-#             "continuous_action_dim",
-#             "max_actions",
-#             "min_actions",
-#             "discrete_action_dims",
-#             "lr",
-#             "gamma",
-#             "n_epochs",
-#             "device",
-#             "entropy_loss",
-#             "hidden_dims",
-#             "activation",
-#             "ppo_clip",
-#             "value_loss_coef",
-#             "value_clip",
-#             "advantage_type",
-#             "norm_advantages",
-#             "mini_batch_size",
-#             "anneal_lr",
-#             "orthogonal",
-#             "clip_grad",
-#             "gae_lambda",
-#             "g_mean",
-#             "steps",
-#             "eval_mode",
-#             "action_head_hidden_dims",
-#             "std_type",
-#             "naive_imitation",
-#             "action_clamp_type",
-#         ]
