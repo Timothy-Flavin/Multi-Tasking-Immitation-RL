@@ -7,26 +7,29 @@ from .Util import T
 
 
 class Agent(ABC):
+    from abc import ABC, abstractmethod
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from .Util import T
+
+
+class Agent(ABC):
 
     @abstractmethod
     def train_actions(
         self, observations, action_mask=None, step=False, debug=False
-    ) -> tuple[
-        np.ndarray | int | None,
-        np.ndarray | float | None,
-        np.ndarray | float | None,
-        np.ndarray | float | None,
-        np.ndarray | float | None,
-        np.ndarray | float | None,
-    ]:
-        return (
-            0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-        )  # discrete actions, continuous actions, discrete log probs, continuous log probs, raw_continuous_activation, value
+    ) -> dict:
+        return {
+            "discrete_action": 0,
+            "continuous_action": 0,
+            "discrete_log_prob": 0,
+            "continuous_log_prob": 0,
+            "value": 0,
+        }
 
     @abstractmethod
     def ego_actions(self, observations, action_mask=None) -> tuple[

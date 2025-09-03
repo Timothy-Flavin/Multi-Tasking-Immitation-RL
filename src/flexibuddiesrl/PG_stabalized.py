@@ -68,6 +68,10 @@ class PG(nn.Module, Agent):
         relative_entropy_loss=0.05,
     ):
         super(PG, self).__init__()
+        config = locals()
+        # Remove 'self' and other unwanted items
+        config.pop("self")
+        self.config = config
         self.load_from_checkpoint = load_from_checkpoint
         self.relative_entropy_loss = relative_entropy_loss
         if self.load_from_checkpoint is not None:

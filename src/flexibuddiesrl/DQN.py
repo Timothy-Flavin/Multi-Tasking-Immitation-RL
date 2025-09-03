@@ -54,6 +54,10 @@ class DQN(nn.Module, Agent):
         mix_type="None",  # None, VDN, QMIX
     ):
         super(DQN, self).__init__()
+        config = locals()
+        config.pop("self")
+        self.config = config
+
         if mix_type is None or mix_type.lower() == "none":
             mix_type = None
         if mix_type is not None:

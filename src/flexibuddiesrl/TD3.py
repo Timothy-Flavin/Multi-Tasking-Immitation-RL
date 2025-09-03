@@ -52,6 +52,9 @@ class TD3(Agent):
             The name of the agent
         device: str
         """
+        config = locals()
+        config.pop("self")
+        self.config = config
 
         self.attrs = [
             "obs_dim",
