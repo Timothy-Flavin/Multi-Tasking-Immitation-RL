@@ -64,6 +64,7 @@ class PG(nn.Module, Agent):
         importance_from_grad=True,
         softmax_importance_scale=True,
         on_policy_mixer=True,
+        logit_reg=0.05,
     ):
         super(PG, self).__init__()
         self.load_from_checkpoint = load_from_checkpoint
@@ -118,6 +119,7 @@ class PG(nn.Module, Agent):
         self.steps = 0
         self.anneal_lr = anneal_lr
         self.lr = lr
+        self.logit_reg = logit_reg
 
         self._sanitize_params()
         self._create_mixer()  # This needs to be before _get_torch_params for Adam to work
@@ -293,9 +295,8 @@ class PG(nn.Module, Agent):
         self.optimizer: torch.optim.Adam
         if self.std_type == "stateless":
             self.actor_logstd = nn.Parameter(
-                torch.zeros(self.continuous_action_dim), requires_grad=True
-            ).to(
-                self.device
+                torch.zeros(self.continuous_action_dim).to(self.device),
+                requires_grad=True,
             )  # TODO: Check this for expand as
             self.actor_logstd.retain_grad()
 
@@ -653,6 +654,7 @@ class PG(nn.Module, Agent):
         log_probs = torch.zeros_like(actions, dtype=torch.float)
         dist = Categorical(logits=logits)
         log_probs = dist.log_prob(actions)
+        # print("Disc probs:", log_probs.mean(dim=0).detach().cpu().numpy())
         return log_probs, dist.entropy().mean()
 
     def _get_cont_log_probs_entropy(
@@ -667,26 +669,26 @@ class PG(nn.Module, Agent):
             ), "If the actor doesnt generate logits then it needs to have a global logstd"
             lstd = lstd_logits.expand_as(logits)
 
-        # print(lstd)
+        # print(lstd.mean(dim=0).detach().cpu().numpy())
+        # print(actions.abs().mean(dim=0).detach().cpu().numpy())
         # print(self.std_type)
 
-        dist = torch.distributions.Normal(
-            loc=logits, scale=torch.clip(torch.exp(lstd), min=0.05)
-        )
         if self.action_clamp_type == "tanh":
+            dist = torch.distributions.Normal(
+                loc=torch.clip(logits, -4.0, 4.0), scale=torch.exp(lstd)
+            )
             # dist = TransformedDistribution(dist, TanhTransform())
             # print("actions were tanhed so we need to get form raw to dist activations")
             # print(f"actions: {actions[:,0]}")
             activations = minmaxnorm(actions, self.min_actions, self.max_actions)
-            eps = 1e-6
-            activations = torch.clamp(activations, -1 + eps, 1 - eps)
-            # print(f"normed actions: {activations[:,0]}")
+            activations = torch.clamp(activations, -0.999329299739, 0.999329299739)
             activations = torch.atanh(activations)
             # print(f"inverse tanh actions: {activations[:,0]}")
             # print(
             #    f"from raw logit means: {logits} and scale {torch.clip(torch.exp(lstd), min=1e-6)}"
             # )
         else:
+            dist = torch.distributions.Normal(loc=logits, scale=torch.exp(lstd))
             activations = actions
 
         log_probs = dist.log_prob(activations).sum(dim=-1)
@@ -931,6 +933,7 @@ class PG(nn.Module, Agent):
         actor_loss = (
             -self.policy_loss * continuous_policy_gradient.mean()
             - self.entropy_loss * cont_entropy
+            + self.logit_reg * (action_means**2).mean()
         )
         return actor_loss
 
@@ -1126,7 +1129,8 @@ class PG(nn.Module, Agent):
 
         avg_actor_loss /= self.n_epochs
         avg_critic_loss /= self.n_epochs
-        # print(avg_actor_loss, critic_loss.item())
+        print(avg_actor_loss, avg_critic_loss)
+        print()
         return avg_actor_loss, avg_critic_loss
 
     def _bin_continuous_actions(self, c_actions):
@@ -1135,12 +1139,17 @@ class PG(nn.Module, Agent):
             self.min_actions is not None and self.max_actions is not None
         ), "Can't bin actions with no max and min action"
         n_bins = 5
-        n_actions = c_actions.shape[-1]
         min_actions = self.min_actions.unsqueeze(0)  # type:ignore
         max_actions = self.max_actions.unsqueeze(0)  # type:ignore
         bin_width = (max_actions - min_actions) / (n_bins - 1)
+        # print(min_actions)
+        # print(max_actions)
+        # print(c_actions)
         bin_indices = torch.round((c_actions - min_actions) / bin_width)
-        bin_indices.clamp(0, n_bins - 1)
+        # print(bin_indices[0:10])
+        bin_indices = bin_indices.clamp(0, n_bins - 1)
+        # print(bin_indices[0:10])
+        # input("hmm")
         return bin_indices.long()
 
     def _gather_observed_advantages(self, d_adv, c_adv, d_actions, c_actions):
@@ -1155,6 +1164,8 @@ class PG(nn.Module, Agent):
         if c_adv is not None:
             c_indices = self._bin_continuous_actions(c_actions)
             assert isinstance(c_adv, torch.Tensor)
+            # print("continuous indices")
+            # print(c_indices)
             advantages.append(
                 c_adv.gather(dim=-1, index=c_indices.unsqueeze(-1)).squeeze(-1)
             )
@@ -1297,7 +1308,9 @@ class PG(nn.Module, Agent):
                 d_entropy += d_dist.entropy().squeeze(-1)
             lp.append(discrete_log_probs)
         lp = torch.cat(lp, dim=-1)
-        logit_regularization_loss = 0.01 * (continuous_means**2).mean()
+        logit_regularization_loss = 0
+        if self.continuous_action_dim > 0:
+            logit_regularization_loss = 0.01 * (continuous_means**2).mean()
         return lp, 0.003 * c_entropy + d_entropy, logit_regularization_loss
 
     def _mix_actor_loss(self, old_log_probs, new_log_probs, advantages, entropy):
@@ -1313,7 +1326,6 @@ class PG(nn.Module, Agent):
 
         # Optional: entropy bonus (if you want to add it here)
         policy_loss -= self.entropy_loss * entropy.mean()
-
         return policy_loss
 
     def _mix_reinforcement_learn(
@@ -1335,10 +1347,13 @@ class PG(nn.Module, Agent):
         if truncated is None:
             truncated = torch.zeros_like(rewards)
         values, d_adv, c_adv = self.critic(obs)
+        # print(f": dadv {d_adv} cadv {c_adv}")
         adv = self._gather_observed_advantages(d_adv, c_adv, d_actions, c_actions)
         grad_free_adv = adv.detach()
         grad_free_adv.requires_grad = True
         __q, adv_grad = self.mixer(grad_free_adv, obs, with_grad=True)
+
+        # print(f"adv grad shape out of mixer {adv_grad.shape} q shape: {__q.shape}")
 
         self.mixer.zero_grad()
         Q = (self.mixer(adv, obs)[0] + values).squeeze(-1)
@@ -1401,8 +1416,8 @@ class PG(nn.Module, Agent):
                 gae_lambda=self.gae_lambda,
             )
 
-        for k in range(1):
-            print(f"mix rl K: {k}")
+        for k in range(self.n_epochs):
+            # print(f"mix rl K: {k}")
             if k > 0:
                 values, d_adv, c_adv = self.critic(obs)
                 adv = self._gather_observed_advantages(
@@ -1423,10 +1438,14 @@ class PG(nn.Module, Agent):
                 continuous_means, continuous_log_std_logits, discrete_logits = (
                     self.actor(obs)
                 )
-                logit_regulrization = 0.1 * (continuous_means**2).mean()
-                self.optimizer.zero_grad()
-                logit_regulrization.backward()
-                self.optimizer.step()
+                if self.continuous_action_dim > 0:
+                    logit_regulrization = 0.1 * (continuous_means**2).mean()
+                    self.optimizer.zero_grad()
+                    logit_regulrization.backward()
+                    self.optimizer.step()
+                else:
+                    logit_regulrization = 0
+
                 break
             actor_loss = (
                 self._mix_actor_loss(old_log_probs, new_log_probs, gae, entropy)

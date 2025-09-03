@@ -4,3 +4,6 @@ pip install matplotlib
 pip install --upgrade flexibuff flexibuddiesrl
 pip install numpy
 pip install build
+pip install --upgrade pip setuptools wheel
+pip install swig
+pip install gymnasium[box2d]

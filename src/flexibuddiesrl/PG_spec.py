@@ -333,10 +333,18 @@ def PG_integration():
                 if ppo_clip > 0.0
                 else batch_size  # Dont do epochs if no ppo clip
             ),
+            value_loss_coef=0.5,
             action_clamp_type=param_grid["action_clamp_type"][random.randint(0, 2)],
             advantage_type=param_grid["adv_type"][random.randint(0, 4)],
             n_epochs=3 if ppo_clip > 0.0 else 1,
-            lr=5e-4,
+            lr=1e-4,
+            mix_type=None,
+            mixer_dim=64,
+            importance_schedule=[10, 1, 10000],
+            importance_from_grad=True,
+            softmax_importance_scale=True,
+            on_policy_mixer=True,
+            logit_reg=0.05,
         )
 
         # Print current hyper parameters before episode start
@@ -436,5 +444,5 @@ def PG_integration():
 
 
 if __name__ == "__main__":
-    PG_test()
+    # PG_test()
     PG_integration()
