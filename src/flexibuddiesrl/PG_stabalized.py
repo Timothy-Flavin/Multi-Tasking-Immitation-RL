@@ -128,6 +128,7 @@ class PG(nn.Module, Agent):
         self.anneal_lr = anneal_lr
         self.lr = lr
         self.logit_reg = logit_reg
+        self.mean_std = 1
 
         self._sanitize_params()
         self._create_mixer()  # This needs to be before _get_torch_params for Adam to work
@@ -1224,6 +1225,8 @@ class PG(nn.Module, Agent):
                 lstd_logits is not None
             ), "If the actor doesnt generate logits then it needs to have a global logstd"
             lstd = lstd_logits.expand_as(logits)
+        # TODO: Make this track better, this is a hack
+        self.mean_std = lstd.detach().mean(0).cpu()
         dist = torch.distributions.Normal(
             loc=torch.clip(logits, min=-4.0, max=4.0), scale=torch.exp(lstd)
         )
@@ -1435,7 +1438,6 @@ class PG(nn.Module, Agent):
         avg_critic_loss = 0.0
         avg_d_entropy = 0.0
         avg_c_entropy = 0.0
-        avg_c_std = 0.0
 
         if self.norm_advantages:
             gae = (gae - gae.mean()) / (gae.std() + 1e-8)
@@ -1521,7 +1523,7 @@ class PG(nn.Module, Agent):
             "rl_critic_loss": avg_critic_loss,
             "d_entropy": avg_d_entropy,
             "c_entropy": avg_c_entropy,
-            "c_std": 0,
+            "c_std": self.mean_std,
             "rl_time": t,
         }
 
