@@ -332,6 +332,17 @@ class PG(nn.Module, Agent):
     # train_actions will take one or multiple actions if given a list of observations
     # this way the agent can be parameter shared in a batched fashion.
     def train_actions(self, observations, action_mask=None, step=False, debug=False):
+        """
+        Returns action dictionary of the form:
+            {
+                "discrete_actions": np.int[da1,da2,...],
+                "continuous_actions": np.float[ca1,ca2,...],
+                "discrete_log_probs": float(sum(dlp1,dlp2,...)),
+                "continuous_log_probs": float(sum(clp1,clp2,...)),
+                "act_time": t(seconds) if self.wall_time,
+            }
+        returns gradient free numpy arrays / floats. act_time is the wall clock time
+        """
         t = 0
         if self.wall_time:
             t = time.time()
@@ -1575,4 +1586,10 @@ class PG(nn.Module, Agent):
         return st
 
     def param_count(self) -> tuple[int, int]:
-        return super().param_count()
+        return super().param_count(){
+            "discrete_actions": self._to_numpy(discrete_actions),
+            "continuous_actions": self._to_numpy(continuous_actions),
+            "discrete_log_probs": self._to_numpy(discrete_log_probs),
+            "continuous_log_probs": self._to_numpy(continuous_log_probs),
+            "act_time": t,
+        }
