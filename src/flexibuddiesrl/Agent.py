@@ -32,11 +32,11 @@ class Agent(ABC):
         }
 
     @abstractmethod
-    def ego_actions(self, observations, action_mask=None) -> tuple[
-        np.ndarray | int | None,
-        np.ndarray | float | None,
-    ]:
-        return np.array([1]), np.array([0.5])
+    def ego_actions(self, observations, action_mask=None) -> dict:
+        return {
+            "discrete_action": 0,
+            "continuous_action": 0,
+        }
 
     @abstractmethod
     def imitation_learn(
@@ -46,10 +46,9 @@ class Agent(ABC):
         discrete_actions,
         action_mask=None,
         debug=False,
-    ) -> tuple[float, float]:
-        x: float = 0.0
-        y: float = 0.0
-        return float(x), float(y)  # loss
+    ) -> dict:
+        immitation_metrics = {"critic_loss": 0, "actor_loss": 0}
+        return immitation_metrics
 
     @abstractmethod
     def utility_function(self, observations, actions=None):
@@ -64,8 +63,16 @@ class Agent(ABC):
     @abstractmethod
     def reinforcement_learn(
         self, batch, agent_num=0, critic_only=False, debug=False
-    ) -> tuple[float, float]:
-        return 0.0, 0.0  # actor loss, critic loss
+    ) -> dict:
+        rl_metrics = {
+            "critic_loss": 0,
+            "d_actor_loss": 0,
+            "c_actor_loss": 0,
+            "d_entropy": 0,
+            "c_entropy": 0,
+            "c_std": 0,
+        }
+        return rl_metrics
 
     @abstractmethod
     def save(self, checkpoint_path):

@@ -66,12 +66,14 @@ class PG(nn.Module, Agent):
         on_policy_mixer=True,
         logit_reg=0.05,
         relative_entropy_loss=0.05,
+        wall_time=False,
     ):
         super(PG, self).__init__()
         config = locals()
         # Remove 'self' and other unwanted items
         config.pop("self")
         self.config = config
+        self.wall_time = wall_time
         self.load_from_checkpoint = load_from_checkpoint
         self.relative_entropy_loss = relative_entropy_loss
         if self.load_from_checkpoint is not None:
@@ -329,6 +331,9 @@ class PG(nn.Module, Agent):
     # train_actions will take one or multiple actions if given a list of observations
     # this way the agent can be parameter shared in a batched fashion.
     def train_actions(self, observations, action_mask=None, step=False, debug=False):
+        t = 0
+        if self.wall_time:
+            t = time.time()
         if debug:
             print(f"  Testing PPO Train Actions: Observations: {observations}")
         if not torch.is_tensor(observations):
@@ -362,13 +367,6 @@ class PG(nn.Module, Agent):
                     f"  After actor: clog {continuous_logits}, dlog{discrete_action_logits}"
                 )
 
-            # clpstd = None
-            # if continuous_log_std_logits is not None:
-            #     clpstd = torch.exp(continuous_log_std_logits)
-            # print(
-            #     f"c_logits {continuous_logits} d_logits: {discrete_action_logits} c_std: {clpstd}"
-            # )
-
             try:
                 (
                     discrete_actions,
@@ -398,14 +396,15 @@ class PG(nn.Module, Agent):
         # print(continuous_logits)
         # print(continuous_actions)
         # print(f"in train action lp: {continuous_log_probs}")
-        return (
-            self._to_numpy(discrete_actions),
-            self._to_numpy(continuous_actions),
-            self._to_numpy(discrete_log_probs),
-            self._to_numpy(continuous_log_probs),
-            self._to_numpy(raw_continuous_activations),
-            0,  # vals.detach().cpu().numpy(), TODO: re-enable this when flexibuff is done
-        )
+        if self.wall_time:
+            t = time.time() - t
+        return {
+            "discrete_actions": self._to_numpy(discrete_actions),
+            "continuous_actions": self._to_numpy(continuous_actions),
+            "discrete_log_probs": self._to_numpy(discrete_log_probs),
+            "continuous_log_probs": self._to_numpy(continuous_log_probs),
+            "act_time": t,
+        }
 
     # takes the observations and returns the action with the highest probability
     def ego_actions(self, observations, action_mask=None):
@@ -428,7 +427,10 @@ class PG(nn.Module, Agent):
                 False,
                 False,
             )
-            return self._to_numpy(discrete_actions), self._to_numpy(continuous_actions)
+            return {
+                "discrete_actions": self._to_numpy(discrete_actions),
+                "continuous_actions": self._to_numpy(continuous_actions),
+            }
 
     def _discrete_imitation_loss(self, discrete_logits, discrete_actions):
         """
@@ -604,6 +606,9 @@ class PG(nn.Module, Agent):
         action_mask=None,
         debug=False,
     ):
+        t = 0
+        if self.wall_time:
+            t = time.time()
         continuous_mean_logits, continuous_log_std_logits, discrete_logits = self.actor(
             x=observations, action_mask=action_mask, debug=False
         )
@@ -638,7 +643,13 @@ class PG(nn.Module, Agent):
             discrete_imitation_loss = discrete_imitation_loss.to("cpu").item()
         if isinstance(continuous_imitation_loss, torch.Tensor):
             continuous_imitation_loss = continuous_imitation_loss.to("cpu").item()
-        return discrete_imitation_loss, continuous_imitation_loss
+        if self.wall_time:
+            t = time.time() - t
+        return {
+            "im_discrete_loss": discrete_imitation_loss,
+            "im_continuous_loss": continuous_imitation_loss,
+            "im_time": t,
+        }
 
     def utility_function(self, observations, actions=None):
         if not torch.is_tensor(observations):
@@ -974,8 +985,18 @@ class PG(nn.Module, Agent):
         critic_only=False,
         debug=False,
     ):
+        t = 0
+        if self.wall_time:
+            t = time.time()
         if self.eval_mode:
-            return 0, 0
+            return {
+                "rl_actor_loss": 0,
+                "rl_critic_loss": 0,
+                "d_entropy": 0,
+                "c_entropy": 0,
+                "c_std": 0,
+                "rl_time": 0,
+            }
         # print(f"mix type: {self.mix_type}, adv type: {self.advantage_type}")
         if self.mix_type == "QMIX" or self.mix_type == "VDN":
             return self._mix_reinforcement_learn(batch, agent_num, critic_only, debug)
@@ -1083,9 +1104,16 @@ class PG(nn.Module, Agent):
 
         avg_actor_loss /= self.n_epochs
         avg_critic_loss /= self.n_epochs
-        print(avg_actor_loss, avg_critic_loss)
-        print()
-        return avg_actor_loss, avg_critic_loss
+        if self.wall_time:
+            t = time.time() - t
+        return {
+            "rl_actor_loss": avg_actor_loss,
+            "rl_critic_loss": avg_critic_loss,
+            "d_entropy": 0,
+            "c_entropy": 0,
+            "c_std": 0,
+            "rl_time": t,
+        }
 
     def _bin_continuous_actions(self, c_actions):
         """Given continuous actions we return the discretized bins that the critic is using"""
@@ -1307,13 +1335,18 @@ class PG(nn.Module, Agent):
                 torch.nn.utils.clip_grad_norm_(self.mixer.parameters(), 0.5)
         self.optimizer.step()
 
-        return critic_loss.to("cpu").detach().item(), 0.0
+        return {
+            "rl_critic_loss": critic_loss.item(),
+        }
 
     def _mix_reinforcement_learn(
         self, batch: FlexiBatch, agent_num, critic_only, debug
     ):
         """If we have QMIX going on then we need to do everything different so might as well make a new function"""
         assert self.mixer is not None, "Can't mix rl without a mixer..."
+        t = 0
+        if self.wall_time:
+            t = time.time()
         if critic_only:
             return self._mix_critic_only(batch, agent_num)
         obs = batch.__getattr__(self.batch_name_map["obs"])[agent_num]
@@ -1400,6 +1433,9 @@ class PG(nn.Module, Agent):
         indices = np.arange(0, obs.shape[0])
         avg_actor_loss = 0.0
         avg_critic_loss = 0.0
+        avg_d_entropy = 0.0
+        avg_c_entropy = 0.0
+        avg_c_std = 0.0
 
         if self.norm_advantages:
             gae = (gae - gae.mean()) / (gae.std() + 1e-8)
@@ -1466,11 +1502,28 @@ class PG(nn.Module, Agent):
 
                 avg_actor_loss += actor_loss.item()
                 avg_critic_loss += critic_loss.item()
+                if isinstance(mb_c_entropy, torch.Tensor):
+                    mb_c_entropy = float(mb_c_entropy.mean().cpu())
+                avg_c_entropy += mb_c_entropy
+                if isinstance(mb_d_entropy, torch.Tensor):
+                    mb_d_entropy = float(mb_d_entropy.mean().cpu())
+                avg_d_entropy += mb_d_entropy
 
         num_updates = self.n_epochs * (len(indices) / self.mini_batch_size)
         avg_actor_loss /= num_updates
         avg_critic_loss /= num_updates
-        return avg_actor_loss, avg_critic_loss
+        avg_c_entropy /= num_updates
+        avg_d_entropy /= num_updates
+        if self.wall_time:
+            t = time.time() - t
+        return {
+            "rl_actor_loss": avg_actor_loss,
+            "rl_critic_loss": avg_critic_loss,
+            "d_entropy": avg_d_entropy,
+            "c_entropy": avg_c_entropy,
+            "c_std": 0,
+            "rl_time": t,
+        }
 
     def _dump_attr(self, attr, path):
         f = open(path, "wb")

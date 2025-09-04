@@ -9,6 +9,7 @@ from flexibuff import FlexiBatch
 import os
 import pickle
 import warnings
+import time
 
 from enum import Enum
 
@@ -52,12 +53,14 @@ class DQN(nn.Module, Agent):
         conservative=False,
         imitation_type="cross_entropy",  # or "reward"
         mix_type="None",  # None, VDN, QMIX
+        wall_time=False,
     ):
         super(DQN, self).__init__()
         config = locals()
         config.pop("self")
         self.config = config
 
+        self.wall_time = wall_time
         if mix_type is None or mix_type.lower() == "none":
             mix_type = None
         if mix_type is not None:
@@ -293,24 +296,23 @@ class DQN(nn.Module, Agent):
         return disc_act, cont_act
 
     def train_actions(self, observations, action_mask=None, step=False, debug=False):
-        # if len(observations.shape) == 1:
-        #    observations = np.expand_dims(observations, axis=0)
-        # if self.dqn_type == dqntype.Munchausen or self.dqn_type == dqntype.Soft:
-        #     disc_act, cont_act = self._soft_train_action(
-        #         observations, action_mask, step, debug
-        #     )
-        #     # print(disc_act)
-        #     # print(cont_act)
-        #     # print()
-        # else:
+        t = 0
+        if self.wall_time:
+            t = time.time()
         disc_act, cont_act = self._e_greedy_train_action(
             observations, action_mask, step, debug
         )
         self.step += int(step)
-        return disc_act, cont_act, 0.0, 0.0, 0.0, 0.0
+        if self.wall_time:
+            t = time.time() - t
+        return {
+            "discrete_actions": disc_act,
+            "continuous_actions": cont_act,
+            "action_time": t,
+        }
 
     def ego_actions(self, observations, action_mask=None):
-        return 0, 0
+        return {"discrete_actions": 0, "continuous_actions": 0, "action_time": 0}
 
     def _bc_cross_entropy_loss(self, disc_adv, cont_adv, disc_act, cont_act):
         discrete_loss = 0
@@ -361,9 +363,12 @@ class DQN(nn.Module, Agent):
         action_mask=None,
         debug=False,
     ):
+        t = 0
+        if self.wall_time:
+            t = time.time()
         values, disc_adv, cont_adv = self.Q1(observations)
         if self.eval_mode:
-            return 0, 0
+            return {"im_discrete_loss": 0, "im_continuous_loss": 0}
         else:
             dloss, closs = torch.zeros(1, device=self.device), torch.zeros(
                 1, device=self.device
@@ -385,7 +390,7 @@ class DQN(nn.Module, Agent):
                 warnings.warn(
                     "Loss is 0, not updating. Most likely due to continuous and discrete actions being None,0 respectively"
                 )
-                return 0, 0
+                return {"im_discrete_loss": 0, "im_continuous_loss": 0}
             self.optimizer.zero_grad()
             loss.backward()
             if self.clip_grad is not None and self.clip_grad > 0:
@@ -400,7 +405,10 @@ class DQN(nn.Module, Agent):
                 dloss = dloss.item()
             if closs != 0:
                 closs = closs.item()
-            return dloss, closs
+
+            if self.wall_time:
+                t = time.time() - t
+            return {"im_discrete_loss": dloss, "im_continuous_loss": closs, "time": t}
 
     def utility_function(self, observations, actions=None):
         return 0  # Returns the single-agent critic for a single action.
@@ -595,9 +603,12 @@ class DQN(nn.Module, Agent):
     def reinforcement_learn(
         self, batch: FlexiBatch, agent_num=0, critic_only=False, debug=False
     ):
+        t = 0
+        if self.wall_time:
+            t = time.time()
         self.update_num += 1
         if self.eval_mode:
-            return float(0.0), float(0.0)
+            return {"rl_loss": 0, "rl_time": 0}
 
         continuous_actions = None
         discrete_actions = None
@@ -769,8 +780,14 @@ class DQN(nn.Module, Agent):
                     tau * online_param.data + (1.0 - tau) * target_param.data
                 )
         # input("\n\nNew iter?")
+
         l_ = loss.item()
-        return l_, l_  # actor loss, critic loss
+        if self.wall_time:
+            t = time.time() - t
+        return {
+            "rl_loss": l_,
+            "rl_time": t,
+        }
 
     def _dump_attr(self, attr, path):
         f = open(path, "wb")
