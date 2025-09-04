@@ -29,6 +29,7 @@ class Agent(ABC):
             "discrete_log_prob": 0,
             "continuous_log_prob": 0,
             "value": 0,
+            "time": 0,
         }
 
     @abstractmethod
@@ -47,7 +48,7 @@ class Agent(ABC):
         action_mask=None,
         debug=False,
     ) -> dict:
-        immitation_metrics = {"critic_loss": 0, "actor_loss": 0}
+        immitation_metrics = {"critic_loss": 0, "actor_loss": 0, "time": 0}
         return immitation_metrics
 
     @abstractmethod
@@ -56,9 +57,9 @@ class Agent(ABC):
         # If actions are none then V(s)
 
     @abstractmethod
-    def expected_V(self, obs, legal_action):
+    def expected_V(self, obs, legal_action) -> torch.Tensor | np.ndarray | float:
         print("expected_V not implemeted")
-        return 0
+        return 0.0
 
     @abstractmethod
     def reinforcement_learn(

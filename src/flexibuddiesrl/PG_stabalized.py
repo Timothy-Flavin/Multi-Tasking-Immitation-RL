@@ -10,7 +10,6 @@ import os
 import time
 from torch.distributions import TransformedDistribution, TanhTransform
 import torch.nn.functional as F
-from typing import Any, cast
 import collections
 
 
@@ -515,7 +514,7 @@ class PG(nn.Module, Agent):
             )
 
         loss = (
-            -dist.log_prob(continuous_actions).sum(axis=-1).mean()
+            -dist.log_prob(continuous_actions).sum(dim=-1).mean()
         )  # TODO: dist.entropy() to stop it from overfitting
         return loss
 
@@ -674,10 +673,10 @@ class PG(nn.Module, Agent):
 
     def expected_V(self, obs, legal_action=None):
         if self.mix_type is None:
-            return self.critic(obs)
+            return self.critic(obs).squeeze(-1)
         else:
             values, disc_advantages, cont_advantages = self.critic(obs)
-            return values
+            return values.squeeze(-1)
 
     def _get_disc_log_probs_entropy(self, logits, actions):
         log_probs = torch.zeros_like(actions, dtype=torch.float)
@@ -1482,18 +1481,23 @@ class PG(nn.Module, Agent):
                 )
                 mb_entropy = mb_d_entropy + self.relative_entropy_loss * mb_c_entropy
                 if torch.min(mb_new_log_probs) < -15:
-                    print("Bad log prob default to regularization only")
-                    # self.optimizer.state = collections.defaultdict(dict)
-                    # continuous_means, continuous_log_std_logits, discrete_logits = (
-                    #     self.actor(obs)
-                    # )
-                    # if self.continuous_action_dim > 0:
-                    #     logit_regulrization = 0.1 * (continuous_means**2).mean()
-                    #     self.optimizer.zero_grad()
-                    #     logit_regulrization.backward()
-                    #     self.optimizer.step()
-                    # else:
-                    #     logit_regulrization = 0
+                    print(
+                        f"Bad log prob default to regularization only {torch.min(mb_new_log_probs)}"
+                    )
+                    self.optimizer.state = collections.defaultdict(dict)
+                    continuous_means, continuous_log_std_logits, discrete_logits = (
+                        self.actor(obs)
+                    )
+                    if self.continuous_action_dim > 0:
+                        mask = continuous_means.abs() > 3.0
+                        logit_regulrization = (
+                            0.1 * ((mask * continuous_means) ** 2).mean()
+                        )
+                        self.optimizer.zero_grad()
+                        logit_regulrization.backward()
+                        self.optimizer.step()
+                    else:
+                        logit_regulrization = 0
                     continue
 
                 # Sum and Normalize loss grads
@@ -1586,10 +1590,4 @@ class PG(nn.Module, Agent):
         return st
 
     def param_count(self) -> tuple[int, int]:
-        return super().param_count(){
-            "discrete_actions": self._to_numpy(discrete_actions),
-            "continuous_actions": self._to_numpy(continuous_actions),
-            "discrete_log_probs": self._to_numpy(discrete_log_probs),
-            "continuous_log_probs": self._to_numpy(continuous_log_probs),
-            "act_time": t,
-        }
+        return super().param_count()

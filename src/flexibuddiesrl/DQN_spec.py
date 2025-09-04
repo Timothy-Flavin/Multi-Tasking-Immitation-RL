@@ -174,24 +174,23 @@ def DQN_test():
         run_times["create_model"] += time.time() - _s
 
         _s = time.time()
-        d_acts, c_acts, d_log, c_log, _1, _ = model.train_actions(
-            obs, step=True, debug=False
-        )
+        act_dict = model.train_actions(obs, step=True, debug=False)
         run_times["train_action_single"] += time.time() - _s
 
         _s = time.time()
-        d_acts, c_acts, d_log, c_log, _1, _ = model.train_actions(
-            obs_batch, step=True, debug=False
-        )
+        act_dict = model.train_actions(obs_batch, step=True, debug=False)
         run_times["train_action_batch"] += time.time() - _s
         mb = mem_buff.sample_transitions(
             batch_size=batch_size, as_torch=True, device=h["device"]
         )
+
+        ev = model.expected_V(obs)
+        ev = model.expected_V(obs_batch)
         # print(mb)
 
         _s = time.time()
         try:
-            aloss, closs = model.imitation_learn(
+            loss_dict = model.imitation_learn(
                 mb.__getattr__("obs")[0],
                 mb.__getattr__("continuous_actions")[0],
                 mb.__getattr__("discrete_actions")[0],
@@ -208,7 +207,7 @@ def DQN_test():
 
         _s = time.time()
         try:
-            aloss, closs = model.reinforcement_learn(mb, 0)
+            rl_metrics = model.reinforcement_learn(mb, 0)
         except Exception as e:
             print(h)
             raise e
@@ -416,5 +415,5 @@ def DQN_integration():
 
 
 if __name__ == "__main__":
-    # DQN_test()
+    DQN_test()
     DQN_integration()

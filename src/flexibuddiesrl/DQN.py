@@ -308,7 +308,7 @@ class DQN(nn.Module, Agent):
         return {
             "discrete_actions": disc_act,
             "continuous_actions": cont_act,
-            "action_time": t,
+            "act_time": t,
         }
 
     def ego_actions(self, observations, action_mask=None):
@@ -416,64 +416,20 @@ class DQN(nn.Module, Agent):
 
     def expected_V(self, obs, legal_action=None, debug=False):
         with torch.no_grad():
-            value, dac, cac = self.Q1(obs, legal_action)
-            if debug:
-                print(f"value: {value}, dac: {dac}, cac: {cac}, eps: {self.eps}")
+            v, dac, cac = self.Q1(obs, legal_action)
             if self.dueling:
-                return value.mean()  # TODO make sure this doesnt need to be item()
-
-            dq = 0
-            n = 0
-            if (
-                self.discrete_action_dims is not None
-                and len(self.discrete_action_dims) > 0
-            ):
-                n += 1
-                for hi, h in enumerate(dac):
-                    a = torch.argmax(h, dim=-1)
-                    bestq = h[a].item()
-                    h[a] = 0
-                    if legal_action is not None:
-                        if torch.sum(legal_action[hi]) == 1:
-                            otherq = (
-                                bestq  # no other choices so 100% * only legal choice
-                            )
-                        else:
-                            otherq = torch.sum(  # average of other choices
-                                h * legal_action[hi], dim=-1
-                            ) / (torch.sum(legal_action[hi], dim=-1) - 1)
-                    else:
-                        otherq = torch.sum(h, dim=-1) / (
-                            self.discrete_action_dims[hi] - 1
-                        )
-                        if debug:
-                            print(
-                                f"{otherq} = self.eps * {torch.sum(h, dim=-1)} / ({self.discrete_action_dims[hi] - 1})"
-                            )
-
-                    qmean = (1 - self.eps) * bestq + self.eps * otherq
-                    if debug:
-                        print(
-                            f"dq: {qmean} = {(1 - self.eps)} * {bestq} + {self.eps} * {otherq}"
-                        )
-                    dq += qmean
-                dq = dq / len(self.discrete_action_dims)
-            cq = 0
-            if self.continuous_action_dims > 0:
-                n += 1
-                for h in cac:
-                    a = torch.argmax(h, dim=-1)
-                    bestq = h[a].item()
-                    h[a] = 0
-                    otherq = torch.sum(h, dim=-1) / (self.n_c_action_bins - 1)
-                    if debug:
-                        print(
-                            f"cq: {(1 - self.eps) * bestq + self.eps * otherq} = {(1 - self.eps)} * {bestq} + {self.eps} * ({otherq})"
-                        )
-                    cq += (1 - self.eps) * bestq + self.eps * otherq
-                cq = cq / self.continuous_action_dims
-
-            return value + (cq + dq) / (max(n, 1))
+                return v.squeeze(-1)
+            else:
+                evs = []
+                if (
+                    self.discrete_action_dims is not None
+                    and len(self.discrete_action_dims) > 0
+                ):
+                    for h in dac:
+                        evs.append(torch.max(h, dim=-1, keepdim=True)[0])
+                if self.continuous_action_dims > 0:
+                    evs.append(torch.max(cac, dim=-1)[0])
+                return torch.cat(evs, dim=-1).mean(dim=-1)
 
     def cql_loss(self, disc_adv, cont_adv, disc_act, cont_act):
         """Computes the CQL loss for a batch of Q-values and actions."""

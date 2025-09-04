@@ -9,6 +9,8 @@ import random
 import time
 import gymnasium as gym
 import matplotlib.pyplot as plt
+import os
+from torch.utils.tensorboard import SummaryWriter
 
 
 def PG_test():
@@ -189,9 +191,14 @@ def PG_test():
         run_times["create_model"] += time.time() - _s
 
         _s = time.time()
-        d_acts, c_acts, d_log, c_log, _1, _ = model.train_actions(
-            obs, step=True, debug=False
-        )
+        act_dict = model.train_actions(obs, step=True, debug=False)
+        v = model.expected_V(obs)
+        print(v)
+        d_acts = act_dict["discrete_actions"]
+        c_acts = act_dict["continuous_actions"]
+        d_log = act_dict["discrete_log_probs"]
+        c_log = act_dict["continuous_log_probs"]
+
         run_times["train_action_single"] += time.time() - _s
 
         if (d_acts is not None and d_acts.shape[0] != 2) or (
@@ -202,9 +209,12 @@ def PG_test():
             )
 
         _s = time.time()
-        d_acts, c_acts, d_log, c_log, _1, _ = model.train_actions(
-            obs_batch, step=True, debug=False
-        )
+        act_dict = model.train_actions(obs_batch, step=True, debug=False)
+        d_acts = act_dict["discrete_actions"]
+        c_acts = act_dict["continuous_actions"]
+        d_log = act_dict["discrete_log_probs"]
+        c_log = act_dict["continuous_log_probs"]
+        v = model.expected_V(obs_batch)
         run_times["train_action_batch"] += time.time() - _s
 
         if (
@@ -224,7 +234,7 @@ def PG_test():
 
         _s = time.time()
         try:
-            aloss, closs = model.imitation_learn(
+            im_dict = model.imitation_learn(
                 mb.__getattr__("obs")[0],
                 mb.__getattr__("continuous_actions")[0],
                 mb.__getattr__("discrete_actions")[0],
@@ -241,7 +251,7 @@ def PG_test():
 
         _s = time.time()
         try:
-            aloss, closs = model.reinforcement_learn(mb, 0)
+            rl_dict = model.reinforcement_learn(mb, 0)
         except Exception as e:
             print(h)
             raise e
@@ -275,6 +285,9 @@ def PG_integration():
 
     for config_id in range(10):
 
+        # TODO: init wandb with the model.config as the config
+        log_dir = f"runs/PG_integration_test_{config_id}"
+        writer = SummaryWriter(log_dir=log_dir)
         cdim = 0
         ddim = None
         if config_id % 2 == 0:
@@ -347,8 +360,6 @@ def PG_integration():
             logit_reg=0.05,
         )
 
-        # Print current hyper parameters before episode start
-
         gym_env = gym.make("LunarLander-v3", continuous=config_id % 2 == 0)
         obs, _ = gym_env.reset()
         obs_ = obs + 0.1
@@ -366,9 +377,11 @@ def PG_integration():
                 default_dlp = np.ones((1, 1), dtype=np.float32)
 
                 # input(f"ob shape: {obs.shape}")
-                dact, cact, dlp, clp, cactivation, v = model.train_actions(
-                    obs, step=True, debug=False
-                )
+                action_dict = model.train_actions(obs, step=True, debug=False)
+                dact = action_dict["discrete_actions"]
+                cact = action_dict["continuous_actions"]
+                dlp = action_dict["discrete_log_probs"]
+                clp = action_dict["continuous_log_probs"]
 
             if cdim > 0:
                 assert (
@@ -431,8 +444,18 @@ def PG_integration():
                 mb = mem_buff.sample_transitions(
                     idx=np.arange(0, batch_size), as_torch=True, device=model.device
                 )
-                aloss, closs = model.reinforcement_learn(mb, 0, debug=False)
-                print(f"Iteration {i}, aloss: {aloss}, closs: {closs}")
+                rl_metrics = model.reinforcement_learn(mb, 0, debug=False)
+
+                for k, v in rl_metrics.items():
+                    if isinstance(v, torch.Tensor):
+                        scalar_labels = {}
+                        for j in range(len(v)):
+                            scalar_labels[f"cdim_{j}"] = torch.exp(v[j])
+                        writer.add_scalars("StDev", scalar_labels, i)
+                    else:
+                        print(f"k: {k} v: {v}")
+                        writer.add_scalar(f"RL/{k}", v, i)
+                print(f"Iteration {i}, {rl_metrics}")
                 mem_buff.reset()
         print(model)
 
