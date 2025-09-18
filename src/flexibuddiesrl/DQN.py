@@ -52,8 +52,9 @@ class DQN(nn.Module, Agent):
         encoder=None,
         conservative=False,
         imitation_type="cross_entropy",  # or "reward"
-        mix_type="None",  # None, VDN, QMIX
+        mix_type: None | str = "None",  # None, VDN, QMIX
         wall_time=False,
+        mix_dim=32,
     ):
         super(DQN, self).__init__()
         config = locals()
@@ -134,7 +135,9 @@ class DQN(nn.Module, Agent):
                 else None
             ),  # if None then no head hidden layer
             QMIX=self.mix_type == "QMIX",
+            QMIX_hidden_dim=mix_dim,
         )
+        self.encoder = self.Q1.encoder
         self.Q1.to(device)
 
         self.Q2 = QS(
@@ -154,6 +157,7 @@ class DQN(nn.Module, Agent):
                 else None
             ),  # if None then no head hidden layer
             QMIX=self.mix_type == "QMIX",
+            QMIX_hidden_dim=mix_dim,
         )
         self.head_hidden_dims = head_hidden_dim
         self.Q2.to(self.device)
@@ -313,6 +317,21 @@ class DQN(nn.Module, Agent):
 
     def ego_actions(self, observations, action_mask=None):
         return {"discrete_actions": 0, "continuous_actions": 0, "action_time": 0}
+
+    def stable_greedy(self, obs, legal_action):
+        with torch.no_grad():
+            values, disc_advantages, cont_advantages = self.Q2(obs)
+            dact = None
+            cact = None
+            if self.has_discrete:
+                dact = []
+                for dh in disc_advantages:
+                    dact.append(torch.argmax(dh, dim=-1).unsqueeze(0))
+                torch.cat(dact, dim=0)
+            if self.has_continuous:
+                cact = torch.argmax(cont_advantages, dim=-1)
+
+        return dact, cact
 
     def _bc_cross_entropy_loss(self, disc_adv, cont_adv, disc_act, cont_act):
         discrete_loss = 0

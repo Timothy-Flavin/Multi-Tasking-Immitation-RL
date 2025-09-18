@@ -417,6 +417,12 @@ class PG(nn.Module, Agent):
             "act_time": t,
         }
 
+    def stable_greedy(self, obs, legal_action):
+        ad = self.train_actions(
+            observations=obs, action_mask=legal_action, step=False, debug=False
+        )
+        return ad["discrete_actions"], ad["continuous_actions"]
+
     # takes the observations and returns the action with the highest probability
     def ego_actions(self, observations, action_mask=None):
         with torch.no_grad():
@@ -1451,12 +1457,14 @@ class PG(nn.Module, Agent):
 
         if self.norm_advantages:
             gae = (gae - gae.mean()) / (gae.std() + 1e-8)
-
+        bad_log = False
         for k in range(self.n_epochs):
             # Shuffle indices at the start of each epoch
             np.random.shuffle(indices)
             # TODO: Loop through mini-batches
             for start in range(0, len(indices), self.mini_batch_size):
+                if bad_log:
+                    break
                 # Get mini batch indices
                 end = start + self.mini_batch_size
                 mini_batch_indices = indices[start:end]
@@ -1484,6 +1492,7 @@ class PG(nn.Module, Agent):
                     print(
                         f"Bad log prob default to regularization only {torch.min(mb_new_log_probs)}"
                     )
+                    bad_log = True
                     self.optimizer.state = collections.defaultdict(dict)
                     continuous_means, continuous_log_std_logits, discrete_logits = (
                         self.actor(obs)

@@ -62,6 +62,17 @@ class Agent(ABC):
         return 0.0
 
     @abstractmethod
+    def stable_greedy(self, obs, legal_action):
+        """
+        Sample a greedy action from this agent's target or stable
+        policy. For DQN this is argmax(target_Q), for PPO this is
+        just like taking a train action which is equal in
+        expectation to the current policy.
+        """
+        print("stable greedy not implemented")
+        return None, None
+
+    @abstractmethod
     def reinforcement_learn(
         self, batch, agent_num=0, critic_only=False, debug=False
     ) -> dict:
@@ -949,7 +960,8 @@ class QS(nn.Module):
         QMIX_hidden_dim=64,
     ):
         super(QS, self).__init__()
-
+        if discrete_action_dims is not None and len(discrete_action_dims) == 0:
+            discrete_action_dims = None
         self.QMIX = QMIX
         # guard code
         if continuous_action_dim is None:
@@ -1069,7 +1081,7 @@ class QS(nn.Module):
     def forward(self, x, action_mask=None):
         # TODO: action mask implementation
         x = T(x, self.device)
-        # print(f"starting x shape: {x.shape} {len(x.shape)}")
+        print(f"starting x shape: {x.shape} {len(x.shape)}")
         if self.encoder is not None:
             x = self.encoder(x)
         values = 0
