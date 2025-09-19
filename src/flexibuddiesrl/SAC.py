@@ -37,6 +37,7 @@ class SAC(Agent):
         self.gamma = gamma
         self.sac_tau = sac_tau
         self.initial_temperature = initial_temperature
+        self.device = device
 
         self.actor = StochasticActor(
             obs_dim=obs_dim,
@@ -67,14 +68,49 @@ class SAC(Agent):
             orthogonal_init=orthogonal_init,
         )
 
+        self.critic_target = ValueS(
+            obs_dim=obs_dim + action_dim,
+            hidden_dim=hidden_dims,
+            device=device,
+            activation=activation,
+            orthogonal_init=orthogonal_init,
+        )
+
+        for param in self.critic.state_dict():
+            print("avg")
+            # TODO: polyak average critic and target
+
+        # TODO: Set up adam optimizer
+
     def train_actions(
         self, observations, action_mask=None, step=False, debug=False
     ) -> dict:
+
+        with torch.no_grad():
+            continuous_means, continuous_log_std_logits, discrete_logits = self.actor(
+                torch.tensor(observations, device=self.device),
+                action_mask=action_mask,
+                debug=debug,
+            )
+            (
+                discrete_actions,
+                continuous_actions,
+                discrete_log_probs,
+                continuous_log_probs,
+                continuous_activations,
+            ) = self.actor.action_from_logits(
+                continuous_means,
+                continuous_log_std_logits,
+                discrete_logits,
+                gumbel=False,  # This will be true in reinforcement learn to get a gradient
+                log_con=False,
+                log_disc=False,
+            )
         return {
-            "discrete_action": 0,
-            "continuous_action": 0,
-            "discrete_log_prob": 0,
-            "continuous_log_prob": 0,
+            "discrete_action": discrete_actions,
+            "continuous_action": continuous_actions,
+            "discrete_log_prob": discrete_log_probs,
+            "continuous_log_prob": continuous_log_probs,
             "value": 0,
             "time": 0,
         }
@@ -101,7 +137,7 @@ class SAC(Agent):
         # If actions are none then V(s)
 
     def expected_V(self, obs, legal_action) -> torch.Tensor | np.ndarray | float:
-        print("expected_V not implemeted")
+        # Return the expected value from our critic
         return 0.0
 
     def stable_greedy(self, obs, legal_action):
@@ -117,6 +153,14 @@ class SAC(Agent):
     def reinforcement_learn(
         self, batch, agent_num=0, critic_only=False, debug=False
     ) -> dict:
+        obs = batch.__getattr__("obs")
+        obs_ = batch.__getattr__("obs_")
+        rewards = batch.__getattr__("global_reward")
+        discrete_actions = batch.__getattr__("discrete_actions")
+        continuous_actions = batch.__getattr__("continuous_actions")
+
+        # TODO: soft actor critic reinforcement learn
+
         rl_metrics = {
             "critic_loss": 0,
             "d_actor_loss": 0,
@@ -128,10 +172,14 @@ class SAC(Agent):
         return rl_metrics
 
     def save(self, checkpoint_path):
+        # Save the model in the checkpoint path
         print("Save not implemeted")
 
     def load(self, checkpoint_path):
+        # Save the model from the checkpoint path
         print("Load not implemented")
 
     def param_count(self) -> tuple[int, int]:
+        # First number is the policy param count
+        # Second is the critic + policy param counts
         return 0, 0  # train and execute param count
