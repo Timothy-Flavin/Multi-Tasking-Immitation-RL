@@ -296,7 +296,7 @@ class StochasticActor(nn.Module):
         gumbel_tau=1.0,  # for gumbel soft
         gumbel_tau_decay=0.9999,
         gumbel_tau_min=0.1,
-        gumble_hard=False,
+        gumbel_hard=False,
         orthogonal_init=False,
         activation="relu",  # activation function for the encoder
         action_head_hidden_dims=[32],  # iterable of hidden dims for action heads
@@ -318,7 +318,7 @@ class StochasticActor(nn.Module):
         self.gumbel_tau = gumbel_tau
         self.gumbel_tau_decay = gumbel_tau_decay
         self.gumbel_tau_min = gumbel_tau_min
-        self.gumble_hard = gumble_hard
+        self.gumbel_hard = gumbel_hard
         self.continuous_action_dim = continuous_action_dim
         sizes = {None: 0, "full": continuous_action_dim, "diagonal": 1}
         self.log_std_dim = sizes[self.std_type]
@@ -511,7 +511,7 @@ class StochasticActor(nn.Module):
         pass
 
     # DDPG way
-    def deterministic_action(self, c_logits, d_logits, noise_generator, gumble=False):
+    def deterministic_action(self, c_logits, d_logits, noise_generator, gumbel=False):
         pass
 
     # PPO / SAC way
@@ -522,7 +522,7 @@ class StochasticActor(nn.Module):
         c_log_stds,
         with_logc=False,
         with_logd=False,
-        gumble=False,
+        gumbel=False,
     ):
         pass
 
@@ -531,7 +531,7 @@ class StochasticActor(nn.Module):
         continuous_means: torch.Tensor | None,
         continuous_log_std_logits: torch.Tensor | None,
         discrete_logits: list[torch.Tensor] | None,
-        gumble: bool = False,
+        gumbel: bool = False,
         log_con: bool = False,
         log_disc: bool = False,
     ) -> tuple[
@@ -644,11 +644,11 @@ class StochasticActor(nn.Module):
             assert (
                 discrete_logits is not None
             ), "Cant have discrete action dim and no discrete actions"
-            if gumble:
+            if gumbel:
                 discrete_actions: list[torch.Tensor] | torch.Tensor | None = []
                 for i, logits in enumerate(discrete_logits):
                     probs = F.gumbel_softmax(
-                        logits, dim=-1, tau=self.gumbel_tau, hard=self.gumble_hard
+                        logits, dim=-1, tau=self.gumbel_tau, hard=self.gumbel_hard
                     )
                     discrete_actions.append(probs)
             else:

@@ -122,7 +122,7 @@ def SA_test(verbose=False):
     head_hidden_tests = [None, [64]]
     log_types = ["full", "diagonal", None, "none"]
     encoder_test = [None, encoder]
-    gumble_test = [True, False]
+    gumbel_test = [True, False]
 
     total_tests = 0
     ca_pass_count = 0
@@ -136,11 +136,11 @@ def SA_test(verbose=False):
             for head_hidden in head_hidden_tests:
                 for enc in encoder_test:
                     for lstd in log_types:
-                        for gum in gumble_test:
+                        for gum in gumbel_test:
 
                             total_tests += 1
                             print(
-                                f"Testing with discrete={dis}, continuous={con}, head_hidden={head_hidden}, encoder: {enc is not None}, logtype: {lstd}, gumble: {gum}"
+                                f"Testing with discrete={dis}, continuous={con}, head_hidden={head_hidden}, encoder: {enc is not None}, logtype: {lstd}, gumbel: {gum}"
                             )
                             sa = StochasticActor(
                                 obs_dim=12,
@@ -242,10 +242,10 @@ def SA_test(verbose=False):
                                 batch_clogpi,
                                 _,
                             ) = sa.action_from_logits(
-                                batch_ca, batch_calp, batch_da, gumble=gum
+                                batch_ca, batch_calp, batch_da, gumbel=gum
                             )
                             (sample_da, sample_ca, dlogpi, clogpi, _) = (
-                                sa.action_from_logits(ca, calp, da, gumble=gum)
+                                sa.action_from_logits(ca, calp, da, gumbel=gum)
                             )
 
                             if con > 0:
@@ -276,7 +276,7 @@ def SA_test(verbose=False):
 
                             if not da_passing or not ca_passing or not lstd_passing:
                                 print(
-                                    f"One or more tests failed for with discrete={dis}, continuous={con}, head_hidden={head_hidden}, encoder: {enc is not None}, logtype: {lstd}, gumble {gum}"
+                                    f"One or more tests failed for with discrete={dis}, continuous={con}, head_hidden={head_hidden}, encoder: {enc is not None}, logtype: {lstd}, gumbel {gum}"
                                 )
                             if not da_passing:
                                 print("  Discrete action failing shapes: ")
