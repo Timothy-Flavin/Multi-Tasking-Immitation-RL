@@ -1081,7 +1081,7 @@ class QS(nn.Module):
     def forward(self, x, action_mask=None):
         # TODO: action mask implementation
         x = T(x, self.device)
-        print(f"starting x shape: {x.shape} {len(x.shape)}")
+        # print(f"starting x shape: {x.shape} {len(x.shape)}")
         if self.encoder is not None:
             x = self.encoder(x)
         values = 0

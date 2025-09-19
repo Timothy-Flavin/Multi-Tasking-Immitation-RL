@@ -421,9 +421,12 @@ class PG(nn.Module, Agent):
         ad = self.train_actions(
             observations=obs, action_mask=legal_action, step=False, debug=False
         )
-        return torch.tensor(ad["discrete_actions"]).to(self.device), torch.tensor(
-            ad["continuous_actions"]
-        ).to(self.device)
+        adiscrete, acontinuous = None, None
+        if ad["discrete_actions"] is not None:
+            adiscrete = torch.tensor(ad["discrete_actions"]).to(self.device)
+        if ad["continuous_actions"] is not None:
+            acontinuous = torch.tensor(ad["continuous_actions"]).to(self.device)
+        return adiscrete, acontinuous
 
     # takes the observations and returns the action with the highest probability
     def ego_actions(self, observations, action_mask=None):
