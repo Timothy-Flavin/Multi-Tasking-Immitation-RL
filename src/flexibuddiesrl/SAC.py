@@ -654,7 +654,7 @@ class SAC(Agent):
         if self.has_continuous:
             a_vec.append(c_actions)
         if self.has_discrete:
-            for i, d in enumerate(self.discrete_action_dims):
+            for i, d in enumerate(self.discrete_action_dims):  # type:ignore
                 a_vec.append(F.one_hot(d_actions[:, i], d))
         return torch.cat(a_vec, dim=-1)
 

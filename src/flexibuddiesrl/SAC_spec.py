@@ -238,7 +238,7 @@ def SAC_integration():
                 env_action = np.clip(c_np, -1.0, 1.0)
             else:
                 d_act = act.get("discrete_action")
-                env_action = d_act - 1
+                env_action = d_act - 1  # type:ignore
 
                 # default_dact = np.array(
                 #    d_idx + [0] * (max(1, len(ddim or [])) - len(d_idx)), dtype=np.int64
