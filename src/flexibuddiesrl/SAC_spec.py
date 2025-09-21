@@ -206,9 +206,10 @@ def SAC_integration():
             max_actions=(None if cdim == 0 else np.ones(cdim, dtype=np.float32)),
             device=("cuda" if torch.cuda.is_available() else "cpu"),
             hidden_dims=[128, 128],
-            lr=1e-2,
+            lr=2e-3,
             actor_every=4,
             initial_temperature=1.0,
+            mode="Q",
         )
 
         gym_env = gym.make("LunarLander-v3", continuous=True)
@@ -257,6 +258,7 @@ def SAC_integration():
                     "discrete_actions": d_act,
                     "continuous_actions": c_act,
                 },
+                bootstrap_values=0.0,
             )
 
             obs = obs_.copy()

@@ -37,6 +37,9 @@ class SAC(Agent):
             "Q",
             "V",
         ], f"The critic mode needs to be 'V' or 'Q', you entered {mode}"
+        if discrete_action_dims is None:
+            self.critic_mode = "V"
+            mode = "V"
         self.critic_mode = mode
         self.log_std_clamp_range = log_std_clamp_range
         self.actor_every = actor_every
