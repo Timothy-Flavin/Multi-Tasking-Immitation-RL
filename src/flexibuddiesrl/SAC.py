@@ -1,4 +1,4 @@
-from flexibuddiesrl.Agent import Agent, StochasticActor, ValueS
+from flexibuddiesrl.Agent import Agent, StochasticActor, ValueS, QS
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -31,10 +31,19 @@ class SAC(Agent):
         gamma=0.99,
         sac_tau=0.05,
         initial_temperature=0.2,
+        mode="V",  # V or Q
     ):
+        assert mode in [
+            "Q",
+            "V",
+        ], f"The critic mode needs to be 'V' or 'Q', you entered {mode}"
+        self.critic_mode = mode
         self.log_std_clamp_range = log_std_clamp_range
         self.actor_every = actor_every
         self.actor_ratio = actor_ratio
+        self.hidden_dims = hidden_dims
+        self.activation = activation
+        self.orthogonal_init = orthogonal_init
         action_dim = continuous_action_dim
         if discrete_action_dims is not None:
             action_dim += sum(discrete_action_dims)
@@ -94,40 +103,10 @@ class SAC(Agent):
             f"obs dim: {obs_dim + action_dim} hdden dims: {hidden_dims} device: {device}"
         )
         # input()
-        self.Q1 = ValueS(
-            obs_dim=obs_dim + action_dim,
-            hidden_dim=hidden_dims[0],
-            device=device,
-            activation=activation,
-            orthogonal_init=orthogonal_init,
-        )
-        self.Q2 = ValueS(
-            obs_dim=obs_dim + action_dim,
-            hidden_dim=hidden_dims[0],
-            device=device,
-            activation=activation,
-            orthogonal_init=orthogonal_init,
-        )
-
-        self.Q1_target = ValueS(
-            obs_dim=obs_dim + action_dim,
-            hidden_dim=hidden_dims[0],
-            device=device,
-            activation=activation,
-            orthogonal_init=orthogonal_init,
-        )
-        self.Q2_target = ValueS(
-            obs_dim=obs_dim + action_dim,
-            hidden_dim=hidden_dims[0],
-            device=device,
-            activation=activation,
-            orthogonal_init=orthogonal_init,
-        )
-
-        # Hard copy critic->target initially
-        self._hard_update(self.Q1_target, self.Q1)
-        self._hard_update(self.Q2_target, self.Q2)
-
+        if self.critic_mode == "V":
+            self._get_V_critics()
+        else:
+            self._get_Q_critics()
         # Set up optimizers (actor, critic, temperature)
         self.actor_opt = torch.optim.Adam(
             self.actor.parameters(), lr=self.lr * actor_ratio
@@ -154,6 +133,110 @@ class SAC(Agent):
 
         # Update cadence control
         self._step_counter = 0
+
+    def _get_V_critics(self):
+        self.Q1 = ValueS(
+            obs_dim=self.obs_dim + self.action_dim,
+            hidden_dim=self.hidden_dims[0],
+            device=self.device,
+            activation=self.activation,
+            orthogonal_init=self.orthogonal_init,
+        )
+        self.Q2 = ValueS(
+            obs_dim=self.obs_dim + self.action_dim,
+            hidden_dim=self.hidden_dims[0],
+            device=self.device,
+            activation=self.activation,
+            orthogonal_init=self.orthogonal_init,
+        )
+
+        self.Q1_target = ValueS(
+            obs_dim=self.obs_dim + self.action_dim,
+            hidden_dim=self.hidden_dims[0],
+            device=self.device,
+            activation=self.activation,
+            orthogonal_init=self.orthogonal_init,
+        )
+        self.Q2_target = ValueS(
+            obs_dim=self.obs_dim + self.action_dim,
+            hidden_dim=self.hidden_dims[0],
+            device=self.device,
+            activation=self.activation,
+            orthogonal_init=self.orthogonal_init,
+        )
+
+        # Hard copy critic->target initially
+        self._hard_update(self.Q1_target, self.Q1)
+        self._hard_update(self.Q2_target, self.Q2)
+
+    def _get_Q_critics(self):
+        self.Q1 = QS(
+            self.obs_dim + self.continuous_action_dim,
+            continuous_action_dim=0,
+            discrete_action_dims=self.discrete_action_dims,
+            hidden_dims=self.hidden_dims,
+            encoder=None,
+            activation=self.activation,
+            orthogonal=self.orthogonal_init,
+            dropout=0.0,
+            dueling=True,
+            device=self.device,
+            n_c_action_bins=0,
+            head_hidden_dims=None,  # linear action heads
+            verbose=False,
+            QMIX=False,
+        )
+        self.Q2 = QS(
+            self.obs_dim + self.continuous_action_dim,
+            continuous_action_dim=0,
+            discrete_action_dims=self.discrete_action_dims,
+            hidden_dims=self.hidden_dims,
+            encoder=None,
+            activation=self.activation,
+            orthogonal=self.orthogonal_init,
+            dropout=0.0,
+            dueling=True,
+            device=self.device,
+            n_c_action_bins=0,
+            head_hidden_dims=None,  # linear action heads
+            verbose=False,
+            QMIX=False,
+        )
+        self.Q1_target = QS(
+            self.obs_dim + self.continuous_action_dim,
+            continuous_action_dim=0,
+            discrete_action_dims=self.discrete_action_dims,
+            hidden_dims=self.hidden_dims,
+            encoder=None,
+            activation=self.activation,
+            orthogonal=self.orthogonal_init,
+            dropout=0.0,
+            dueling=True,
+            device=self.device,
+            n_c_action_bins=0,
+            head_hidden_dims=None,  # linear action heads
+            verbose=False,
+            QMIX=False,
+        )
+        self.Q1_target = QS(
+            self.obs_dim + self.continuous_action_dim,
+            continuous_action_dim=0,
+            discrete_action_dims=self.discrete_action_dims,
+            hidden_dims=self.hidden_dims,
+            encoder=None,
+            activation=self.activation,
+            orthogonal=self.orthogonal_init,
+            dropout=0.0,
+            dueling=True,
+            device=self.device,
+            n_c_action_bins=0,
+            head_hidden_dims=None,  # linear action heads
+            verbose=False,
+            QMIX=False,
+        )
+        # Hard copy critic->target initially
+        self._hard_update(self.Q1_target, self.Q1)
+        self._hard_update(self.Q2_target, self.Q2)
 
     def tonumpy(self, x):
         if isinstance(x, torch.Tensor):
