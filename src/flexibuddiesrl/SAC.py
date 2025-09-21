@@ -76,8 +76,7 @@ class SAC(Agent):
         if self.discrete_action_dims is not None:
             self.has_discrete = True
 
-        print(f"min actions {min_actions}")
-        input(f"max actions {max_actions}")
+        # Debug prints removed to avoid blocking input during training
         self.actor = StochasticActor(
             obs_dim=obs_dim,
             continuous_action_dim=continuous_action_dim,
@@ -218,7 +217,7 @@ class SAC(Agent):
             verbose=False,
             QMIX=False,
         )
-        self.Q1_target = QS(
+        self.Q2_target = QS(
             self.obs_dim + self.continuous_action_dim,
             continuous_action_dim=0,
             discrete_action_dims=self.discrete_action_dims,
@@ -382,16 +381,16 @@ class SAC(Agent):
         return q - alpha * logp_sum
 
     def expected_V(self, obs, legal_action) -> torch.Tensor | np.ndarray | float:
-        # V(s) with no gradient: E_a[Q_target(s,a)-alpha*logpi]
+        # V(s) with no gradient
         with torch.no_grad():
-            print(f"obs shape: {obs}")
             obs_t = self._to_tensor(obs, torch.float32)
             if obs_t.ndim == 1:
-                obs_t.unsqueeze_(0)
+                obs_t = obs_t.unsqueeze(0)
             alpha = self._alpha()
             c_means, c_logstd_logits, d_logits = self.actor(
                 obs_t, action_mask=None, debug=False
             )
+            # Sample continuous action; for discrete we compute expectation
             (
                 d_act,
                 c_act,
@@ -403,18 +402,59 @@ class SAC(Agent):
                 c_logstd_logits,
                 d_logits,
                 gumbel=True,
-                log_con=False,
-                log_disc=False,
+                log_con=self.has_continuous,
+                log_disc=(self.critic_mode == "V" and self.has_discrete),
             )
-            print(f" cact: {c_act} d_act: {d_act}")
-            a_vec = self._flatten_actions(c_act, d_act)
-            print(f" obs_t: {obs_t} a_vec: {a_vec}")
-            q_in = torch.cat([obs_t, a_vec], dim=-1)
-            print(f"qin dim: {q_in.shape}")
-            q = self.Q1_target(q_in)
-            logp_sum = self._sum_logps(c_logp, d_logp)
-            v = q - alpha * logp_sum
-            return v.squeeze(-1) if v.ndim > 1 else v
+            if self.critic_mode == "V":
+                a_vec = self._flatten_actions(c_act, d_act)
+                q_in = torch.cat([obs_t, a_vec], dim=-1)
+                q = self.Q1_target(q_in)
+                logp_sum = self._sum_logps(c_logp, d_logp)
+                v = q - alpha * logp_sum
+                return v.squeeze(-1) if v.ndim > 1 else v
+            else:
+                # Q-mode: expectation over discrete heads
+                # Ensure continuous action is a single tensor if present
+                if c_act is not None and isinstance(c_act, (list, tuple)):
+                    c_act_cat = torch.cat(c_act, dim=-1)
+                else:
+                    c_act_cat = c_act
+                in_vec = (
+                    torch.cat([obs_t, c_act_cat], dim=-1)
+                    if c_act_cat is not None
+                    else obs_t
+                )
+                v1, adv1, _ = self.Q1_target(in_vec)
+                v2, adv2, _ = self.Q2_target(in_vec)
+                # Compute pi over discrete heads
+                pi_list = (
+                    [F.softmax(logits, dim=-1) for logits in d_logits]
+                    if d_logits is not None
+                    else []
+                )
+
+                # Expected advantages per head
+                exp_adv1 = self._exp_adv(adv1, pi_list, v1)
+                exp_adv2 = self._exp_adv(adv2, pi_list, v2)
+                V1 = v1.squeeze(-1) + exp_adv1
+                V2 = v2.squeeze(-1) + exp_adv2
+                Vmin = torch.minimum(V1, V2)
+                # E log pi over discrete heads
+                logpi_d_exp = (
+                    sum(
+                        [
+                            (pi * F.log_softmax(lg, dim=-1)).sum(dim=-1)
+                            for pi, lg in zip(pi_list, d_logits)
+                        ]
+                    )
+                    if d_logits is not None
+                    else torch.zeros_like(Vmin)
+                )
+                c_logp_agg = self._aggregate_continuous_logp(c_logp)
+                if c_logp_agg is None:
+                    c_logp_agg = torch.zeros_like(Vmin)
+                v = Vmin - alpha * (c_logp_agg + logpi_d_exp)
+                return v
 
     def stable_greedy(self, obs, legal_action):
         """
@@ -453,21 +493,11 @@ class SAC(Agent):
         else:
             d_t = torch.zeros_like(r_t)
 
-        # Build action vector from saved actions (discrete must be one-hot)
-
-        # Critic loss: MSE(Q(s,a), y)
         alpha = self._alpha()
 
+        # Build next-state target V
         with torch.no_grad():
-            # print(" before make batch actions")
-            # print(continuous_actions)
-            # print(discrete_actions)
-            a_vec = self._build_action_vector_from_batch_actions(
-                continuous_actions, discrete_actions
-            )
-            # print(" after build action vector")
-            # print(a_vec)
-            # Next action from actor with gumbel for discrete to keep consistency
+            # build current action vector for V-mode later when needed
             c_means_n, c_logstd_logits_n, d_logits_n = self.actor(
                 obs_next_t, action_mask=None, debug=debug
             )
@@ -483,44 +513,89 @@ class SAC(Agent):
                 d_logits_n,
                 gumbel=True,
                 log_con=self.has_continuous,
-                log_disc=self.has_discrete,
+                log_disc=(self.critic_mode == "V" and self.has_discrete),
             )
-            # print(f"next c actions: {c_act_n}")
-            # print(f"next d actions: {d_act_n}")
+            if self.critic_mode == "V":
+                a_next_vec = self._flatten_actions(c_act_n, d_act_n)
+                q_target_in = torch.cat([obs_next_t, a_next_vec], dim=-1)
+                q_next_1 = self.Q1_target(q_target_in)
+                q_next_2 = self.Q2_target(q_target_in)
+                q_next = torch.minimum(q_next_1, q_next_2)
+                q_next = q_next.squeeze(-1) if q_next.ndim > 1 else q_next
+                logp_next = self._sum_logps(c_logp_n, d_logp_n)
+                v_next = q_next - alpha * logp_next
+            else:
+                # Q-mode: expectation over discrete heads given sampled continuous action
+                if c_act_n is not None and isinstance(c_act_n, (list, tuple)):
+                    c_act_n_cat = torch.cat(c_act_n, dim=-1)
+                else:
+                    c_act_n_cat = c_act_n
+                in_vec_next = (
+                    torch.cat([obs_next_t, c_act_n_cat], dim=-1)
+                    if c_act_n_cat is not None
+                    else obs_next_t
+                )
+                v1_n, adv1_n, _ = self.Q1_target(in_vec_next)
+                v2_n, adv2_n, _ = self.Q2_target(in_vec_next)
+                pi_list_n = (
+                    [F.softmax(lg, dim=-1) for lg in d_logits_n]
+                    if d_logits_n is not None
+                    else []
+                )
 
-            a_next_vec = self._flatten_actions(c_act_n, d_act_n)
-            # print(f"after flatten: {a_next_vec}")
-            q_target_in = torch.cat([obs_next_t, a_next_vec], dim=-1)
-            q_next_1 = self.Q1_target(q_target_in)
-            q_next_2 = self.Q2_target(q_target_in)
-            q_next = torch.minimum(q_next_1, q_next_2)
-            q_next = q_next.squeeze(-1) if q_next.ndim > 1 else q_next
-            logp_next = self._sum_logps(c_logp_n, d_logp_n)
-            v_next = q_next - alpha * logp_next
+                V1_n = v1_n.squeeze(-1) + self._exp_adv(adv1_n, pi_list_n, v1_n)
+                V2_n = v2_n.squeeze(-1) + self._exp_adv(adv2_n, pi_list_n, v2_n)
+                Vmin_n = torch.minimum(V1_n, V2_n)
+                logpi_d_exp_n = (
+                    sum(
+                        [
+                            (pi * F.log_softmax(lg, dim=-1)).sum(dim=-1)
+                            for pi, lg in zip(pi_list_n, d_logits_n)
+                        ]
+                    )
+                    if d_logits_n is not None
+                    else Vmin_n.new_zeros(Vmin_n.shape[0])
+                )
+                c_logp_n_agg = self._aggregate_continuous_logp(c_logp_n)
+                if c_logp_n_agg is None:
+                    c_logp_n_agg = Vmin_n.new_zeros(Vmin_n.shape[0])
+                v_next = Vmin_n - alpha * (c_logp_n_agg + logpi_d_exp_n)
             y = r_t + (1.0 - d_t) * (self.gamma * v_next)
 
-        # print(f"obs vec rl: {obs_t.shape} avec rl: {a_vec.shape}")
-        q_in = torch.cat([obs_t, a_vec], dim=-1)
+        # Current Q(s,a)
+        if self.critic_mode == "V":
+            a_vec_v = self._build_action_vector_from_batch_actions(
+                continuous_actions, discrete_actions
+            )
+            q_in = torch.cat([obs_t, a_vec_v], dim=-1)
+            q_1 = self.Q1(q_in)
+            q_1 = q_1.squeeze(-1) if q_1.ndim > 1 else q_1
+            q_2 = self.Q2(q_in)
+            q_2 = q_2.squeeze(-1) if q_2.ndim > 1 else q_2
+        else:
+            c_hist = (
+                self._to_tensor(continuous_actions, torch.float32)
+                if self.has_continuous
+                else None
+            )
+            in_vec_cur = (
+                torch.cat([obs_t, c_hist], dim=-1) if c_hist is not None else obs_t
+            )
+            v1, adv1, _ = self.Q1(in_vec_cur)
+            v2, adv2, _ = self.Q2(in_vec_cur)
 
-        # print(f"a_vec: {a_vec.shape}")
-        # print(f"a_next_vec: {a_next_vec.shape}")
-        # print(f"q target in: {q_target_in.shape} qin: {q_in.shape}")
-        # print(f"rewards: {r_t.shape}")
-        # print(f"dones: {d_t.shape}")
-        # print(f"q1: {q_1.shape}")
-        # print(f"q2: {q_2.shape}")
-        # print(f"v_next: {v_next.shape}")
-        # print(f"y.shape: {y.shape}")
-        # print(
-        #     f"y {y.shape} = r_t {r_t.shape} + (1.0 - d_t {d_t.shape}) * (self.gamma * v_next {v_next.shape})"
-        # )
-        # input("is it working?")
-        # for i in range(20):
-        q_1 = self.Q1(q_in)
-        q_1 = q_1.squeeze(-1) if q_1.ndim > 1 else q_1
+            def gather_sum_adv(adv_heads, d_idx):
+                out = v1.new_zeros(v1.shape[0])
+                for i, adv in enumerate(adv_heads):
+                    idx = d_idx[:, i].long().unsqueeze(-1)
+                    out = out + adv.gather(dim=-1, index=idx).squeeze(-1)
+                return out
 
-        q_2 = self.Q2(q_in)
-        q_2 = q_2.squeeze(-1) if q_2.ndim > 1 else q_2
+            adv1_sum = gather_sum_adv(adv1, discrete_actions)
+            adv2_sum = gather_sum_adv(adv2, discrete_actions)
+            q_1 = v1.squeeze(-1) + adv1_sum
+            q_2 = v2.squeeze(-1) + adv2_sum
+
         critic_loss_1 = F.mse_loss(q_1, y)
         critic_loss_2 = F.mse_loss(q_2, y)
 
@@ -533,13 +608,11 @@ class SAC(Agent):
         critic_loss_2.backward()
         torch.nn.utils.clip_grad_norm_(self.Q2.parameters(), max_norm=1.0)
         self.Q2_opt.step()
-        # print(f"Q1 loss: {critic_loss_1} Q2 loss {critic_loss_2}")
-        # input()
-        # Soft-update target
+
         self._soft_update(self.Q1_target, self.Q1, self.sac_tau)
         self._soft_update(self.Q2_target, self.Q2, self.sac_tau)
 
-        # Possibly skip actor/alpha updates on critic-only mode
+        # Actor/temperature updates
         d_actor_loss_val = torch.tensor(0.0, device=self.device)
         c_actor_loss_val = torch.tensor(0.0, device=self.device)
         d_entropy = torch.tensor(0.0, device=self.device)
@@ -550,7 +623,6 @@ class SAC(Agent):
         update_actor = self._step_counter % self.actor_every == 0
 
         if update_actor:
-            # Actor loss: E[alpha * logpi - Q(s,a)]
             c_means, c_logstd_logits, d_logits = self.actor(
                 obs_t, action_mask=None, debug=debug
             )
@@ -566,42 +638,89 @@ class SAC(Agent):
                 d_logits,
                 gumbel=True,
                 log_con=self.has_continuous,
-                log_disc=self.has_discrete,
+                log_disc=(self.critic_mode == "V" and self.has_discrete),
             )
-            a_sample_vec = self._flatten_actions(c_act_s, d_act_s)
-            q_pi_in = torch.cat([obs_t, a_sample_vec], dim=-1)
-            q_pi_1 = self.Q1(q_pi_in)
-            q_pi_2 = self.Q2(q_pi_in)
-            q_pi = torch.minimum(q_pi_1, q_pi_2)
-            q_pi = q_pi.squeeze(-1) if q_pi.ndim > 1 else q_pi
-            logp_s = self._sum_logps(c_logp_s, d_logp_s)
+            current_logp_for_alpha = None
+            q_pi = None
+            Vmin_pi = None
+            if self.critic_mode == "V":
+                a_sample_vec = self._flatten_actions(c_act_s, d_act_s)
+                q_pi_in = torch.cat([obs_t, a_sample_vec], dim=-1)
+                q_pi_1 = self.Q1(q_pi_in)
+                q_pi_2 = self.Q2(q_pi_in)
+                q_pi = torch.minimum(q_pi_1, q_pi_2)
+                q_pi = q_pi.squeeze(-1) if q_pi.ndim > 1 else q_pi
+                logp_s = self._sum_logps(c_logp_s, d_logp_s)
+                current_logp_for_alpha = logp_s
+                actor_loss = (alpha * logp_s - q_pi).mean()
+            else:
+                if c_act_s is not None and isinstance(c_act_s, (list, tuple)):
+                    c_act_s_cat = torch.cat(c_act_s, dim=-1)
+                else:
+                    c_act_s_cat = c_act_s
+                in_vec = (
+                    torch.cat([obs_t, c_act_s_cat], dim=-1)
+                    if c_act_s_cat is not None
+                    else obs_t
+                )
+                v1, adv1, _ = self.Q1(in_vec)
+                v2, adv2, _ = self.Q2(in_vec)
+                pi_list = (
+                    [F.softmax(logits, dim=-1) for logits in d_logits]
+                    if d_logits is not None
+                    else []
+                )
 
-            actor_loss = (alpha * logp_s - q_pi).mean()  # alpha * logp_s
+                V1_pi = v1.squeeze(-1) + self._exp_adv(adv1, pi_list, v1)
+                V2_pi = v2.squeeze(-1) + self._exp_adv(adv2, pi_list, v2)
+                Vmin_pi = torch.minimum(V1_pi, V2_pi)
+                logpi_d_exp = (
+                    sum(
+                        [
+                            (pi * F.log_softmax(lg, dim=-1)).sum(dim=-1)
+                            for pi, lg in zip(pi_list, d_logits)
+                        ]
+                    )
+                    if d_logits is not None
+                    else v1.new_zeros(v1.shape[0])
+                )
+                c_logp_s_agg = self._aggregate_continuous_logp(c_logp_s)
+                if c_logp_s_agg is None:
+                    c_logp_s_agg = v1.new_zeros(v1.shape[0])
+                total_logp = c_logp_s_agg + logpi_d_exp
+                current_logp_for_alpha = total_logp
+                actor_loss = (alpha * total_logp - Vmin_pi).mean()
 
             self.actor_opt.zero_grad(set_to_none=True)
             actor_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
             self.actor_opt.step()
 
-            # Temperature loss
+            total_logp_detached = (
+                current_logp_for_alpha.detach()
+                if current_logp_for_alpha is not None
+                else torch.zeros(obs_t.shape[0], device=self.device)
+            )
             alpha_loss = -(
-                self.log_alpha * (logp_s.detach() + self.target_entropy)
+                self.log_alpha * (total_logp_detached + self.target_entropy)
             ).mean()
             self.alpha_opt.zero_grad(set_to_none=True)
             alpha_loss.backward()
             self.alpha_opt.step()
 
-            # Metrics
-            d_logp_agg = self._aggregate_discrete_logp(d_logp_s)
-            if d_logp_agg is not None:
-                d_entropy = (-d_logp_agg).mean()
-                d_actor_loss_val = (
-                    alpha * d_logp_agg.mean() - q_pi.detach().mean()
-                )  # rough component
+            if d_logits is not None and len(d_logits) > 0:
+                pi_list = [F.softmax(lg, dim=-1) for lg in d_logits]
+                terms = [
+                    (pi * F.log_softmax(lg, dim=-1)).sum(dim=-1)
+                    for pi, lg in zip(pi_list, d_logits)
+                ]
+                d_logpi_exp = terms[0]
+                for t in terms[1:]:
+                    d_logpi_exp = d_logpi_exp + t
+                d_entropy = (-d_logpi_exp).mean()
             c_logp_agg = self._aggregate_continuous_logp(c_logp_s)
             if c_logp_agg is not None:
                 c_entropy = (-c_logp_agg).mean()
-                # Estimate std from logits if possible
                 if c_logstd_logits is not None:
                     c_std = torch.exp(
                         torch.clamp(
@@ -611,7 +730,25 @@ class SAC(Agent):
                         )
                     )
                     c_std_mean = c_std.mean()
-                c_actor_loss_val = alpha * c_logp_agg.mean() - q_pi.detach().mean()
+            if self.critic_mode == "V":
+                if q_pi is not None:
+                    if d_logits is not None:
+                        d_actor_loss_val = alpha * (-d_entropy) - q_pi.detach().mean()
+                    if c_logp_agg is not None:
+                        c_actor_loss_val = (
+                            alpha * c_logp_agg.mean() - q_pi.detach().mean()
+                        )
+            else:
+                if Vmin_pi is not None:
+                    if d_logits is not None:
+                        d_actor_loss_val = (
+                            alpha * (-d_entropy) - Vmin_pi.detach().mean()
+                        )
+                    if c_logp_agg is not None:
+                        c_actor_loss_val = (
+                            alpha * c_logp_agg.mean() - Vmin_pi.detach().mean()
+                        )
+
         with torch.no_grad():
             cl = (critic_loss_1 + critic_loss_2) / 2
         rl_metrics = {
@@ -630,11 +767,11 @@ class SAC(Agent):
             "actor": self.actor.state_dict(),
             "critic_1": self.Q1.state_dict(),
             "critic_target_1": self.Q1_target.state_dict(),
-            "critic_2": self.Q1.state_dict(),
-            "critic_target_2": self.Q1_target.state_dict(),
+            "critic_2": self.Q2.state_dict(),
+            "critic_target_2": self.Q2_target.state_dict(),
             "actor_opt": self.actor_opt.state_dict(),
             "critic_opt_1": self.Q1_opt.state_dict(),
-            "critic_opt_2": self.Q1_opt.state_dict(),
+            "critic_opt_2": self.Q2_opt.state_dict(),
             "alpha_opt": self.alpha_opt.state_dict(),
             "log_alpha": self.log_alpha.detach().cpu(),
             "config": {
@@ -824,3 +961,18 @@ class SAC(Agent):
                 out = out + t
             return out
         return c_logp.sum(dim=-1) if c_logp.ndim > 1 else c_logp
+
+    # Expected advantage helper used in Q-mode
+    def _exp_adv(
+        self,
+        adv_heads: Optional[List[torch.Tensor]],
+        pi_heads: Optional[List[torch.Tensor]],
+        ref: torch.Tensor,
+    ) -> torch.Tensor:
+        # Returns a [B] tensor with expected advantage across all discrete heads.
+        if adv_heads is None or pi_heads is None or len(pi_heads) == 0:
+            return ref.new_zeros(ref.shape[0])
+        out = ref.new_zeros(ref.shape[0])
+        for i, adv in enumerate(adv_heads):
+            out = out + (pi_heads[i] * adv).sum(dim=-1)
+        return out
