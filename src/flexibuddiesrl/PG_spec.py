@@ -424,6 +424,165 @@ def PG_integration():
         plt.show()
 
 
+def PG_hand_pick():
+    continuous = True
+    if continuous:
+        cdim = 2
+        ddim = None
+    else:
+        ddim = [4]
+        cdim = 0
+
+    ppo_clip = 0.1
+    batch_size = 1024
+    mini_batch_size = 128
+
+    std_type = "full"
+    mem_buff = FlexibleBuffer(
+        num_steps=5000,
+        n_agents=1,
+        discrete_action_cardinalities=[4],
+        track_action_mask=False,
+        path="./test_buffer",
+        name="spec_buffer",
+        memory_weights=False,
+        global_registered_vars={
+            "global_rewards": (None, np.float32),
+        },
+        individual_registered_vars={
+            "obs": ([8], np.float32),
+            "obs_": ([8], np.float32),
+            "discrete_log_probs": ([1], np.float32),
+            "continuous_log_probs": (None, np.float32),
+            "discrete_actions": ([1], np.int64),
+            "continuous_actions": ([2], np.float32),
+        },
+    )
+    mem_buff.reset()
+    model = PG(
+        obs_dim=8,
+        continuous_action_dim=cdim,
+        discrete_action_dims=ddim,
+        min_actions=(np.array([-1, -1]) if cdim > 0 else np.zeros(2)),
+        max_actions=(np.array([1, 1]) if cdim > 0 else np.zeros(2)),
+        device="cpu",
+        entropy_loss=0.1,
+        ppo_clip=ppo_clip,
+        value_clip=0.2,
+        norm_advantages=True,
+        anneal_lr=0,
+        orthogonal=True,
+        std_type=std_type,
+        clip_grad=True,
+        mini_batch_size=mini_batch_size,
+        action_clamp_type="tanh",
+        advantage_type="gae",
+        n_epochs=2,
+        lr=3e-4,
+        mix_type=None,
+    )
+
+    # Print current hyper parameters before episode start
+
+    gym_env = gym.make("LunarLander-v3", continuous=continuous)
+    obs, _ = gym_env.reset()
+    obs_ = obs + 0.1
+    rewards = [0.0]
+    ep_num = 0
+    ep_step = 0
+
+    for i in range(100000):
+        with torch.no_grad():
+            env_action = 0
+            default_dact = np.zeros((1), dtype=np.int64)
+            default_cact = np.zeros((2), dtype=np.float32) - 0.5
+            cactivation = np.zeros((2), dtype=np.float32) - 0.5
+            default_clp = np.ones((1), dtype=np.float32)
+            default_dlp = np.ones((1, 1), dtype=np.float32)
+
+            # input(f"ob shape: {obs.shape}")
+            dact, cact, dlp, clp, cactivation, v = model.train_actions(
+                obs, step=True, debug=False
+            )
+
+        if cdim > 0:
+            assert (
+                cact is not None and clp is not None
+            ), f"Continuous action and log prob {cact} {clp} should not be None when cdim [{cdim}] is not 0"
+            # print(f"Continuous action: {cact}, log prob: {clp}")
+            # print()
+            # input()
+            # print(cact.shape, clp.shape)
+            # print("from logits look like:")
+            # print(model.actor.forward(obs))
+            # print(model.action_clamp_type)
+
+            env_action = cact  # int(cact[0] > 0.5)
+            default_cact = cact
+            default_clp = clp
+            # print(clp)
+        else:
+            assert (
+                dact is not None and dlp is not None
+            ), f"Discrete action and log prob {dact} {dlp} should not be None when cdim [{cdim}] is 0"
+            # print(dact.shape, dlp.shape, dact, dlp)
+            env_action = dact[0]
+            default_dact[0] = dact[0]
+            default_dlp[0][0] = dlp[0]
+
+        obs_, reward, terminated, truncated, _ = gym_env.step(env_action)
+        rewards[-1] = rewards[-1] + float(reward)
+        rv = {
+            "global_rewards": reward,
+            "obs": [obs.copy()],
+            "obs_": [obs_.copy()],
+            "discrete_log_probs": default_dlp.copy(),
+            "continuous_log_probs": default_clp.copy(),
+            "discrete_actions": (default_dact.copy()),
+            "continuous_actions": (
+                default_cact.copy()
+                if model.action_clamp_type != "clamp"
+                else cactivation
+            ),
+        }
+        # print(rv)
+        bootstrap_val = 0.0
+        if truncated:
+            bootstrap_val = model.expected_V(obs_)
+        ep_step += 1
+        mem_buff.save_transition(
+            terminated=terminated,
+            registered_vals=rv,
+            bootstrap_values=bootstrap_val,
+        )
+
+        obs = obs_.copy()
+        if terminated or truncated:
+            obs, _ = gym_env.reset()
+            obs = obs.copy()
+            rewards.append(0.0)
+            ep_step = 0
+            print(f"Episode {ep_num}, total reward: {rewards[-2]}")
+            ep_num += 1
+
+        if mem_buff.steps_recorded == batch_size:
+            # print(model.action_clamp_type)
+            mb = mem_buff.sample_transitions(
+                idx=np.arange(0, batch_size), as_torch=True, device=model.device
+            )
+            aloss, closs = model.reinforcement_learn(mb, 0, debug=False)
+            print(f"Iteration {i}, aloss: {aloss}, closs: {closs}")
+            mem_buff.reset()
+    print(model)
+
+    for i in range(1, len(rewards)):
+        rewards[i] = 0.9 * rewards[i - 1] + 0.1 * rewards[i]
+    plt.plot(rewards)
+    plt.title("Rewards")
+    plt.show()
+
+
 if __name__ == "__main__":
-    PG_integration()
-    PG_test()
+    # PG_integration()
+    # PG_test()
+    PG_hand_pick()

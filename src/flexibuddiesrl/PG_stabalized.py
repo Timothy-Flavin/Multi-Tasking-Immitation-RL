@@ -615,11 +615,11 @@ class PG(nn.Module, Agent):
     def expected_V(self, obs, legal_action=None):
         return self.critic(obs)
 
-    def _get_disc_log_probs_entropy(self, logits, actions):
-        log_probs = torch.zeros_like(actions, dtype=torch.float)
-        dist = Categorical(logits=logits)
-        log_probs = dist.log_prob(actions)
-        return log_probs, dist.entropy().mean()
+    # def _get_disc_log_probs_entropy(self, logits, actions):
+    #     log_probs = torch.zeros_like(actions, dtype=torch.float)
+    #     dist = Categorical(logits=logits)
+    #     log_probs = dist.log_prob(actions)
+    #     return log_probs, dist.entropy().mean()
 
     def _get_cont_log_probs_entropy(
         self, logits, actions, lstd_logits: torch.Tensor | None = None
@@ -667,11 +667,12 @@ class PG(nn.Module, Agent):
             ).sum(dim=-1)
 
         eloss = dist.entropy().mean()
-        # if torch.min(log_probs) < -100:
-        #     print(
-        #         f"{self.action_clamp_type} Warning: log_probs has very low values: {torch.min(log_probs)}. "
-        #         "This might cause numerical instability."
-        #     )
+        if torch.min(log_probs) < -20:
+            print(
+                f"{self.action_clamp_type} Warning: log_probs has very low values: {torch.min(log_probs)}. "
+                "This might cause numerical instability."
+            )
+            eloss = 0.0
         #     input(f"print the rest? {self.action_clamp_type}")
         #     print(
         #         f"loc: {logits}, scale: {torch.exp(lstd)} actions: {actions} activations {activations}"
@@ -681,62 +682,62 @@ class PG(nn.Module, Agent):
 
         return log_probs, eloss
 
-    def _get_probs_and_entropy(self, batch: FlexiBatch, agent_num):
-        bm = None
-        if batch.action_mask is not None:
-            bm = batch.action_mask[agent_num]
+    # def _get_probs_and_entropy(self, batch: FlexiBatch, agent_num):
+    #     bm = None
+    #     if batch.action_mask is not None:
+    #         bm = batch.action_mask[agent_num]
 
-        assert hasattr(
-            batch, "obs"
-        ), "Batch needs attribute 'obs' for PG stabalized get_probs_and_entropy to work"
+    #     assert hasattr(
+    #         batch, "obs"
+    #     ), "Batch needs attribute 'obs' for PG stabalized get_probs_and_entropy to work"
 
-        continuous_means, continuous_log_std_logits, discrete_logits = self.actor(
-            x=batch.__getattr__(self.batch_name_map["obs"])[agent_num],
-            action_mask=bm,  # type:ignore
-        )
-        old_disc_log_probs = 0
-        old_disc_entropy = 0
-        old_cont_log_probs = 0
-        old_cont_entropy = 0
+    #     continuous_means, continuous_log_std_logits, discrete_logits = self.actor(
+    #         x=batch.__getattr__(self.batch_name_map["obs"])[agent_num],
+    #         action_mask=bm,  # type:ignore
+    #     )
+    #     old_disc_log_probs = 0
+    #     old_disc_entropy = 0
+    #     old_cont_log_probs = 0
+    #     old_cont_entropy = 0
 
-        if self.discrete_action_dims is not None and len(self.discrete_action_dims) > 0:
-            assert (
-                hasattr(batch, "discrete_actions")
-                and batch.__getattr__(self.batch_name_map["discrete_actions"])
-                is not None
-            ), "Batch does not have attribute 'discrete_actions' but model has discrete_action_dims"
-            old_disc_log_probs = []
-            old_disc_entropy = 0
-            for head in range(len(self.discrete_action_dims)):
-                odlp, ode = self._get_disc_log_probs_entropy(
-                    logits=discrete_logits[head],
-                    actions=batch.__getattr__(self.batch_name_map["discrete_actions"])[
-                        agent_num
-                    ][
-                        :, head
-                    ],  # type:ignore
-                )
-                old_disc_log_probs.append(odlp)
-                old_disc_entropy += ode
+    #     if self.discrete_action_dims is not None and len(self.discrete_action_dims) > 0:
+    #         assert (
+    #             hasattr(batch, "discrete_actions")
+    #             and batch.__getattr__(self.batch_name_map["discrete_actions"])
+    #             is not None
+    #         ), "Batch does not have attribute 'discrete_actions' but model has discrete_action_dims"
+    #         old_disc_log_probs = []
+    #         old_disc_entropy = 0
+    #         for head in range(len(self.discrete_action_dims)):
+    #             odlp, ode = self._get_disc_log_probs_entropy(
+    #                 logits=discrete_logits[head],
+    #                 actions=batch.__getattr__(self.batch_name_map["discrete_actions"])[
+    #                     agent_num
+    #                 ][
+    #                     :, head
+    #                 ],  # type:ignore
+    #             )
+    #             old_disc_log_probs.append(odlp)
+    #             old_disc_entropy += ode
 
-        if self.continuous_action_dim > 0:
-            assert (
-                hasattr(batch, "continuous_actions")
-                and batch.__getattr__("continuous_actions") is not None
-            ), "Batch does not have attribute 'continuous_actions' but model has discrete_action_dims"
-            old_cont_log_probs, old_cont_entropy = self._get_cont_log_probs_entropy(
-                logits=continuous_means,
-                actions=batch.__getattr__(self.batch_name_map["continuous_actions"])[
-                    agent_num
-                ],  # type:ignore
-                lstd_logits=continuous_log_std_logits,
-            )
-        return (
-            old_disc_log_probs,
-            old_disc_entropy,
-            old_cont_log_probs,
-            old_cont_entropy,
-        )
+    # if self.continuous_action_dim > 0:
+    #     assert (
+    #         hasattr(batch, "continuous_actions")
+    #         and batch.__getattr__("continuous_actions") is not None
+    #     ), "Batch does not have attribute 'continuous_actions' but model has discrete_action_dims"
+    #     old_cont_log_probs, old_cont_entropy = self._get_cont_log_probs_entropy(
+    #         logits=continuous_means,
+    #         actions=batch.__getattr__(self.batch_name_map["continuous_actions"])[
+    #             agent_num
+    #         ],  # type:ignore
+    #         lstd_logits=continuous_log_std_logits,
+    #     )
+    # return (
+    #     old_disc_log_probs,
+    #     old_disc_entropy,
+    #     old_cont_log_probs,
+    #     old_cont_entropy,
+    # )
 
     def _print_grad_norm(self):
         total_norm = 0
@@ -754,8 +755,6 @@ class PG(nn.Module, Agent):
         V_current = self.critic(
             batch.__getattr__(self.batch_name_map["obs"])[agent_num, indices]
         )
-        # print(f"    V_current: {V_current.shape}, G[indices] {G[indices].shape}")
-        # input()
         critic_loss = 0.5 * ((V_current - G[indices]) ** 2).mean()
         return critic_loss
 
@@ -857,21 +856,17 @@ class PG(nn.Module, Agent):
             lstd_logits=action_log_std,
         )
         if self.ppo_clip > 0:
-            # print(f"cont lp shape: {cont_log_probs.shape}")
-            # print(f"old lp shape: {old_log_probs.shape}")
             logratio = (
                 cont_log_probs
                 - old_log_probs  # batch.continuous_log_probs[agent_num, indices]
             )
             ratio = logratio.exp()
-            # print(f" ratio shape: {ratio.shape} adv shape: {advantages.shape}")
             pg_loss1 = advantages * ratio
             pg_loss2 = advantages * torch.clamp(
                 ratio, 1 - self.ppo_clip, 1 + self.ppo_clip
             )
             continuous_policy_gradient = torch.min(pg_loss1, pg_loss2)
         else:
-            # print(f" lp shape: {cont_log_probs.shape} adv shape: {advantages.shape}")
             continuous_policy_gradient = cont_log_probs * advantages
         actor_loss = (
             -self.policy_loss * continuous_policy_gradient.mean()
@@ -886,9 +881,6 @@ class PG(nn.Module, Agent):
             entropy = dist.entropy().mean()
             selected_log_probs = dist.log_prob(actions[:, head])
             if self.ppo_clip > 0:
-                # print(
-                #     f"disc shapes sel_lp {selected_log_probs.shape} lphead: {log_probs[:, head].shape}"
-                # )
                 logratio = (
                     selected_log_probs
                     - log_probs[
@@ -900,14 +892,8 @@ class PG(nn.Module, Agent):
                 pg_loss2 = advantages.squeeze(-1) * torch.clamp(
                     ratio, 1 - self.ppo_clip, 1 + self.ppo_clip
                 )
-                # print(
-                #     f"advsq {advantages.squeeze(-1).shape} ratio: {ratio.shape} pg1: {pg_loss1.shape} pg2: {pg_loss2.shape}"
-                # )
                 discrete_policy_gradient = torch.min(pg_loss1, pg_loss2)
             else:
-                # print(
-                #     f"adv {advantages.squeeze(-1).shape} slp: {selected_log_probs.shape}"
-                # )
                 discrete_policy_gradient = selected_log_probs * advantages.squeeze(-1)
 
             actor_loss += (
