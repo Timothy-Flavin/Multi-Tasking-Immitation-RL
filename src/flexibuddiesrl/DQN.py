@@ -329,7 +329,7 @@ class DQN(nn.Module, Agent):
                     dact.append(torch.argmax(dh, dim=-1).unsqueeze(0))
                 torch.cat(dact, dim=0)
             if self.has_continuous:
-                cact = torch.argmax(cont_advantages, dim=-1)
+                cact = self._cont_from_q(cont_advantages)
 
         return dact, cact
 
