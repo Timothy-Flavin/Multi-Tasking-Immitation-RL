@@ -66,11 +66,15 @@ class PG(nn.Module, Agent):
         logit_reg=0.05,
         relative_entropy_loss=0.05,
         wall_time=False,
+        joint_kl_penalty=0.1,
+        target_kl=0.01,
     ):
         super(PG, self).__init__()
         config = locals()
         # Remove 'self' and other unwanted items
         config.pop("self")
+        self.joint_kl_penalty = joint_kl_penalty
+        self.target_kl = target_kl
         self.config = config
         self.wall_time = wall_time
         self.load_from_checkpoint = load_from_checkpoint
@@ -726,6 +730,7 @@ class PG(nn.Module, Agent):
             # print(
             #    f"from raw logit means: {logits} and scale {torch.clip(torch.exp(lstd), min=1e-6)}"
             # )
+
         else:
             dist = torch.distributions.Normal(loc=logits, scale=torch.exp(lstd))
             activations = actions
@@ -741,78 +746,34 @@ class PG(nn.Module, Agent):
                 np.log(2) - activations - F.softplus(-2 * activations)
             ).sum(dim=-1)
 
-        eloss = dist.entropy().mean()
         if torch.min(log_probs) < -20:
             print(
                 f"{self.action_clamp_type} Warning: log_probs has very low values: {torch.min(log_probs)}. "
                 "This might cause numerical instability."
             )
-            eloss = 0.0
+            # print(log_probs < -20)
+            # print(
+            #     f"loc: {logits[log_probs < -20]}, scale: {torch.exp(lstd)[log_probs < -20]} activations: {activations[log_probs < -20]}"
+            # )
+            # print(
+            #     f"diff: {(torch.clip(logits, -4.0, 4.0) - activations)[log_probs < -20]}"
+            # )
+            # print(f"lstd: {torch.exp(lstd)[log_probs < -20]}")
+            # print(f"log probs: {log_probs[log_probs < -20]}")
+            # eloss = 0.0
+            # print(f"lstd: {torch.exp(lstd)[log_probs < -20]}")
+            # input(f"dist entropy: {dist.entropy()[log_probs < -20]}")
+        # else:
+        # eloss = dist.entropy().mean()
+        #     eloss = 0.0
         #     input(f"print the rest? {self.action_clamp_type}")
         #     print(
         #         f"loc: {logits}, scale: {torch.exp(lstd)} actions: {actions} activations {activations}"
         #     )
         # log_probs = torch.clamp(log_probs, -100, 2)
         # eloss = eloss * 100
-
+        eloss = dist.entropy().clamp(min=-0.1).mean()
         return log_probs, eloss
-
-    # def _get_probs_and_entropy(self, batch: FlexiBatch, agent_num):
-    #     bm = None
-    #     if batch.action_mask is not None:
-    #         bm = batch.action_mask[agent_num]
-
-    #     assert hasattr(
-    #         batch, "obs"
-    #     ), "Batch needs attribute 'obs' for PG stabalized get_probs_and_entropy to work"
-
-    #     continuous_means, continuous_log_std_logits, discrete_logits = self.actor(
-    #         x=batch.__getattr__(self.batch_name_map["obs"])[agent_num],
-    #         action_mask=bm,  # type:ignore
-    #     )
-    #     old_disc_log_probs = 0
-    #     old_disc_entropy = 0
-    #     old_cont_log_probs = 0
-    #     old_cont_entropy = 0
-
-    #     if self.discrete_action_dims is not None and len(self.discrete_action_dims) > 0:
-    #         assert (
-    #             hasattr(batch, "discrete_actions")
-    #             and batch.__getattr__(self.batch_name_map["discrete_actions"])
-    #             is not None
-    #         ), "Batch does not have attribute 'discrete_actions' but model has discrete_action_dims"
-    #         old_disc_log_probs = []
-    #         old_disc_entropy = 0
-    #         for head in range(len(self.discrete_action_dims)):
-    #             odlp, ode = self._get_disc_log_probs_entropy(
-    #                 logits=discrete_logits[head],
-    #                 actions=batch.__getattr__(self.batch_name_map["discrete_actions"])[
-    #                     agent_num
-    #                 ][
-    #                     :, head
-    #                 ],  # type:ignore
-    #             )
-    #             old_disc_log_probs.append(odlp)
-    #             old_disc_entropy += ode
-
-    # if self.continuous_action_dim > 0:
-    #     assert (
-    #         hasattr(batch, "continuous_actions")
-    #         and batch.__getattr__("continuous_actions") is not None
-    #     ), "Batch does not have attribute 'continuous_actions' but model has discrete_action_dims"
-    #     old_cont_log_probs, old_cont_entropy = self._get_cont_log_probs_entropy(
-    #         logits=continuous_means,
-    #         actions=batch.__getattr__(self.batch_name_map["continuous_actions"])[
-    #             agent_num
-    #         ],  # type:ignore
-    #         lstd_logits=continuous_log_std_logits,
-    #     )
-    # return (
-    #     old_disc_log_probs,
-    #     old_disc_entropy,
-    #     old_cont_log_probs,
-    #     old_cont_entropy,
-    # )
 
     def _print_grad_norm(self):
         total_norm = 0
@@ -951,24 +912,44 @@ class PG(nn.Module, Agent):
             actions=actions,
             lstd_logits=action_log_std,
         )
+
         if self.ppo_clip > 0:
             logratio = (
                 cont_log_probs
                 - old_log_probs  # batch.continuous_log_probs[agent_num, indices]
             )
+
             ratio = logratio.exp()
             pg_loss1 = advantages * ratio
             pg_loss2 = advantages * torch.clamp(
                 ratio, 1 - self.ppo_clip, 1 + self.ppo_clip
             )
+
             continuous_policy_gradient = torch.min(pg_loss1, pg_loss2)
         else:
             continuous_policy_gradient = cont_log_probs * advantages
         actor_loss = (
             -self.policy_loss * continuous_policy_gradient.mean()
             - self.entropy_loss * cont_entropy
-            + self.logit_reg * (action_means**2).mean()
         )
+        al = (
+            actor_loss
+            + self.logit_reg * (action_means[torch.abs(action_means) > 4.0] ** 2).mean()
+        )
+        if not torch.isnan(al):
+            actor_loss += al
+        if torch.isnan(actor_loss):
+            actor_loss = (
+                self.logit_reg
+                * (action_means[torch.abs(action_means) > 4.0] ** 2).mean()
+            )
+            print("NaN in actor loss, setting to zero")
+            print(continuous_policy_gradient.mean())
+            print(cont_entropy)
+            print(
+                self.logit_reg
+                * (action_means[torch.abs(action_means) > 4.0] ** 2).mean()
+            )
         return actor_loss
 
     def _discrete_actor_loss(self, actions, log_probs, logits, advantages):
@@ -1063,6 +1044,7 @@ class PG(nn.Module, Agent):
                 bend = min(bstart + self.mini_batch_size, bsize - 1)
                 indices = mini_batch_indices[bstart:bend]
                 bnum += 1
+                print(f"bnum: {bnum}")
                 if debug:
                     print(
                         f"    Mini batch: {bstart}:{bend}, Indices: {indices}, {len(indices)}"
@@ -1252,15 +1234,31 @@ class PG(nn.Module, Agent):
         )
         if self.action_clamp_type == "tanh":
             activations = minmaxnorm(actions, self.min_actions, self.max_actions)
-            eps = 1.0 - 0.999329299739
-            activations = torch.clamp(activations, -1 + eps, 1 - eps)
+            activations = torch.clamp(activations, -0.999329299739, 0.999329299739)
             activations = torch.atanh(activations)
         else:
             activations = actions
         log_probs = dist.log_prob(activations)
         if self.action_clamp_type == "tanh":
             log_probs -= 2 * (np.log(2) - activations - F.softplus(-2 * activations))
-        return log_probs, dist.entropy().sum(-1)
+
+        # if torch.min(log_probs) < -20:
+        #     print(
+        #         f"{self.action_clamp_type} Warning: log_probs has very low values: {torch.min(log_probs)}. "
+        #         "This might cause numerical instability."
+        #     )
+        #     print(log_probs < -20)
+        #     print(
+        #         f"from raw logit means: {logits[log_probs < -20]}, scale: {torch.exp(lstd)[log_probs < -20]} actions: {actions[log_probs < -20]}"
+        #     )
+        #     print(
+        #         f"diff: {(torch.clip(logits, -4.0, 4.0) - activations)[log_probs < -20]}"
+        #     )
+        #     print(f"lstd: {torch.exp(lstd)[log_probs < -20]}")
+        #     print(f"log probs: {log_probs[log_probs < -20]}")
+        #     eloss = 0.0
+        #     input("does this make sense?")
+        return log_probs, dist.entropy().clamp(min=-0.1).sum(-1)
 
     def _log_probs_per_dim(self, obs, d_actions, c_actions):
         continuous_means, continuous_log_std_logits, discrete_logits = self.actor(obs)
@@ -1293,19 +1291,40 @@ class PG(nn.Module, Agent):
         lp = torch.cat(lp, dim=-1)
         logit_regularization_loss = 0
         if self.continuous_action_dim > 0:
-            logit_regularization_loss = 0.01 * (continuous_means**2).mean()
+            logit_regularization_loss = (
+                continuous_means[torch.abs(continuous_means) > 4.0] ** 2
+            ).mean()
+            if torch.isnan(logit_regularization_loss):
+                logit_regularization_loss = 0.0
         return lp, d_entropy, c_entropy, logit_regularization_loss
 
     def _mix_actor_loss(self, old_log_probs, new_log_probs, advantages, entropy):
         logratio = new_log_probs - old_log_probs
         ratio = torch.exp(logratio)
+        # ratio_joint = torch.exp(new_log_probs.sum(-1) - old_log_probs.sum(-1))
+        clip_ratio = torch.clamp(ratio, 1 - self.ppo_clip, 1 + self.ppo_clip)
 
+        # PG loss
         pg_loss1 = advantages * ratio
-        pg_loss2 = advantages * torch.clamp(ratio, 1 - self.ppo_clip, 1 + self.ppo_clip)
-        policy_loss = -torch.min(pg_loss1, pg_loss2).mean()
+        pg_loss2 = advantages * clip_ratio
+        policy_loss = -(torch.min(pg_loss1, pg_loss2).sum(-1)).mean()
 
-        # Optional: entropy bonus (if you want to add it here)
+        # Entropy Bonus
         policy_loss -= self.entropy_loss * entropy.mean()
+
+        # KL Divergence for joint distribution
+        kl_div = torch.nn.functional.kl_div(
+            new_log_probs, old_log_probs, reduction="none", log_target=True
+        )
+        joint_kl = kl_div.sum(-1).mean()
+        policy_loss += self.joint_kl_penalty * joint_kl
+
+        if joint_kl > self.target_kl:
+            self.joint_kl_penalty *= 1.5
+        elif joint_kl < self.target_kl / 1.5:
+            self.joint_kl_penalty /= 1.5
+        self.joint_kl_penalty = min(max(self.joint_kl_penalty, 1e-4), 10000)
+
         return policy_loss
 
     def _mix_critic_only(self, batch: FlexiBatch, agent_num):
@@ -1349,9 +1368,11 @@ class PG(nn.Module, Agent):
                 gamma=self.gamma,
                 gae_lambda=self.gae_lambda,
             )
-        critic_loss = ((Q - global_Q) ** 2).mean()
+        # print(f"Q - global_Q.squeeze(-1): {Q.shape} - {global_Q.squeeze(-1).shape}:")
+        critic_loss = ((Q - global_Q.squeeze(-1)) ** 2).mean()
         self.optimizer.zero_grad()
         critic_loss.backward()
+        # print(f"critic loss only: {critic_loss.item()}")
         if self.clip_grad:
             torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
             if self.mixer is not None:
@@ -1415,13 +1436,13 @@ class PG(nn.Module, Agent):
             else:
                 raw_importance = self._gather_importance(d_adv, c_adv.detach())
                 scaled_importance = raw_importance * adv_grad
-
             self._update_importance()
 
             if self.softmax_importance_scale:
                 scaled_importance = torch.softmax(
                     scaled_importance / self.importance_temperature, dim=-1
                 )
+                print(scaled_importance)
             else:
                 scaled_importance = (
                     scaled_importance.abs() + self.importance_temperature
@@ -1461,14 +1482,12 @@ class PG(nn.Module, Agent):
 
         if self.norm_advantages:
             gae = (gae - gae.mean()) / (gae.std() + 1e-8)
-        bad_log = False
         for k in range(self.n_epochs):
             # Shuffle indices at the start of each epoch
             np.random.shuffle(indices)
             # TODO: Loop through mini-batches
             for start in range(0, len(indices), self.mini_batch_size):
-                if bad_log:
-                    break
+
                 # Get mini batch indices
                 end = start + self.mini_batch_size
                 mini_batch_indices = indices[start:end]
@@ -1486,7 +1505,11 @@ class PG(nn.Module, Agent):
                     mb_d_adv, mb_c_adv, mb_d_actions, mb_c_actions
                 )
                 mb_Q = (self.mixer(mb_adv, mb_obs)[0] + mb_values).squeeze(-1)
-                critic_loss = ((mb_Q - mb_global_Q) ** 2).mean()
+                critic_loss = ((mb_Q - mb_global_Q.squeeze(-1)) ** 2).mean()
+                # print(
+                #     f" mb_Q: {mb_Q.shape}, mb_global_Q: {mb_global_Q.squeeze(-1).shape}"
+                # )
+                # print(f"critic loss: {critic_loss.item()}")
 
                 mb_new_log_probs, mb_d_entropy, mb_c_entropy, mb_logit_regulrization = (
                     self._log_probs_per_dim(mb_obs, mb_d_actions, mb_c_actions)
@@ -1496,22 +1519,21 @@ class PG(nn.Module, Agent):
                     print(
                         f"Bad log prob default to regularization only {torch.min(mb_new_log_probs)}"
                     )
-                    bad_log = True
-                    self.optimizer.state = collections.defaultdict(dict)
-                    continuous_means, continuous_log_std_logits, discrete_logits = (
-                        self.actor(obs)
-                    )
-                    if self.continuous_action_dim > 0:
-                        mask = continuous_means.abs() > 3.0
-                        logit_regulrization = (
-                            0.1 * ((mask * continuous_means) ** 2).mean()
-                        )
-                        self.optimizer.zero_grad()
-                        logit_regulrization.backward()
-                        self.optimizer.step()
-                    else:
-                        logit_regulrization = 0
-                    continue
+                    # self.optimizer.state = collections.defaultdict(dict)
+                    # continuous_means, continuous_log_std_logits, discrete_logits = (
+                    #     self.actor(obs)
+                    # )
+                    # if self.continuous_action_dim > 0:
+                    #     mask = continuous_means.abs() > 3.0
+                    #     logit_regulrization = (
+                    #         0.1 * ((mask * continuous_means) ** 2).mean()
+                    #     )
+                    #     self.optimizer.zero_grad()
+                    #     logit_regulrization.backward()
+                    #     self.optimizer.step()
+                    # else:
+                    #     logit_regulrization = 0
+                    # continue
 
                 # Sum and Normalize loss grads
                 actor_loss = (

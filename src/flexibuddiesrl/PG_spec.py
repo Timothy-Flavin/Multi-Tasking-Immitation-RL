@@ -477,11 +477,31 @@ def PG_hand_pick():
 
     ppo_clip = 0.1
     batch_size = 1024
-    mini_batch_size = 128
+    mini_batch_size = 256
 
-    std_type = "full"
+    std_type = "stateless"
     mem_buff = FlexibleBuffer(
         num_steps=5000,
+        n_agents=1,
+        discrete_action_cardinalities=[4],
+        track_action_mask=False,
+        path="./test_buffer",
+        name="spec_buffer",
+        memory_weights=False,
+        global_registered_vars={
+            "global_rewards": (None, np.float32),
+        },
+        individual_registered_vars={
+            "obs": ([8], np.float32),
+            "obs_": ([8], np.float32),
+            "discrete_log_probs": ([1], np.float32),
+            "continuous_log_probs": (None, np.float32),
+            "discrete_actions": ([1], np.int64),
+            "continuous_actions": ([2], np.float32),
+        },
+    )
+    qmem_buff = FlexibleBuffer(
+        num_steps=10000,
         n_agents=1,
         discrete_action_cardinalities=[4],
         track_action_mask=False,
@@ -508,7 +528,7 @@ def PG_hand_pick():
         min_actions=(np.array([-1, -1]) if cdim > 0 else np.zeros(2)),
         max_actions=(np.array([1, 1]) if cdim > 0 else np.zeros(2)),
         device="cpu",
-        entropy_loss=0.1,
+        entropy_loss=0.02,
         ppo_clip=ppo_clip,
         value_clip=0.2,
         norm_advantages=True,
@@ -520,8 +540,11 @@ def PG_hand_pick():
         action_clamp_type="tanh",
         advantage_type="gae",
         n_epochs=2,
-        lr=3e-4,
+        lr=1e-3,
         mix_type=None,
+        logit_reg=0.1,
+        importance_schedule=[50, 1.0, 20000],
+        importance_from_grad=True,
     )
 
     # Print current hyper parameters before episode start
@@ -543,9 +566,11 @@ def PG_hand_pick():
             default_dlp = np.ones((1, 1), dtype=np.float32)
 
             # input(f"ob shape: {obs.shape}")
-            dact, cact, dlp, clp, cactivation, v = model.train_actions(
-                obs, step=True, debug=False
-            )
+            act_dict = model.train_actions(obs, step=True, debug=False)
+            dact = act_dict["discrete_actions"]
+            cact = act_dict["continuous_actions"]
+            dlp = act_dict["discrete_log_probs"]
+            clp = act_dict["continuous_log_probs"]
 
         if cdim > 0:
             assert (
@@ -597,6 +622,11 @@ def PG_hand_pick():
             registered_vals=rv,
             bootstrap_values=bootstrap_val,
         )
+        qmem_buff.save_transition(
+            terminated=terminated,
+            registered_vals=rv,
+            bootstrap_values=bootstrap_val,
+        )
 
         obs = obs_.copy()
         if terminated or truncated:
@@ -607,13 +637,19 @@ def PG_hand_pick():
             print(f"Episode {ep_num}, total reward: {rewards[-2]}")
             ep_num += 1
 
+        # if qmem_buff.steps_recorded > mini_batch_size * 8 and i % 16 == 0:
+        #     mb = qmem_buff.sample_transitions(
+        #         batch_size=mini_batch_size, as_torch=True, device=model.device
+        #     )
+        #     rl_dict = model.reinforcement_learn(mb, 0, debug=False, critic_only=True)
+
         if mem_buff.steps_recorded == batch_size:
             # print(model.action_clamp_type)
             mb = mem_buff.sample_transitions(
                 idx=np.arange(0, batch_size), as_torch=True, device=model.device
             )
-            aloss, closs = model.reinforcement_learn(mb, 0, debug=False)
-            print(f"Iteration {i}, aloss: {aloss}, closs: {closs}")
+            rl_dict = model.reinforcement_learn(mb, 0, debug=False)
+            print(f"Iteration {i}, aloss: {rl_dict}")
             mem_buff.reset()
     print(model)
 
