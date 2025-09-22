@@ -174,24 +174,23 @@ def DQN_test():
         run_times["create_model"] += time.time() - _s
 
         _s = time.time()
-        d_acts, c_acts, d_log, c_log, _1, _ = model.train_actions(
-            obs, step=True, debug=False
-        )
+        act_dict = model.train_actions(obs, step=True, debug=False)
         run_times["train_action_single"] += time.time() - _s
 
         _s = time.time()
-        d_acts, c_acts, d_log, c_log, _1, _ = model.train_actions(
-            obs_batch, step=True, debug=False
-        )
+        act_dict = model.train_actions(obs_batch, step=True, debug=False)
         run_times["train_action_batch"] += time.time() - _s
         mb = mem_buff.sample_transitions(
             batch_size=batch_size, as_torch=True, device=h["device"]
         )
+
+        ev = model.expected_V(obs)
+        ev = model.expected_V(obs_batch)
         # print(mb)
 
         _s = time.time()
         try:
-            aloss, closs = model.imitation_learn(
+            loss_dict = model.imitation_learn(
                 mb.__getattr__("obs")[0],
                 mb.__getattr__("continuous_actions")[0],
                 mb.__getattr__("discrete_actions")[0],
@@ -208,7 +207,7 @@ def DQN_test():
 
         _s = time.time()
         try:
-            aloss, closs = model.reinforcement_learn(mb, 0)
+            rl_metrics = model.reinforcement_learn(mb, 0)
         except Exception as e:
             print(h)
             raise e
@@ -233,7 +232,7 @@ def DQN_integration():
     }
 
     for config_id in range(10):
-        dfirst = 1
+        dfirst = 0
         cdim = 0
         ddim = None
         if config_id % 2 == dfirst:
@@ -263,7 +262,7 @@ def DQN_integration():
         )
         mem_buff.reset()
         munch = param_grid["munchausen"][random.randint(0, 1)]
-        munch = 0.9
+        munch = 0.0
         print(f"munch: {munch}")
         model = DQN(
             obs_dim=8,
@@ -272,30 +271,31 @@ def DQN_integration():
             min_actions=(None if cdim == 0 else -np.ones(2)),  # np.array([-1,-1]),
             max_actions=(None if cdim == 0 else np.ones(2)),  # ,np.array([1,1]),
             hidden_dims=[64, 64],  # first is obs dim if encoder provded
-            head_hidden_dim=param_grid["head_hidden_dim"][
-                random.randint(0, 1)
-            ],  # if None then no head hidden layer
+            head_hidden_dim=[64],  # param_grid["head_hidden_dim"][
+            # random.randint(0, 1)
+            # ],  # if None then no head hidden layer
             gamma=0.99,
             lr=1e-4,
             imitation_lr=1e-5,
             dueling=True,  # param_grid["dueling"][random.randint(0, 1)],
             n_c_action_bins=3,
             munchausen=munch,  # turns it into munchausen dqn
-            entropy=0.03,  # param_grid["entropy"][random.randint(0, 1) or munch > 0.1],  # turns it into soft-dqn
+            entropy=0.0,  # param_grid["entropy"][random.randint(0, 1) or munch > 0.1],  # turns it into soft-dqn
             activation="tanh",
             orthogonal=False,
             init_eps=1.0,
             eps_decay_half_life=15000,
-            device=param_grid["device"][random.randint(0, 1)],
+            device="cpu",  # param_grid["device"][random.randint(0, 1)],
             eval_mode=False,
             name="DQN",
             clip_grad=0.5,
             load_from_checkpoint_path=None,
             encoder=None,
-            conservative=param_grid["conservative"][random.randint(0, 1)],
-            mix_type=param_grid["mix_type"][random.randint(0, 2)],  # or "reward"
+            conservative=False,  # param_grid["conservative"][random.randint(0, 1)],
+            mix_type="QMIX",  # param_grid["mix_type"][random.randint(0, 2)],  # or "reward"
         )
         print(model)
+        # input("head hidden")
         # Print current hyper parameters before episode start
 
         gym_env = gym.make(
@@ -364,6 +364,8 @@ def DQN_integration():
             mem_buff.save_transition(
                 terminated=terminated,
                 registered_vals=rv,
+                truncated=truncated,
+                bootstrap_values=0,
             )
 
             obs = obs_.copy()
@@ -397,8 +399,7 @@ def DQN_integration():
                 )
                 # for k in range(50):
                 aloss, closs = model.reinforcement_learn(mb, 0, debug=False)
-                tot_closs[-1] += closs
-                # print(f"Iteration {i}, aloss: {aloss}, closs: {closs}")
+                print(f"Iteration {i}, aloss: {aloss}, closs: {closs}")
                 # input()
                 # mem_buff.reset()
 
@@ -414,5 +415,5 @@ def DQN_integration():
 
 
 if __name__ == "__main__":
-    # DQN_test()
+    DQN_test()
     DQN_integration()

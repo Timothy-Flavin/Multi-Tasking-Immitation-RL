@@ -1,4 +1,4 @@
-from .Agent import ValueS, StochasticActor, Agent, QMixer, QS
+from .Agent import ValueS, StochasticActor, Agent, QMixer, QS, VDNMixer
 from .Util import T, minmaxnorm
 import torch
 from flexibuff import FlexiBatch, FlexibleBuffer
@@ -10,7 +10,7 @@ import os
 import time
 from torch.distributions import TransformedDistribution, TanhTransform
 import torch.nn.functional as F
-from typing import Any, cast
+import collections
 
 
 class PG(nn.Module, Agent):
@@ -31,7 +31,7 @@ class PG(nn.Module, Agent):
         ppo_clip=0.2,
         value_loss_coef=0.5,
         value_clip=0.5,
-        advantage_type="gae",
+        advantage_type="gae",  # [g, gv, a2c, constant, gae, qmix]
         norm_advantages=True,
         mini_batch_size=64,
         anneal_lr=200000,
@@ -54,193 +54,239 @@ class PG(nn.Module, Agent):
             "obs_": "obs_",
             "continuous_log_probs": "continuous_log_probs",
             "discrete_log_probs": "discrete_log_probs",
+            "truncated": "truncated",
+            "terminated": "terminated",
         },
         mix_type=None,  # [None, 'VDN', 'QMIX']
+        mixer_dim=128,
+        importance_schedule=[10.0, 1.0, 10000],  # start end nsteps
+        importance_from_grad=True,
+        softmax_importance_scale=True,
+        on_policy_mixer=True,
+        logit_reg=0.05,
+        relative_entropy_loss=0.05,
+        wall_time=False,
     ):
         super(PG, self).__init__()
+        config = locals()
+        # Remove 'self' and other unwanted items
+        config.pop("self")
+        self.config = config
+        self.wall_time = wall_time
+        self.load_from_checkpoint = load_from_checkpoint
+        self.relative_entropy_loss = relative_entropy_loss
+        if self.load_from_checkpoint is not None:
+            self.load(self.load_from_checkpoint)
+            return
+
+        # Set up the params for Qmixed PPO
+        self.importance_temperature = importance_schedule[0]
+        self.max_importance_temperature = importance_schedule[0]
+        self.min_importance_temperature = importance_schedule[1]
+        self.importance_temperature_steps = importance_schedule[2]
+        self.importance_step = 0
+        self.importance_from_grad = importance_from_grad
+        self.softmax_importance_scale = softmax_importance_scale
+        self.on_policy_mixer = on_policy_mixer
+        self.mixer_dim = mixer_dim
+
+        # Set up the normal PPO params
+        self.continuous_action_dim = continuous_action_dim
+        self.discrete_action_dims = discrete_action_dims
+        self.batch_name_map = batch_name_map
         self.eval_mode = eval_mode
-        if mix_type is not None:
-            if mix_type.lower() == "vdn":
-                mix_type = "VDN"
-                assert (
-                    advantage_type == "qv1"
-                ), "cant vdn if the advantage is expected to not be Q based or to be per-head adv"
-
-            elif mix_type.lower() == "qmix":
-                mix_type = "QMIX"
-                assert (
-                    advantage_type == "qv1"
-                ), "cant qmix  if the advantage is expected to not be Q based or to be per-head adv"
-                nagents = (
-                    len(discrete_action_dims) if discrete_action_dims is not None else 0
-                )
-                self.Q = QS(
-                    obs_dim + continuous_action_dim,
-                    0,
-                    discrete_action_dims,
-                    hidden_dims=[64, 64],
-                    head_hidden_dims=[32],
-                    QMIX=True,
-                )
-            elif mix_type.lower() == "none":
-                mix_type = None
-                if advantage_type == "qv1":
-                    ddim = (
-                        sum(discrete_action_dims)
-                        if discrete_action_dims is not None
-                        else 0
-                    )
-                    self.q_heads = QS(
-                        obs_dim + continuous_action_dim + ddim,
-                        0,
-                        [1],
-                        hidden_dims=[64, 64],
-                        head_hidden_dims=[32],
-                        QMIX=False,
-                    )
-                else:
-                    self.Q = QS(
-                        obs_dim + continuous_action_dim,
-                        0,
-                        discrete_action_dims,
-                        hidden_dims=[64, 64],
-                        head_hidden_dims=[32],
-                        QMIX=False,
-                    )
-
         self.mix_type = mix_type
         self.mixer = None
-
-        self.attrs = [
-            "obs_dim",
-            "continuous_action_dim",
-            "max_actions",
-            "min_actions",
-            "discrete_action_dims",
-            "lr",
-            "gamma",
-            "n_epochs",
-            "device",
-            "entropy_loss",
-            "hidden_dims",
-            "activation",
-            "ppo_clip",
-            "value_loss_coef",
-            "value_clip",
-            "advantage_type",
-            "norm_advantages",
-            "mini_batch_size",
-            "anneal_lr",
-            "orthogonal",
-            "clip_grad",
-            "gae_lambda",
-            "g_mean",
-            "steps",
-            "eval_mode",
-            "action_head_hidden_dims",
-            "std_type",
-            "naive_imitation",
-            "action_clamp_type",
-        ]
-        self.run_times = {
-            "advantage": 0.0,
-            "critic_loss": 0.0,
-            "act": 0.0,
-            "dloss": 0.0,
-            "closs": 0.0,
-            "backward": 0.0,
-            "tot": 0.0001,
-        }
-
-        assert (
-            continuous_action_dim > 0 or discrete_action_dims is not None
-        ), "At least one action dim should be provided"
-
-        self.batch_name_map = batch_name_map
-        for k in ["rewards", "obs", "obs_"]:
-            assert (
-                k in batch_name_map
-            ), "PPO needs these names defined ['rewards','obs','obs_'] "
-        if discrete_action_dims is not None:
-            assert (
-                "discrete_actions" in batch_name_map
-                and "discrete_log_probs" in batch_name_map
-            ), 'discrete actions is not None but "discrete_actions" or "discrete_log_probs" does not appear in batch_name_map'
-        if continuous_action_dim > 0:
-            assert (
-                "continuous_actions" in batch_name_map
-                and "continuous_log_probs" in batch_name_map
-            ), 'continuous actions is not None but "continuous_actions" or "continuous_log_probs" does not appear in batch_name_map'
         self.name = name
         self.encoder = encoder
         self.action_clamp_type = action_clamp_type
         self.naive_imitation = naive_imitation
-        if load_from_checkpoint is not None:
-            self.load(load_from_checkpoint)
-            return
         self.ppo_clip = ppo_clip
         self.value_clip = value_clip
         self.gae_lambda = gae_lambda
         self.value_loss_coef = value_loss_coef
         self.mini_batch_size = mini_batch_size
-        assert advantage_type.lower() in [
-            "gae",
-            "a2c",
-            "constant",
-            "gv",
-            "g",
-            "qvhead",
-            "qv1",
-        ], "Invalid advantage type"
         self.advantage_type = advantage_type
         self.clip_grad = clip_grad
         self.device = device
         self.gamma = gamma
         self.obs_dim = obs_dim
-        self.continuous_action_dim = continuous_action_dim
-        self.discrete_action_dims = discrete_action_dims
         self.n_epochs = n_epochs
         self.activation = activation
         self.norm_advantages = norm_advantages
-
         self.policy_loss = 1.0
         self.critic_loss_coef = value_loss_coef
         self.entropy_loss = entropy_loss
-
         self.min_actions = min_actions
         self.max_actions = max_actions
         self.hidden_dims = hidden_dims
         self.orthogonal = orthogonal
-
         self.std_type = std_type
         self.g_mean = 0
         self.steps = 0
         self.anneal_lr = anneal_lr
         self.lr = lr
+        self.logit_reg = logit_reg
+        self.mean_std = 1
 
+        self._sanitize_params()
+        self._create_mixer()  # This needs to be before _get_torch_params for Adam to work
         self._get_torch_params(encoder, action_head_hidden_dims)
+
+    def _sanitize_params(self):
+        self.total_action_dims = 0
+        if self.mix_type is not None and self.mix_type.lower() == "none":
+            self.mix_type = None
+        if (
+            self.discrete_action_dims is not None
+            and len(self.discrete_action_dims) == 0
+        ):
+            self.discrete_action_dims = None
+        if self.mix_type is not None and self.mix_type.lower() == "none":
+            self.mix_type = None
+        for k in ["VDN", "QMIX"]:
+            if self.mix_type is not None and self.mix_type.lower() == "vdn":
+                self.mix_type = "VDN"
+                self.advantage_type = "qmix"
+            if self.mix_type is not None and self.mix_type.lower() == "qmix":
+                self.mix_type = "QMIX"
+                self.advantage_type = "qmix"
 
         if self.continuous_action_dim is not None and self.continuous_action_dim > 0:
             if isinstance(self.max_actions, list):
                 self.max_actions = np.array(self.max_actions)
             if isinstance(self.min_actions, list):
                 self.min_actions = np.array(self.min_actions)
-
             if isinstance(self.min_actions, np.ndarray):
-                self.min_actions = torch.from_numpy(min_actions).to(self.device)
+                self.min_actions = torch.from_numpy(self.min_actions).to(self.device)
             if isinstance(self.max_actions, np.ndarray):
-                self.max_actions = torch.from_numpy(max_actions).to(self.device)
+                self.max_actions = torch.from_numpy(self.max_actions).to(self.device)
+
+        if self.discrete_action_dims is not None:
+            self.total_action_dims += len(self.discrete_action_dims)
+        if self.continuous_action_dim > 0:
+            self.total_action_dims += self.continuous_action_dim
+
+    def _assert_params(self):
+        assert (
+            self.continuous_action_dim > 0 or self.discrete_action_dims is not None
+        ), "At least one action dim should be provided"
+        for k in [
+            "rewards",
+            "obs",
+            "obs_",
+            "continuous_log_probs",
+            "discrete_log_probs",
+        ]:
+            assert (
+                k in self.batch_name_map
+            ), "PPO needs these names defined ['rewards','obs','obs_'] "
+        if self.discrete_action_dims is not None:
+            assert (
+                "discrete_actions" in self.batch_name_map
+                and "discrete_log_probs" in self.batch_name_map
+            ), 'discrete actions is not None but "discrete_actions" or "discrete_log_probs" does not appear in batch_name_map'
+        if self.continuous_action_dim > 0:
+            assert (
+                "continuous_actions" in self.batch_name_map
+                and "continuous_log_probs" in self.batch_name_map
+            ), 'continuous actions is not None but "continuous_actions" or "continuous_log_probs" does not appear in batch_name_map'
+        if self.continuous_action_dim > 0:
+            assert (
+                self.max_actions is not None or self.action_clamp_type is None
+            ), "Clamp type is not None, but max actions is None so no way to clamp"
+            assert (
+                self.min_actions is not None or self.action_clamp_type is None
+            ), "Clamp type is not None, but min actions is None so no way to clamp"
+
+            if self.action_clamp_type is not None:
+                assert (
+                    self.max_actions is not None
+                    and len(self.max_actions) >= self.continuous_action_dim
+                ), f"If Clamp type '{self.action_clamp_type}' is not None, len(max_actions): {len(self.max_actions) if self.max_actions is not None else None}, must be greater than continuous_action_dim: {self.continuous_action_dim}"
+                assert (
+                    self.min_actions is not None
+                    and len(self.min_actions) >= self.continuous_action_dim
+                ), f"If Clamp type '{self.action_clamp_type}' is not None, len(min_actions): {len(self.min_actions) if self.min_actions is not None else None}, must be greater than continuous_action_dim: {self.continuous_action_dim}"
+        if self.mix_type == "QMIX":
+            assert self.mixer_dim is not None and isinstance(
+                self.mixer_dim, int
+            ), "mixer_dim must be an integer embedding size to use QMIX e.i. 256"
+            assert (
+                self.advantage_type == "qmix"
+            ), "Cane have mixtype QMIX without advantage tyype qmix"
+        assert self.advantage_type.lower() in [
+            "gae",
+            "a2c",
+            "constant",
+            "gv",
+            "g",
+            "qmix",  # one value and one A/U value per discrete head
+        ], "Invalid advantage type"
+
+    def _create_mixer(self):
+        if self.mix_type is None:
+            self.critic = ValueS(
+                obs_dim=self.obs_dim,
+                hidden_dim=self.hidden_dims[0],
+                device=self.device,
+                orthogonal_init=self.orthogonal,
+                activation=self.activation,
+            ).to(self.device)
+
+        elif self.mix_type == "VDN":
+            self.mixer = VDNMixer(
+                self.total_action_dims, self.obs_dim, mixing_embed_dim=self.mixer_dim
+            ).to(self.device)
+            self.critic = QS(
+                obs_dim=self.obs_dim,
+                continuous_action_dim=self.continuous_action_dim,
+                discrete_action_dims=self.discrete_action_dims,
+                hidden_dims=[self.mixer_dim, self.mixer_dim],
+                encoder=None,
+                activation="tanh",
+                dueling=True,
+                device=self.device,
+                n_c_action_bins=5,
+                head_hidden_dims=[64],
+                QMIX=False,
+                QMIX_hidden_dim=0,
+            ).to(self.device)
+        elif self.mix_type == "QMIX":
+            self.mixer = QMixer(
+                self.total_action_dims, self.obs_dim, mixing_embed_dim=self.mixer_dim
+            ).to(self.device)
+            self.critic = QS(
+                obs_dim=self.obs_dim,
+                continuous_action_dim=self.continuous_action_dim,
+                discrete_action_dims=self.discrete_action_dims,
+                hidden_dims=[self.mixer_dim, self.mixer_dim],
+                encoder=None,
+                activation="tanh",
+                dueling=True,
+                device=self.device,
+                n_c_action_bins=5,
+                head_hidden_dims=[self.mixer_dim],
+                QMIX=False,
+                QMIX_hidden_dim=0,
+            ).to(self.device)
 
     def _get_torch_params(self, encoder, action_head_hidden_dims=None):
         st = None
         if self.std_type in ["full", "diagonal"]:
             st = self.std_type
+        np_maxes = None
+        np_mins = None
+        if isinstance(self.max_actions, torch.Tensor):
+            np_maxes = self.max_actions.to("cpu").numpy()
+        if isinstance(self.min_actions, torch.Tensor):
+            np_mins = self.min_actions.to("cpu").numpy()
         self.actor = StochasticActor(
             obs_dim=self.obs_dim,
             continuous_action_dim=self.continuous_action_dim,
             discrete_action_dims=self.discrete_action_dims,
-            max_actions=self.max_actions,
-            min_actions=self.min_actions,
+            max_actions=np_maxes,
+            min_actions=np_mins,
             hidden_dims=self.hidden_dims,
             device=self.device,
             orthogonal_init=self.orthogonal,
@@ -250,22 +296,15 @@ class PG(nn.Module, Agent):
             action_head_hidden_dims=action_head_hidden_dims,
             std_type=st,
             clamp_type=self.action_clamp_type,
+            log_std_clamp_range=(-5.0, 1.0),
         ).to(self.device)
 
-        self.critic = ValueS(
-            obs_dim=self.obs_dim,
-            hidden_dim=self.hidden_dims[0],
-            device=self.device,
-            orthogonal_init=self.orthogonal,
-            activation=self.activation,
-        ).to(self.device)
         self.actor_logstd = None
         self.optimizer: torch.optim.Adam
         if self.std_type == "stateless":
             self.actor_logstd = nn.Parameter(
-                torch.zeros(self.continuous_action_dim), requires_grad=True
-            ).to(
-                self.device
+                torch.zeros(self.continuous_action_dim).to(self.device),
+                requires_grad=True,
             )  # TODO: Check this for expand as
             self.actor_logstd.retain_grad()
 
@@ -292,6 +331,20 @@ class PG(nn.Module, Agent):
     # train_actions will take one or multiple actions if given a list of observations
     # this way the agent can be parameter shared in a batched fashion.
     def train_actions(self, observations, action_mask=None, step=False, debug=False):
+        """
+        Returns action dictionary of the form:
+            {
+                "discrete_actions": np.int[da1,da2,...],
+                "continuous_actions": np.float[ca1,ca2,...],
+                "discrete_log_probs": float(sum(dlp1,dlp2,...)),
+                "continuous_log_probs": float(sum(clp1,clp2,...)),
+                "act_time": t(seconds) if self.wall_time,
+            }
+        returns gradient free numpy arrays / floats. act_time is the wall clock time
+        """
+        t = 0
+        if self.wall_time:
+            t = time.time()
         if debug:
             print(f"  Testing PPO Train Actions: Observations: {observations}")
         if not torch.is_tensor(observations):
@@ -325,13 +378,6 @@ class PG(nn.Module, Agent):
                     f"  After actor: clog {continuous_logits}, dlog{discrete_action_logits}"
                 )
 
-            # clpstd = None
-            # if continuous_log_std_logits is not None:
-            #     clpstd = torch.exp(continuous_log_std_logits)
-            # print(
-            #     f"c_logits {continuous_logits} d_logits: {discrete_action_logits} c_std: {clpstd}"
-            # )
-
             try:
                 (
                     discrete_actions,
@@ -361,14 +407,26 @@ class PG(nn.Module, Agent):
         # print(continuous_logits)
         # print(continuous_actions)
         # print(f"in train action lp: {continuous_log_probs}")
-        return (
-            self._to_numpy(discrete_actions),
-            self._to_numpy(continuous_actions),
-            self._to_numpy(discrete_log_probs),
-            self._to_numpy(continuous_log_probs),
-            self._to_numpy(raw_continuous_activations),
-            0,  # vals.detach().cpu().numpy(), TODO: re-enable this when flexibuff is done
+        if self.wall_time:
+            t = time.time() - t
+        return {
+            "discrete_actions": self._to_numpy(discrete_actions),
+            "continuous_actions": self._to_numpy(continuous_actions),
+            "discrete_log_probs": self._to_numpy(discrete_log_probs),
+            "continuous_log_probs": self._to_numpy(continuous_log_probs),
+            "act_time": t,
+        }
+
+    def stable_greedy(self, obs, legal_action):
+        ad = self.train_actions(
+            observations=obs, action_mask=legal_action, step=False, debug=False
         )
+        adiscrete, acontinuous = None, None
+        if ad["discrete_actions"] is not None:
+            adiscrete = torch.tensor(ad["discrete_actions"]).to(self.device)
+        if ad["continuous_actions"] is not None:
+            acontinuous = torch.tensor(ad["continuous_actions"]).to(self.device)
+        return adiscrete, acontinuous
 
     # takes the observations and returns the action with the highest probability
     def ego_actions(self, observations, action_mask=None):
@@ -391,7 +449,10 @@ class PG(nn.Module, Agent):
                 False,
                 False,
             )
-            return self._to_numpy(discrete_actions), self._to_numpy(continuous_actions)
+            return {
+                "discrete_actions": self._to_numpy(discrete_actions),
+                "continuous_actions": self._to_numpy(continuous_actions),
+            }
 
     def _discrete_imitation_loss(self, discrete_logits, discrete_actions):
         """
@@ -464,7 +525,7 @@ class PG(nn.Module, Agent):
             )
 
         loss = (
-            -dist.log_prob(continuous_actions).sum(axis=-1).mean()
+            -dist.log_prob(continuous_actions).sum(dim=-1).mean()
         )  # TODO: dist.entropy() to stop it from overfitting
         return loss
 
@@ -567,6 +628,9 @@ class PG(nn.Module, Agent):
         action_mask=None,
         debug=False,
     ):
+        t = 0
+        if self.wall_time:
+            t = time.time()
         continuous_mean_logits, continuous_log_std_logits, discrete_logits = self.actor(
             x=observations, action_mask=action_mask, debug=False
         )
@@ -601,7 +665,13 @@ class PG(nn.Module, Agent):
             discrete_imitation_loss = discrete_imitation_loss.to("cpu").item()
         if isinstance(continuous_imitation_loss, torch.Tensor):
             continuous_imitation_loss = continuous_imitation_loss.to("cpu").item()
-        return discrete_imitation_loss, continuous_imitation_loss
+        if self.wall_time:
+            t = time.time() - t
+        return {
+            "im_discrete_loss": discrete_imitation_loss,
+            "im_continuous_loss": continuous_imitation_loss,
+            "im_time": t,
+        }
 
     def utility_function(self, observations, actions=None):
         if not torch.is_tensor(observations):
@@ -613,13 +683,18 @@ class PG(nn.Module, Agent):
         # If actions are none then V(s)
 
     def expected_V(self, obs, legal_action=None):
-        return self.critic(obs)
+        if self.mix_type is None:
+            return self.critic(obs).squeeze(-1)
+        else:
+            values, disc_advantages, cont_advantages = self.critic(obs)
+            return values.squeeze(-1)
 
-    # def _get_disc_log_probs_entropy(self, logits, actions):
-    #     log_probs = torch.zeros_like(actions, dtype=torch.float)
-    #     dist = Categorical(logits=logits)
-    #     log_probs = dist.log_prob(actions)
-    #     return log_probs, dist.entropy().mean()
+    def _get_disc_log_probs_entropy(self, logits, actions):
+        log_probs = torch.zeros_like(actions, dtype=torch.float)
+        dist = Categorical(logits=logits)
+        log_probs = dist.log_prob(actions)
+        # print("Disc probs:", log_probs.mean(dim=0).detach().cpu().numpy())
+        return log_probs, dist.entropy().mean()
 
     def _get_cont_log_probs_entropy(
         self, logits, actions, lstd_logits: torch.Tensor | None = None
@@ -633,26 +708,26 @@ class PG(nn.Module, Agent):
             ), "If the actor doesnt generate logits then it needs to have a global logstd"
             lstd = lstd_logits.expand_as(logits)
 
-        # print(lstd)
+        # print(lstd.mean(dim=0).detach().cpu().numpy())
+        # print(actions.abs().mean(dim=0).detach().cpu().numpy())
         # print(self.std_type)
 
-        dist = torch.distributions.Normal(
-            loc=logits, scale=torch.clip(torch.exp(lstd), min=0.05)
-        )
         if self.action_clamp_type == "tanh":
+            dist = torch.distributions.Normal(
+                loc=torch.clip(logits, -4.0, 4.0), scale=torch.exp(lstd)
+            )
             # dist = TransformedDistribution(dist, TanhTransform())
             # print("actions were tanhed so we need to get form raw to dist activations")
             # print(f"actions: {actions[:,0]}")
             activations = minmaxnorm(actions, self.min_actions, self.max_actions)
-            eps = 1e-6
-            activations = torch.clamp(activations, -1 + eps, 1 - eps)
-            # print(f"normed actions: {activations[:,0]}")
+            activations = torch.clamp(activations, -0.999329299739, 0.999329299739)
             activations = torch.atanh(activations)
             # print(f"inverse tanh actions: {activations[:,0]}")
             # print(
             #    f"from raw logit means: {logits} and scale {torch.clip(torch.exp(lstd), min=1e-6)}"
             # )
         else:
+            dist = torch.distributions.Normal(loc=logits, scale=torch.exp(lstd))
             activations = actions
 
         log_probs = dist.log_prob(activations).sum(dim=-1)
@@ -798,7 +873,7 @@ class PG(nn.Module, Agent):
                 gamma=self.gamma,
             )
             advantages = G
-        else:
+        elif self.advantage_type in ["gae", "a2c"]:
             with torch.no_grad():
                 if "values" in self.batch_name_map.keys():
                     values = batch.__getattr__(self.batch_name_map["values"])[agent_num]
@@ -834,6 +909,27 @@ class PG(nn.Module, Agent):
                 )
             else:
                 raise ValueError("Invalid advantage type")
+        # elif self.advantage_type == "qmix":
+        #     with torch.no_grad():
+        #         if "values" in self.batch_name_map.keys():
+        #             values = batch.__getattr__(self.batch_name_map["values"])[agent_num]
+        #         elif hasattr(batch, "values"):
+        #             values = batch.__getattr__("values")[agent_num]
+        #         else:
+        #             values, da, ca = self.critic(
+        #                 batch.__getattr__(self.batch_name_map["obs"])[agent_num]
+        #             ).squeeze(-1)
+
+        #     G, advantages = FlexibleBuffer.GAE(
+        #         rewards,
+        #         values,
+        #         batch.terminated,
+        #         last_val,
+        #         self.gamma,
+        #         self.gae_lambda,
+        #     )
+        else:
+            raise Exception(f"advantage type {self.advantage_type} not allowed")
         if debug:
             print(
                 f"  batch rewards: {batch.__getattr__(self.batch_name_map['rewards'])}"
@@ -871,6 +967,7 @@ class PG(nn.Module, Agent):
         actor_loss = (
             -self.policy_loss * continuous_policy_gradient.mean()
             - self.entropy_loss * cont_entropy
+            + self.logit_reg * (action_means**2).mean()
         )
         return actor_loss
 
@@ -909,8 +1006,21 @@ class PG(nn.Module, Agent):
         critic_only=False,
         debug=False,
     ):
+        t = 0
+        if self.wall_time:
+            t = time.time()
         if self.eval_mode:
-            return 0, 0
+            return {
+                "rl_actor_loss": 0,
+                "rl_critic_loss": 0,
+                "d_entropy": 0,
+                "c_entropy": 0,
+                "c_std": 0,
+                "rl_time": 0,
+            }
+        # print(f"mix type: {self.mix_type}, adv type: {self.advantage_type}")
+        if self.mix_type == "QMIX" or self.mix_type == "VDN":
+            return self._mix_reinforcement_learn(batch, agent_num, critic_only, debug)
         if debug:
             print(f"Starting PG Reinforcement Learn for agent {agent_num}")
         with torch.no_grad():
@@ -960,15 +1070,13 @@ class PG(nn.Module, Agent):
 
                 critic_loss = self._critic_loss(batch, indices, G, agent_num, debug)
                 actor_loss = torch.zeros(1, device=self.device)
-                # print(torch.abs(V_current - G[indices]).mean())
                 if not critic_only:
                     mb_adv = advantages[torch.from_numpy(indices).to(self.device)]
+                    mb_obs = batch.__getattr__(self.batch_name_map["obs"])[
+                        agent_num, indices
+                    ]
                     continuous_means, continuous_log_std_logits, discrete_logits = (
-                        self.actor(
-                            x=batch.__getattr__(self.batch_name_map["obs"])[
-                                agent_num, indices
-                            ],
-                        )
+                        self.actor(x=mb_obs)
                     )
                     if self.continuous_action_dim > 0:
                         clp = batch.__getattr__(
@@ -988,13 +1096,6 @@ class PG(nn.Module, Agent):
                         dact = batch.__getattr__(
                             self.batch_name_map["discrete_actions"]
                         )[agent_num, indices]
-                        # dlp = []
-                        # for head in range(len(self.discrete_action_dims)):
-                        #     dlp.append(
-                        #         batch.__getattr__(
-                        #             self.batch_name_map["discrete_log_probs"]
-                        #         )[head][agent_num, indices]
-                        #     )
                         dlp = batch.__getattr__(
                             self.batch_name_map["discrete_log_probs"]
                         )[agent_num, indices]
@@ -1002,19 +1103,9 @@ class PG(nn.Module, Agent):
                             dact, dlp, discrete_logits, mb_adv
                         )
 
-                    # print("actor")
-                    # self.optimizer.zero_grad()
-                    # loss = actor_loss
-                    # loss.backward()
-                    # self._print_grad_norm()
-                    # print("critic")
                 self.optimizer.zero_grad()
                 loss = actor_loss + critic_loss * self.critic_loss_coef
                 loss.backward()
-                # self._print_grad_norm()
-                # print(self.actor_logstd)
-                # print(self.actor_logstd.grad)
-                # self._print_grad_norm()
 
                 if self.clip_grad:
                     torch.nn.utils.clip_grad_norm_(
@@ -1024,37 +1115,7 @@ class PG(nn.Module, Agent):
                         foreach=True,
                     )
 
-                # with torch.no_grad():
-                #     (
-                #         old_continuous_means,
-                #         old_continuous_log_std_logits,
-                #         old_discrete_logits,
-                #     ) = self.actor(
-                #         x=batch.__getattr__(self.batch_name_map["obs"])[
-                #             agent_num, indices
-                #         ],
-                #     )
-                #     print(
-                #         f"old logits before update: {old_continuous_means[:,0]} and std: {torch.exp(old_continuous_log_std_logits)[:,0]}"
-                #     )
-
                 self.optimizer.step()
-
-                # if debug:
-                #     with torch.no_grad():
-                #         continuous_means, continuous_log_std_logits, discrete_logits = (
-                #             self.actor(
-                #                 x=batch.__getattr__(self.batch_name_map["obs"])[
-                #                     agent_num, indices
-                #                 ],
-                #             )
-                #         )
-
-                #         print(
-                #             f"new logits after update: {continuous_means[:,0]} and std: {torch.exp(continuous_log_std_logits)[:,0]}"
-                #         )
-                #         print(self.optimizer.param_groups[0]["lr"])
-                #         input()
 
                 avg_actor_loss += actor_loss.to("cpu").item()
                 avg_critic_loss += critic_loss.to("cpu").item()
@@ -1064,8 +1125,435 @@ class PG(nn.Module, Agent):
 
         avg_actor_loss /= self.n_epochs
         avg_critic_loss /= self.n_epochs
-        # print(avg_actor_loss, critic_loss.item())
-        return avg_actor_loss, avg_critic_loss
+        if self.wall_time:
+            t = time.time() - t
+        return {
+            "rl_actor_loss": avg_actor_loss,
+            "rl_critic_loss": avg_critic_loss,
+            "d_entropy": 0,
+            "c_entropy": 0,
+            "c_std": 0,
+            "rl_time": t,
+        }
+
+    def _bin_continuous_actions(self, c_actions):
+        """Given continuous actions we return the discretized bins that the critic is using"""
+        assert (
+            self.min_actions is not None and self.max_actions is not None
+        ), "Can't bin actions with no max and min action"
+        n_bins = 5
+        min_actions = self.min_actions.unsqueeze(0)  # type:ignore
+        max_actions = self.max_actions.unsqueeze(0)  # type:ignore
+        bin_width = (max_actions - min_actions) / (n_bins - 1)
+        bin_indices = torch.round((c_actions - min_actions) / bin_width)
+        bin_indices = bin_indices.clamp(0, n_bins - 1)
+        return bin_indices.long()
+
+    def _gather_observed_advantages(self, d_adv, c_adv, d_actions, c_actions):
+        advantages = []
+        if d_adv is not None:
+            for h in range(len(d_adv)):
+                adv_h = d_adv[h]
+                assert isinstance(adv_h, torch.Tensor)
+                advantages.append(
+                    adv_h.gather(dim=-1, index=d_actions[:, h].unsqueeze(-1))
+                )
+        if c_adv is not None:
+            c_indices = self._bin_continuous_actions(c_actions)
+            assert isinstance(c_adv, torch.Tensor)
+            advantages.append(
+                c_adv.gather(dim=-1, index=c_indices.unsqueeze(-1)).squeeze(-1)
+            )
+        advantages = torch.cat(advantages, dim=-1)
+        return advantages
+
+    def _max_advantages(self, d_adv, c_adv):
+        advantages = []
+        if d_adv is not None:
+            for h in range(len(d_adv)):
+                adv_h = d_adv[h]
+                assert isinstance(adv_h, torch.Tensor)
+                advantages.append(adv_h.max(dim=-1).values.unsqueeze(-1))
+        if c_adv is not None:
+            assert isinstance(c_adv, torch.Tensor)
+            advantages.append(c_adv.max(dim=-1).values)
+        advantages = torch.cat(advantages, dim=-1)
+        return advantages
+
+    def _gather_importance(self, d_adv, c_adv):
+        importance = []
+        if d_adv is not None:
+            for h in range(len(d_adv)):
+                adv_h = d_adv[h].detach()
+                assert isinstance(adv_h, torch.Tensor)
+                importance.append(
+                    adv_h.max(dim=-1).values.unsqueeze(-1)
+                    - adv_h.min(dim=-1).values.unsqueeze(-1)
+                )
+        if c_adv is not None:
+            assert isinstance(c_adv, torch.Tensor)
+            importance.append(c_adv.max(dim=-1).values - c_adv.min(dim=-1).values)
+        importance = torch.cat(importance, dim=-1)
+        return importance
+
+    def _update_importance(self):
+        # based on importance step, max and min, and nsteps, scale importance temperature
+        frac = min(self.importance_step / self.importance_temperature_steps, 1.0)
+        self.importance_temperature = (
+            self.max_importance_temperature * (1.0 - frac)
+            + self.min_importance_temperature * frac
+        )
+        self.importance_step += 1
+
+    def _weighted_gae(
+        self,
+        rewards: torch.Tensor,  # shape = [n_steps]
+        values: torch.Tensor,  # shape = [n_steps]
+        bootstrap_values: torch.Tensor,  # shape = [n_steps]
+        terminated: torch.Tensor,  # shape = [n_steps]
+        truncated: torch.Tensor,  # shape = [n_steps]
+        advantage_weights: torch.Tensor,  # shape = [n_steps, n_agents]
+        gamma=0.99,
+        gae_lambda=0.95,
+    ):
+        advantages = torch.zeros_like(advantage_weights).to(advantage_weights.device)
+        num_steps = len(rewards)
+        last_gae_lam = torch.zeros(advantage_weights.shape[1]).to(self.device)
+        for step in reversed(range(num_steps)):
+            if terminated[step] > 0.1:
+                next_value = 0.0
+            else:
+                next_value = gamma * bootstrap_values[step]
+
+            ep_not_over = float((terminated[step] < 0.1) and (truncated[step] < 0.1))
+            delta = rewards[step] + next_value - values[step]
+            weighted_delta = delta * advantage_weights[step]
+            last_gae_lam = (
+                weighted_delta + gamma * gae_lambda * ep_not_over * last_gae_lam
+            )
+
+            advantages[step] = last_gae_lam
+        G = advantages + values.unsqueeze(-1)
+        return G, advantages
+
+    def _continuous_log_probs_per_dim(self, logits, lstd_logits, actions):
+        lstd = -1.0
+        if self.actor_logstd is not None:
+            lstd = self.actor_logstd.expand_as(logits)
+        else:
+            assert (
+                lstd_logits is not None
+            ), "If the actor doesnt generate logits then it needs to have a global logstd"
+            lstd = lstd_logits.expand_as(logits)
+        # TODO: Make this track better, this is a hack
+        self.mean_std = lstd.detach().mean(0).cpu()
+        dist = torch.distributions.Normal(
+            loc=torch.clip(logits, min=-4.0, max=4.0), scale=torch.exp(lstd)
+        )
+        if self.action_clamp_type == "tanh":
+            activations = minmaxnorm(actions, self.min_actions, self.max_actions)
+            eps = 1.0 - 0.999329299739
+            activations = torch.clamp(activations, -1 + eps, 1 - eps)
+            activations = torch.atanh(activations)
+        else:
+            activations = actions
+        log_probs = dist.log_prob(activations)
+        if self.action_clamp_type == "tanh":
+            log_probs -= 2 * (np.log(2) - activations - F.softplus(-2 * activations))
+        return log_probs, dist.entropy().sum(-1)
+
+    def _log_probs_per_dim(self, obs, d_actions, c_actions):
+        continuous_means, continuous_log_std_logits, discrete_logits = self.actor(obs)
+
+        # print(
+        #     f"continuous_means: {continuous_means}\nclstdl: {continuous_log_std_logits}"
+        # )
+        discrete_log_probs = None
+        continuous_log_probs = None
+        lp = []
+        c_entropy = 0
+        if self.continuous_action_dim > 0:
+            continuous_log_probs, c_entropy = self._continuous_log_probs_per_dim(
+                continuous_means, continuous_log_std_logits, c_actions
+            )
+            lp.append(continuous_log_probs)
+            # print(f"continuous lp: {continuous_log_probs}")
+        d_entropy = 0
+        if self.discrete_action_dims is not None and len(self.discrete_action_dims) > 0:
+            discrete_log_probs = torch.zeros(
+                discrete_logits[0].shape[0],
+                len(self.discrete_action_dims),
+                device=self.device,
+            )
+            for i, logits in enumerate(discrete_logits):
+                d_dist = torch.distributions.Categorical(logits=logits)
+                discrete_log_probs[:, i] = d_dist.log_prob(d_actions[:, i])
+                d_entropy += d_dist.entropy().squeeze(-1)
+            lp.append(discrete_log_probs)
+        lp = torch.cat(lp, dim=-1)
+        logit_regularization_loss = 0
+        if self.continuous_action_dim > 0:
+            logit_regularization_loss = 0.01 * (continuous_means**2).mean()
+        return lp, d_entropy, c_entropy, logit_regularization_loss
+
+    def _mix_actor_loss(self, old_log_probs, new_log_probs, advantages, entropy):
+        logratio = new_log_probs - old_log_probs
+        ratio = torch.exp(logratio)
+
+        pg_loss1 = advantages * ratio
+        pg_loss2 = advantages * torch.clamp(ratio, 1 - self.ppo_clip, 1 + self.ppo_clip)
+        policy_loss = -torch.min(pg_loss1, pg_loss2).mean()
+
+        # Optional: entropy bonus (if you want to add it here)
+        policy_loss -= self.entropy_loss * entropy.mean()
+        return policy_loss
+
+    def _mix_critic_only(self, batch: FlexiBatch, agent_num):
+        obs = batch.__getattr__(self.batch_name_map["obs"])[agent_num]
+        obs_ = batch.__getattr__(self.batch_name_map["obs_"])[agent_num]
+        d_actions = batch.__getattr__(self.batch_name_map["discrete_actions"])[
+            agent_num
+        ]
+        c_actions = batch.__getattr__(self.batch_name_map["continuous_actions"])[
+            agent_num
+        ]
+        rewards = batch.__getattr__(self.batch_name_map["rewards"])
+        terminated = batch.terminated
+        truncated = batch.truncated
+        if truncated is None:
+            truncated = torch.zeros_like(rewards)
+        values, d_adv, c_adv = self.critic(obs)
+        adv = self._gather_observed_advantages(d_adv, c_adv, d_actions, c_actions)
+        Q = (self.mixer(adv, obs)[0] + values).squeeze(-1)  # type:ignore
+
+        with torch.no_grad():
+            next_values, next_d_adv, next_c_adv = self.critic(obs_)
+            if self.on_policy_mixer:
+                next_adv = 0
+                next_Q = next_values
+            else:
+                next_adv = self._max_advantages(
+                    next_d_adv,
+                    next_c_adv,
+                )
+                next_Q = (
+                    self.mixer(next_adv, obs_)[0] + next_values  # type:ignore
+                ).squeeze(-1)
+            global_Q, global_GAE = self._weighted_gae(
+                rewards=rewards,
+                values=Q,
+                bootstrap_values=next_Q,
+                terminated=terminated,  # type:ignore
+                truncated=truncated,  # type:ignore
+                advantage_weights=torch.ones_like(rewards).unsqueeze(-1),
+                gamma=self.gamma,
+                gae_lambda=self.gae_lambda,
+            )
+        critic_loss = ((Q - global_Q) ** 2).mean()
+        self.optimizer.zero_grad()
+        critic_loss.backward()
+        if self.clip_grad:
+            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
+            if self.mixer is not None:
+                torch.nn.utils.clip_grad_norm_(self.mixer.parameters(), 0.5)
+        self.optimizer.step()
+
+        return {
+            "rl_critic_loss": critic_loss.item(),
+        }
+
+    def _mix_reinforcement_learn(
+        self, batch: FlexiBatch, agent_num, critic_only, debug
+    ):
+        """If we have QMIX going on then we need to do everything different so might as well make a new function"""
+        assert self.mixer is not None, "Can't mix rl without a mixer..."
+        t = 0
+        if self.wall_time:
+            t = time.time()
+        if critic_only:
+            return self._mix_critic_only(batch, agent_num)
+        obs = batch.__getattr__(self.batch_name_map["obs"])[agent_num]
+        obs_ = batch.__getattr__(self.batch_name_map["obs_"])[agent_num]
+        d_actions = batch.__getattr__(self.batch_name_map["discrete_actions"])[
+            agent_num
+        ]
+        c_actions = batch.__getattr__(self.batch_name_map["continuous_actions"])[
+            agent_num
+        ]
+        rewards = batch.__getattr__(self.batch_name_map["rewards"])
+        terminated = batch.terminated
+        truncated = batch.truncated
+        if truncated is None:
+            truncated = torch.zeros_like(rewards)
+
+        with torch.no_grad():
+            values, d_adv, c_adv = self.critic(obs)
+            adv = self._gather_observed_advantages(d_adv, c_adv, d_actions, c_actions)
+        grad_free_adv = adv.detach()
+        grad_free_adv.requires_grad = True
+        __q, adv_grad = self.mixer(grad_free_adv, obs, with_grad=True)
+        self.mixer.zero_grad()
+
+        with torch.no_grad():
+            Q = (self.mixer(adv, obs)[0] + values).squeeze(-1)
+            next_values, next_d_adv, next_c_adv = self.critic(obs_)
+            old_log_probs, old_d_ent, old_c_end, _ = self._log_probs_per_dim(
+                obs, d_actions, c_actions
+            )
+            if self.on_policy_mixer:
+                next_adv = 0
+                next_Q = next_values
+            else:
+                next_adv = self._max_advantages(
+                    next_d_adv,
+                    next_c_adv,
+                )
+                next_Q = (self.mixer(next_adv, obs_)[0] + next_values).squeeze(-1)
+            # critic_target = rewards + self.gamma * (1.0 - terminated) * next_Q
+            if self.importance_from_grad:
+                scaled_importance = grad_free_adv * adv_grad
+            else:
+                raw_importance = self._gather_importance(d_adv, c_adv.detach())
+                scaled_importance = raw_importance * adv_grad
+
+            self._update_importance()
+
+            if self.softmax_importance_scale:
+                scaled_importance = torch.softmax(
+                    scaled_importance / self.importance_temperature, dim=-1
+                )
+            else:
+                scaled_importance = (
+                    scaled_importance.abs() + self.importance_temperature
+                )
+                scaled_importance /= scaled_importance.sum(dim=-1).unsqueeze(-1)
+
+            # So learning rate doesn't shrink with number of agents
+            scaled_importance *= grad_free_adv.shape[-1]
+
+            G, gae = self._weighted_gae(
+                rewards=rewards,
+                values=Q,
+                bootstrap_values=next_Q,
+                terminated=terminated,  # type:ignore
+                truncated=truncated,  # type:ignore
+                advantage_weights=scaled_importance,
+                gamma=self.gamma,
+                gae_lambda=self.gae_lambda,
+            )
+
+            global_Q, global_GAE = self._weighted_gae(
+                rewards=rewards,
+                values=Q,
+                bootstrap_values=next_Q,
+                terminated=terminated,  # type:ignore
+                truncated=truncated,  # type:ignore
+                advantage_weights=torch.ones_like(rewards).unsqueeze(-1),
+                gamma=self.gamma,
+                gae_lambda=self.gae_lambda,
+            )
+
+        indices = np.arange(0, obs.shape[0])
+        avg_actor_loss = 0.0
+        avg_critic_loss = 0.0
+        avg_d_entropy = 0.0
+        avg_c_entropy = 0.0
+
+        if self.norm_advantages:
+            gae = (gae - gae.mean()) / (gae.std() + 1e-8)
+        bad_log = False
+        for k in range(self.n_epochs):
+            # Shuffle indices at the start of each epoch
+            np.random.shuffle(indices)
+            # TODO: Loop through mini-batches
+            for start in range(0, len(indices), self.mini_batch_size):
+                if bad_log:
+                    break
+                # Get mini batch indices
+                end = start + self.mini_batch_size
+                mini_batch_indices = indices[start:end]
+
+                # Select mini-batch data
+                mb_obs = obs[mini_batch_indices]
+                mb_d_actions = d_actions[mini_batch_indices]
+                mb_c_actions = c_actions[mini_batch_indices]
+                mb_old_log_probs = old_log_probs[mini_batch_indices]
+                mb_gae = gae[mini_batch_indices]
+                mb_global_Q = global_Q[mini_batch_indices]
+
+                mb_values, mb_d_adv, mb_c_adv = self.critic(mb_obs)
+                mb_adv = self._gather_observed_advantages(
+                    mb_d_adv, mb_c_adv, mb_d_actions, mb_c_actions
+                )
+                mb_Q = (self.mixer(mb_adv, mb_obs)[0] + mb_values).squeeze(-1)
+                critic_loss = ((mb_Q - mb_global_Q) ** 2).mean()
+
+                mb_new_log_probs, mb_d_entropy, mb_c_entropy, mb_logit_regulrization = (
+                    self._log_probs_per_dim(mb_obs, mb_d_actions, mb_c_actions)
+                )
+                mb_entropy = mb_d_entropy + self.relative_entropy_loss * mb_c_entropy
+                if torch.min(mb_new_log_probs) < -15:
+                    print(
+                        f"Bad log prob default to regularization only {torch.min(mb_new_log_probs)}"
+                    )
+                    bad_log = True
+                    self.optimizer.state = collections.defaultdict(dict)
+                    continuous_means, continuous_log_std_logits, discrete_logits = (
+                        self.actor(obs)
+                    )
+                    if self.continuous_action_dim > 0:
+                        mask = continuous_means.abs() > 3.0
+                        logit_regulrization = (
+                            0.1 * ((mask * continuous_means) ** 2).mean()
+                        )
+                        self.optimizer.zero_grad()
+                        logit_regulrization.backward()
+                        self.optimizer.step()
+                    else:
+                        logit_regulrization = 0
+                    continue
+
+                # Sum and Normalize loss grads
+                actor_loss = (
+                    self._mix_actor_loss(
+                        mb_old_log_probs, mb_new_log_probs, mb_gae, mb_entropy
+                    )
+                    + mb_logit_regulrization
+                )
+                loss = self.value_loss_coef * critic_loss + actor_loss
+                self.optimizer.zero_grad()
+                if self.clip_grad:
+                    torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
+                    torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
+                    if self.mixer is not None:
+                        torch.nn.utils.clip_grad_norm_(self.mixer.parameters(), 0.5)
+                loss.backward()
+                self.optimizer.step()
+
+                avg_actor_loss += actor_loss.item()
+                avg_critic_loss += critic_loss.item()
+                if isinstance(mb_c_entropy, torch.Tensor):
+                    mb_c_entropy = float(mb_c_entropy.mean().cpu())
+                avg_c_entropy += mb_c_entropy
+                if isinstance(mb_d_entropy, torch.Tensor):
+                    mb_d_entropy = float(mb_d_entropy.mean().cpu())
+                avg_d_entropy += mb_d_entropy
+
+        num_updates = self.n_epochs * (len(indices) / self.mini_batch_size)
+        avg_actor_loss /= num_updates
+        avg_critic_loss /= num_updates
+        avg_c_entropy /= num_updates
+        avg_d_entropy /= num_updates
+        if self.wall_time:
+            t = time.time() - t
+        return {
+            "rl_actor_loss": avg_actor_loss,
+            "rl_critic_loss": avg_critic_loss,
+            "d_entropy": avg_d_entropy,
+            "c_entropy": avg_c_entropy,
+            "c_std": self.mean_std,
+            "rl_time": t,
+        }
 
     def _dump_attr(self, attr, path):
         f = open(path, "wb")
@@ -1089,19 +1577,19 @@ class PG(nn.Module, Agent):
         torch.save(self.actor.state_dict(), checkpoint_path + "/PI")
         torch.save(self.critic.state_dict(), checkpoint_path + "/V")
         torch.save(self.actor_logstd, checkpoint_path + "/actor_logstd")
-        for i in range(len(self.attrs)):
-            self._dump_attr(
-                self.__dict__[self.attrs[i]], checkpoint_path + f"/{self.attrs[i]}"
-            )
+        # for i in range(len(self.attrs)):
+        #    self._dump_attr(
+        #        self.__dict__[self.attrs[i]], checkpoint_path + f"/{self.attrs[i]}"
+        #    )
 
     def load(self, checkpoint_path):
         if checkpoint_path is None:
             checkpoint_path = "./" + self.name + "/"
 
-        for i in range(len(self.attrs)):
-            self.__dict__[self.attrs[i]] = self._load_attr(
-                checkpoint_path + f"/{self.attrs[i]}"
-            )
+        # for i in range(len(self.attrs)):
+        #    self.__dict__[self.attrs[i]] = self._load_attr(
+        #        checkpoint_path + f"/{self.attrs[i]}"
+        #    )
         self._get_torch_params(self.starting_actorlogstd)
         self.policy_loss = 5.0
         self.actor.load_state_dict(torch.load(checkpoint_path + "/PI"))
@@ -1113,3 +1601,6 @@ class PG(nn.Module, Agent):
         for d in self.__dict__.keys():
             st += f"{d}: {self.__dict__[d]}\n"
         return st
+
+    def param_count(self) -> tuple[int, int]:
+        return super().param_count()

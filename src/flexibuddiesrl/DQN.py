@@ -9,6 +9,7 @@ from flexibuff import FlexiBatch
 import os
 import pickle
 import warnings
+import time
 
 from enum import Enum
 
@@ -51,9 +52,16 @@ class DQN(nn.Module, Agent):
         encoder=None,
         conservative=False,
         imitation_type="cross_entropy",  # or "reward"
-        mix_type="None",  # None, VDN, QMIX
+        mix_type: None | str = "None",  # None, VDN, QMIX
+        wall_time=False,
+        mix_dim=32,
     ):
         super(DQN, self).__init__()
+        config = locals()
+        config.pop("self")
+        self.config = config
+
+        self.wall_time = wall_time
         if mix_type is None or mix_type.lower() == "none":
             mix_type = None
         if mix_type is not None:
@@ -127,7 +135,9 @@ class DQN(nn.Module, Agent):
                 else None
             ),  # if None then no head hidden layer
             QMIX=self.mix_type == "QMIX",
+            QMIX_hidden_dim=mix_dim,
         )
+        self.encoder = self.Q1.encoder
         self.Q1.to(device)
 
         self.Q2 = QS(
@@ -147,10 +157,14 @@ class DQN(nn.Module, Agent):
                 else None
             ),  # if None then no head hidden layer
             QMIX=self.mix_type == "QMIX",
+            QMIX_hidden_dim=mix_dim,
         )
+        self.head_hidden_dims = head_hidden_dim
         self.Q2.to(self.device)
         with torch.no_grad():
             self.Q2.load_state_dict(self.Q1.state_dict())
+        for param in self.Q2.parameters():
+            param.requires_grad = False
 
         self.update_num = 0
         self.conservative = conservative
@@ -286,24 +300,38 @@ class DQN(nn.Module, Agent):
         return disc_act, cont_act
 
     def train_actions(self, observations, action_mask=None, step=False, debug=False):
-        # if len(observations.shape) == 1:
-        #    observations = np.expand_dims(observations, axis=0)
-        # if self.dqn_type == dqntype.Munchausen or self.dqn_type == dqntype.Soft:
-        #     disc_act, cont_act = self._soft_train_action(
-        #         observations, action_mask, step, debug
-        #     )
-        #     # print(disc_act)
-        #     # print(cont_act)
-        #     # print()
-        # else:
+        t = 0
+        if self.wall_time:
+            t = time.time()
         disc_act, cont_act = self._e_greedy_train_action(
             observations, action_mask, step, debug
         )
         self.step += int(step)
-        return disc_act, cont_act, 0.0, 0.0, 0.0, 0.0
+        if self.wall_time:
+            t = time.time() - t
+        return {
+            "discrete_actions": disc_act,
+            "continuous_actions": cont_act,
+            "act_time": t,
+        }
 
     def ego_actions(self, observations, action_mask=None):
-        return 0, 0
+        return {"discrete_actions": 0, "continuous_actions": 0, "action_time": 0}
+
+    def stable_greedy(self, obs, legal_action):
+        with torch.no_grad():
+            values, disc_advantages, cont_advantages = self.Q2(obs)
+            dact = None
+            cact = None
+            if self.has_discrete:
+                dact = []
+                for dh in disc_advantages:
+                    dact.append(torch.argmax(dh, dim=-1).unsqueeze(0))
+                torch.cat(dact, dim=0)
+            if self.has_continuous:
+                cact = torch.argmax(cont_advantages, dim=-1)
+
+        return dact, cact
 
     def _bc_cross_entropy_loss(self, disc_adv, cont_adv, disc_act, cont_act):
         discrete_loss = 0
@@ -354,9 +382,12 @@ class DQN(nn.Module, Agent):
         action_mask=None,
         debug=False,
     ):
+        t = 0
+        if self.wall_time:
+            t = time.time()
         values, disc_adv, cont_adv = self.Q1(observations)
         if self.eval_mode:
-            return 0, 0
+            return {"im_discrete_loss": 0, "im_continuous_loss": 0}
         else:
             dloss, closs = torch.zeros(1, device=self.device), torch.zeros(
                 1, device=self.device
@@ -378,7 +409,7 @@ class DQN(nn.Module, Agent):
                 warnings.warn(
                     "Loss is 0, not updating. Most likely due to continuous and discrete actions being None,0 respectively"
                 )
-                return 0, 0
+                return {"im_discrete_loss": 0, "im_continuous_loss": 0}
             self.optimizer.zero_grad()
             loss.backward()
             if self.clip_grad is not None and self.clip_grad > 0:
@@ -393,7 +424,10 @@ class DQN(nn.Module, Agent):
                 dloss = dloss.item()
             if closs != 0:
                 closs = closs.item()
-            return dloss, closs
+
+            if self.wall_time:
+                t = time.time() - t
+            return {"im_discrete_loss": dloss, "im_continuous_loss": closs, "time": t}
 
     def utility_function(self, observations, actions=None):
         return 0  # Returns the single-agent critic for a single action.
@@ -401,64 +435,20 @@ class DQN(nn.Module, Agent):
 
     def expected_V(self, obs, legal_action=None, debug=False):
         with torch.no_grad():
-            value, dac, cac = self.Q1(obs, legal_action)
-            if debug:
-                print(f"value: {value}, dac: {dac}, cac: {cac}, eps: {self.eps}")
+            v, dac, cac = self.Q1(obs, legal_action)
             if self.dueling:
-                return value.mean()  # TODO make sure this doesnt need to be item()
-
-            dq = 0
-            n = 0
-            if (
-                self.discrete_action_dims is not None
-                and len(self.discrete_action_dims) > 0
-            ):
-                n += 1
-                for hi, h in enumerate(dac):
-                    a = torch.argmax(h, dim=-1)
-                    bestq = h[a].item()
-                    h[a] = 0
-                    if legal_action is not None:
-                        if torch.sum(legal_action[hi]) == 1:
-                            otherq = (
-                                bestq  # no other choices so 100% * only legal choice
-                            )
-                        else:
-                            otherq = torch.sum(  # average of other choices
-                                h * legal_action[hi], dim=-1
-                            ) / (torch.sum(legal_action[hi], dim=-1) - 1)
-                    else:
-                        otherq = torch.sum(h, dim=-1) / (
-                            self.discrete_action_dims[hi] - 1
-                        )
-                        if debug:
-                            print(
-                                f"{otherq} = self.eps * {torch.sum(h, dim=-1)} / ({self.discrete_action_dims[hi] - 1})"
-                            )
-
-                    qmean = (1 - self.eps) * bestq + self.eps * otherq
-                    if debug:
-                        print(
-                            f"dq: {qmean} = {(1 - self.eps)} * {bestq} + {self.eps} * {otherq}"
-                        )
-                    dq += qmean
-                dq = dq / len(self.discrete_action_dims)
-            cq = 0
-            if self.continuous_action_dims > 0:
-                n += 1
-                for h in cac:
-                    a = torch.argmax(h, dim=-1)
-                    bestq = h[a].item()
-                    h[a] = 0
-                    otherq = torch.sum(h, dim=-1) / (self.n_c_action_bins - 1)
-                    if debug:
-                        print(
-                            f"cq: {(1 - self.eps) * bestq + self.eps * otherq} = {(1 - self.eps)} * {bestq} + {self.eps} * ({otherq})"
-                        )
-                    cq += (1 - self.eps) * bestq + self.eps * otherq
-                cq = cq / self.continuous_action_dims
-
-            return value + (cq + dq) / (max(n, 1))
+                return v.squeeze(-1)
+            else:
+                evs = []
+                if (
+                    self.discrete_action_dims is not None
+                    and len(self.discrete_action_dims) > 0
+                ):
+                    for h in dac:
+                        evs.append(torch.max(h, dim=-1, keepdim=True)[0])
+                if self.continuous_action_dims > 0:
+                    evs.append(torch.max(cac, dim=-1)[0])
+                return torch.cat(evs, dim=-1).mean(dim=-1)
 
     def cql_loss(self, disc_adv, cont_adv, disc_act, cont_act):
         """Computes the CQL loss for a batch of Q-values and actions."""
@@ -500,6 +490,7 @@ class DQN(nn.Module, Agent):
         if self.mix_type == "VDN":
             Q_ = Q_.sum(dim=-1)
         elif self.mix_type is None:
+            # print(f"dQ_: {Q_.shape}, values: {values.shape}")
             Q_ = Q_ + values
         return Q_
 
@@ -513,6 +504,7 @@ class DQN(nn.Module, Agent):
         else:
             Q_ = torch.max(advantages, dim=-1).values
         if self.mix_type is None:
+            # print(f"cQ_: {Q_.shape}, values: {values.shape}")
             Q_ = Q_ + values
         elif self.mix_type == "VDN":
             Q_ = Q_.sum(dim=-1)
@@ -548,13 +540,17 @@ class DQN(nn.Module, Agent):
             if self.has_discrete:
                 disc_targets = rewards.unsqueeze(-1) + (
                     self.gamma * (1 - terminated.unsqueeze(-1))
-                ) * (dQ_ + values)
+                ) * (dQ_)
+
+                # print(
+                #    f"In targ: rew: {rewards[0:5]}, terminated: {(1 - terminated.unsqueeze(-1))[0:5]}, dQ_: {dQ_[0:5]} values: {values[0:5]}"
+                # )
             else:
                 disc_targets = 0
             if self.has_continuous:
                 cont_targets = rewards.unsqueeze(-1) + (
                     self.gamma * (1 - terminated.unsqueeze(-1))
-                ) * (cQ_ + values)
+                ) * (cQ_)
             else:
                 cont_targets = 0
         else:
@@ -568,20 +564,26 @@ class DQN(nn.Module, Agent):
                 if self.has_continuous:
                     qlist.append(cQ_)
                 Q_ = (
-                    self.Q2.factorize_Q(torch.cat(qlist, dim=1), state).squeeze(-1)
+                    self.Q2.factorize_Q(torch.cat(qlist, dim=1), state)[0].squeeze(-1)
                     + vals
                 )
             else:
                 raise Exception("Mix type needs to be None VDN or QMIX")
+            # print(
+            #    f"combined shapes: {rewards.shape} 1-term: {(1-terminated).shape} Q_.shape: {Q_.shape}"
+            # )
             combined_targets = rewards + (self.gamma * (1 - terminated)) * Q_
         return disc_targets, cont_targets, combined_targets
 
     def reinforcement_learn(
         self, batch: FlexiBatch, agent_num=0, critic_only=False, debug=False
     ):
+        t = 0
+        if self.wall_time:
+            t = time.time()
         self.update_num += 1
         if self.eval_mode:
-            return float(0.0), float(0.0)
+            return {"rl_loss": 0, "rl_time": 0}
 
         continuous_actions = None
         discrete_actions = None
@@ -591,8 +593,8 @@ class DQN(nn.Module, Agent):
             continuous_actions = self._discretize_actions(
                 batch.continuous_actions[agent_num]  # type: ignore
             )
-        discrete_target = torch.zeros(1, device=self.device)
-        continuous_target = torch.zeros(1, device=self.device)
+        discrete_target = 0  # torch.zeros(1, device=self.device)
+        continuous_target = 0  # torch.zeros(1, device=self.device)
         values, disc_adv, cont_adv = self.Q1(batch.obs[agent_num])
         with torch.no_grad():
             next_values, next_disc_adv, next_cont_adv = self.Q2(batch.obs_[agent_num])
@@ -660,7 +662,7 @@ class DQN(nn.Module, Agent):
                         ), "If mixing is enabled then combined target needs to be tensor"
                         combined_target += munchausen_reward.sum(-1)
 
-        cQ = torch.zeros(1, device=self.device)
+        cQ = 0
         if self.has_continuous:
             assert (
                 continuous_actions is not None
@@ -675,7 +677,7 @@ class DQN(nn.Module, Agent):
             if self.mix_type == "VDN":
                 cQ = cQ.sum(-1)
 
-        dQ = torch.zeros(1, device=self.device)
+        dQ = 0
         if self.has_discrete:
             assert (
                 discrete_actions is not None and self.discrete_action_dims is not None
@@ -693,13 +695,12 @@ class DQN(nn.Module, Agent):
                 ).squeeze(-1)
             if self.mix_type == "VDN":
                 dQ = dQ.sum(-1)
-
         loss = 0
         if self.mix_type is None:
             dloss = 0
             closs = 0
             if self.has_discrete:
-                dloss = ((dQ + values - discrete_target) ** 2).mean()
+                dloss = (((dQ + values) - discrete_target) ** 2).mean()
             if self.has_continuous:
                 closs = (
                     ((cQ + values - continuous_target) ** 2).mean()
@@ -720,11 +721,12 @@ class DQN(nn.Module, Agent):
                     qs.append(cQ)
 
                 Q = (
-                    self.Q1.factorize_Q(
-                        torch.cat(qs, dim=1), batch.obs[agent_num]
-                    ).squeeze(-1)
+                    self.Q1.factorize_Q(torch.cat(qs, dim=-1), batch.obs[agent_num])[
+                        0
+                    ].squeeze(-1)
                     + v
                 )
+
             assert isinstance(
                 Q, torch.Tensor
             ), "Can't learn when the current q values don't exist"
@@ -740,6 +742,9 @@ class DQN(nn.Module, Agent):
                 error_if_nonfinite=True,
                 foreach=True,
             )
+        for name, param in self.Q2.named_parameters():
+            if param.grad is not None:
+                print(f"WARNING: Q2 param {name} has non-zero grad!")
         self.optimizer.step()
         tau = 0.005  # A typical value
         with torch.no_grad():
@@ -749,8 +754,15 @@ class DQN(nn.Module, Agent):
                 target_param.data.copy_(
                     tau * online_param.data + (1.0 - tau) * target_param.data
                 )
+        # input("\n\nNew iter?")
+
         l_ = loss.item()
-        return l_, l_  # actor loss, critic loss
+        if self.wall_time:
+            t = time.time() - t
+        return {
+            "rl_loss": l_,
+            "rl_time": t,
+        }
 
     def _dump_attr(self, attr, path):
         f = open(path, "wb")
@@ -840,6 +852,19 @@ class DQN(nn.Module, Agent):
         for i in self.__dict__.keys():
             st += f"{i}: {self.__dict__[i]}\n"
         return st
+
+    def param_count(self):
+        total_params = sum(p.numel() for p in self.Q1.parameters()) + sum(
+            p.numel() for p in self.Q2.parameters()
+        )
+        exec_params = sum(p.numel() for p in self.Q1.parameters())
+        if self.mix_type == "QMIX":
+            assert (
+                self.Q1.mixing_network is not None
+            ), "If we are a q mixer then our q network needs a mixer"
+            exec_params -= sum(p.numel() for p in self.Q1.mixing_network.parameters())
+
+        return total_params, exec_params
 
 
 # %%

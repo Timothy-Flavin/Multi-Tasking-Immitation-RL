@@ -9,6 +9,8 @@ import random
 import time
 import gymnasium as gym
 import matplotlib.pyplot as plt
+import os
+from torch.utils.tensorboard import SummaryWriter
 
 
 def PG_test():
@@ -20,13 +22,13 @@ def PG_test():
         "reinforcement_learn": 0.0,
     }
     rl_times = {
-        "advantage": 0.0,
-        "critic_loss": 0.0,
-        "act": 0.0,
-        "dloss": 0.0,
-        "closs": 0.0,
-        "backward": 0.0,
-        "tot": 0.0,
+        "advantage": 0.1,
+        "critic_loss": 0.1,
+        "act": 0.1,
+        "dloss": 0.1,
+        "closs": 0.1,
+        "backward": 0.1,
+        "tot": 0.1,
     }
     obs_dim = 3
     continuous_action_dim = 5
@@ -104,7 +106,8 @@ def PG_test():
         "clip_grad": (False, True),
         "eval_mode": (False, True),
         "action_head_hidden_dims": (None, [8, 4]),
-        "adv_type": ["gae", "gv", "a2c", "g", "constant"],
+        "adv_type": ["qmix", "gae", "gv", "a2c", "g", "constant"],
+        "mix_type": ["QMIX", None, "VDN"],
     }
 
     p_keys = param_grid.keys()
@@ -113,8 +116,12 @@ def PG_test():
         h = dict(zip(p_keys, vals))
         if h["continuous_action_dim"] == 0 and h["discrete_action_dims"] is None:
             continue
+        if h["mix_type"] is not None and h["adv_type"] != "qmix":
+            continue
+        if h["adv_type"] == "qmix" and h["mix_type"] not in ["VDN", "QMIX"]:
+            continue
         tot += 1
-    print(tot)
+    # print(tot)
     start_time = time.time()
     current_time = time.time()
     current_iter = 0
@@ -122,6 +129,11 @@ def PG_test():
         h = dict(zip(p_keys, vals))
         if h["continuous_action_dim"] == 0 and h["discrete_action_dims"] is None:
             continue
+        if h["mix_type"] is not None and h["adv_type"] != "qmix":
+            continue
+        if h["adv_type"] == "qmix" and h["mix_type"] not in ["VDN", "QMIX"]:
+            continue
+        # print("We continued??")
         # print(h)
         t = time.time()
         if t - current_time > 5.0:
@@ -174,13 +186,19 @@ def PG_test():
             action_clamp_type=h["action_clamp_type"],
             advantage_type=h["adv_type"],
             n_epochs=1,
+            mix_type=h["mix_type"],
         )
         run_times["create_model"] += time.time() - _s
 
         _s = time.time()
-        d_acts, c_acts, d_log, c_log, _1, _ = model.train_actions(
-            obs, step=True, debug=False
-        )
+        act_dict = model.train_actions(obs, step=True, debug=False)
+        v = model.expected_V(obs)
+        print(v)
+        d_acts = act_dict["discrete_actions"]
+        c_acts = act_dict["continuous_actions"]
+        d_log = act_dict["discrete_log_probs"]
+        c_log = act_dict["continuous_log_probs"]
+
         run_times["train_action_single"] += time.time() - _s
 
         if (d_acts is not None and d_acts.shape[0] != 2) or (
@@ -191,9 +209,12 @@ def PG_test():
             )
 
         _s = time.time()
-        d_acts, c_acts, d_log, c_log, _1, _ = model.train_actions(
-            obs_batch, step=True, debug=False
-        )
+        act_dict = model.train_actions(obs_batch, step=True, debug=False)
+        d_acts = act_dict["discrete_actions"]
+        c_acts = act_dict["continuous_actions"]
+        d_log = act_dict["discrete_log_probs"]
+        c_log = act_dict["continuous_log_probs"]
+        v = model.expected_V(obs_batch)
         run_times["train_action_batch"] += time.time() - _s
 
         if (
@@ -213,7 +234,7 @@ def PG_test():
 
         _s = time.time()
         try:
-            aloss, closs = model.imitation_learn(
+            im_dict = model.imitation_learn(
                 mb.__getattr__("obs")[0],
                 mb.__getattr__("continuous_actions")[0],
                 mb.__getattr__("discrete_actions")[0],
@@ -230,14 +251,14 @@ def PG_test():
 
         _s = time.time()
         try:
-            aloss, closs = model.reinforcement_learn(mb, 0)
+            rl_dict = model.reinforcement_learn(mb, 0)
         except Exception as e:
             print(h)
             raise e
         run_times["reinforcement_learn"] += time.time() - _s
 
-        for k in rl_times:
-            rl_times[k] += model.run_times[k]
+        # for k in rl_times:
+        #    rl_times[k] += model.run_times[k]
 
     print(tot)
 
@@ -264,6 +285,9 @@ def PG_integration():
 
     for config_id in range(10):
 
+        # TODO: init wandb with the model.config as the config
+        log_dir = f"runs/PG_integration_test_{config_id}"
+        writer = SummaryWriter(log_dir=log_dir)
         cdim = 0
         ddim = None
         if config_id % 2 == 0:
@@ -322,15 +346,21 @@ def PG_integration():
                 if ppo_clip > 0.0
                 else batch_size  # Dont do epochs if no ppo clip
             ),
+            value_loss_coef=0.5,
             action_clamp_type=param_grid["action_clamp_type"][random.randint(0, 2)],
             advantage_type=param_grid["adv_type"][random.randint(0, 4)],
             n_epochs=3 if ppo_clip > 0.0 else 1,
-            lr=5e-4,
+            lr=1e-3,
+            mix_type="VDN",
+            mixer_dim=64,
+            importance_schedule=[10, 1, 10000],
+            importance_from_grad=True,
+            softmax_importance_scale=True,
+            on_policy_mixer=True,
+            logit_reg=0.05,
         )
 
-        # Print current hyper parameters before episode start
-
-        gym_env = gym.make("LunarLander-v2", continuous=config_id % 2 == 0)
+        gym_env = gym.make("LunarLander-v3", continuous=config_id % 2 == 0)
         obs, _ = gym_env.reset()
         obs_ = obs + 0.1
         rewards = [0.0]
@@ -347,9 +377,11 @@ def PG_integration():
                 default_dlp = np.ones((1, 1), dtype=np.float32)
 
                 # input(f"ob shape: {obs.shape}")
-                dact, cact, dlp, clp, cactivation, v = model.train_actions(
-                    obs, step=True, debug=False
-                )
+                action_dict = model.train_actions(obs, step=True, debug=False)
+                dact = action_dict["discrete_actions"]
+                cact = action_dict["continuous_actions"]
+                dlp = action_dict["discrete_log_probs"]
+                clp = action_dict["continuous_log_probs"]
 
             if cdim > 0:
                 assert (
@@ -412,8 +444,18 @@ def PG_integration():
                 mb = mem_buff.sample_transitions(
                     idx=np.arange(0, batch_size), as_torch=True, device=model.device
                 )
-                aloss, closs = model.reinforcement_learn(mb, 0, debug=False)
-                print(f"Iteration {i}, aloss: {aloss}, closs: {closs}")
+                rl_metrics = model.reinforcement_learn(mb, 0, debug=False)
+
+                for k, v in rl_metrics.items():
+                    if isinstance(v, torch.Tensor):
+                        scalar_labels = {}
+                        for j in range(len(v)):
+                            scalar_labels[f"cdim_{j}"] = torch.exp(v[j])
+                        writer.add_scalars("StDev", scalar_labels, i)
+                    else:
+                        print(f"k: {k} v: {v}")
+                        writer.add_scalar(f"RL/{k}", v, i)
+                print(f"Iteration {i}, {rl_metrics}")
                 mem_buff.reset()
         print(model)
 
@@ -583,6 +625,7 @@ def PG_hand_pick():
 
 
 if __name__ == "__main__":
+
     # PG_integration()
     # PG_test()
     PG_hand_pick()

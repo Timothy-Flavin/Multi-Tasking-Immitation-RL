@@ -52,6 +52,9 @@ class DDPG(Agent):
             The name of the agent
         device: str
         """
+        config = locals()
+        config.pop("self")
+        self.config = config
         assert not (
             continuous_action_dim is None and discrete_action_dims is None
         ), "At least one action dim should be provided"

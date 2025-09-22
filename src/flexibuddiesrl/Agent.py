@@ -7,33 +7,37 @@ from .Util import T
 
 
 class Agent(ABC):
+    from abc import ABC, abstractmethod
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+from .Util import T
+
+
+class Agent(ABC):
 
     @abstractmethod
     def train_actions(
         self, observations, action_mask=None, step=False, debug=False
-    ) -> tuple[
-        np.ndarray | int | None,
-        np.ndarray | float | None,
-        np.ndarray | float | None,
-        np.ndarray | float | None,
-        np.ndarray | float | None,
-        np.ndarray | float | None,
-    ]:
-        return (
-            0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
-        )  # discrete actions, continuous actions, discrete log probs, continuous log probs, raw_continuous_activation, value
+    ) -> dict:
+        return {
+            "discrete_action": 0,
+            "continuous_action": 0,
+            "discrete_log_prob": 0,
+            "continuous_log_prob": 0,
+            "value": 0,
+            "time": 0,
+        }
 
     @abstractmethod
-    def ego_actions(self, observations, action_mask=None) -> tuple[
-        np.ndarray | int | None,
-        np.ndarray | float | None,
-    ]:
-        return np.array([1]), np.array([0.5])
+    def ego_actions(self, observations, action_mask=None) -> dict:
+        return {
+            "discrete_action": 0,
+            "continuous_action": 0,
+        }
 
     @abstractmethod
     def imitation_learn(
@@ -43,10 +47,9 @@ class Agent(ABC):
         discrete_actions,
         action_mask=None,
         debug=False,
-    ) -> tuple[float, float]:
-        x: float = 0.0
-        y: float = 0.0
-        return float(x), float(y)  # loss
+    ) -> dict:
+        immitation_metrics = {"critic_loss": 0, "actor_loss": 0, "time": 0}
+        return immitation_metrics
 
     @abstractmethod
     def utility_function(self, observations, actions=None):
@@ -54,15 +57,34 @@ class Agent(ABC):
         # If actions are none then V(s)
 
     @abstractmethod
-    def expected_V(self, obs, legal_action):
+    def expected_V(self, obs, legal_action) -> torch.Tensor | np.ndarray | float:
         print("expected_V not implemeted")
-        return 0
+        return 0.0
+
+    @abstractmethod
+    def stable_greedy(self, obs, legal_action):
+        """
+        Sample a greedy action from this agent's target or stable
+        policy. For DQN this is argmax(target_Q), for PPO this is
+        just like taking a train action which is equal in
+        expectation to the current policy.
+        """
+        print("stable greedy not implemented")
+        return None, None
 
     @abstractmethod
     def reinforcement_learn(
         self, batch, agent_num=0, critic_only=False, debug=False
-    ) -> tuple[float, float]:
-        return 0.0, 0.0  # actor loss, critic loss
+    ) -> dict:
+        rl_metrics = {
+            "critic_loss": 0,
+            "d_actor_loss": 0,
+            "c_actor_loss": 0,
+            "d_entropy": 0,
+            "c_entropy": 0,
+            "c_std": 0,
+        }
+        return rl_metrics
 
     @abstractmethod
     def save(self, checkpoint_path):
@@ -71,6 +93,10 @@ class Agent(ABC):
     @abstractmethod
     def load(self, checkpoint_path):
         print("Load not implemented")
+
+    @abstractmethod
+    def param_count(self) -> tuple[int, int]:
+        return 0, 0  # train and execute param count
 
 
 def _orthogonal_init(layer, std=np.sqrt(2), bias_const=0.0):
@@ -270,7 +296,7 @@ class StochasticActor(nn.Module):
         gumbel_tau=1.0,  # for gumbel soft
         gumbel_tau_decay=0.9999,
         gumbel_tau_min=0.1,
-        gumble_hard=False,
+        gumbel_hard=False,
         orthogonal_init=False,
         activation="relu",  # activation function for the encoder
         action_head_hidden_dims=[32],  # iterable of hidden dims for action heads
@@ -292,7 +318,7 @@ class StochasticActor(nn.Module):
         self.gumbel_tau = gumbel_tau
         self.gumbel_tau_decay = gumbel_tau_decay
         self.gumbel_tau_min = gumbel_tau_min
-        self.gumble_hard = gumble_hard
+        self.gumbel_hard = gumbel_hard
         self.continuous_action_dim = continuous_action_dim
         sizes = {None: 0, "full": continuous_action_dim, "diagonal": 1}
         self.log_std_dim = sizes[self.std_type]
@@ -326,9 +352,9 @@ class StochasticActor(nn.Module):
             assert (
                 max_actions is not None
                 and min_actions is not None
-                and len(max_actions) == continuous_action_dim
-                and len(min_actions) == continuous_action_dim
-            ), f"max_actions should be provided for each continuous action dim len(max): {len(max_actions) if max_actions is not None else None}, continuous_action_dim: {continuous_action_dim}"
+                and len(max_actions) >= continuous_action_dim
+                and len(min_actions) >= continuous_action_dim
+            ), f"max_actions should be provided for each continuous action dim len(max): {len(max_actions) if max_actions is not None else None}, continuous_action_dim: {continuous_action_dim} min: {len(min_actions) if min_actions is not None else None}, continuous_action_dim: {continuous_action_dim}"
 
         # print(
         #    f"Min actions: {min_actions}, max actions: {max_actions}, torch {torch.from_numpy(max_actions - min_actions)}"
@@ -485,7 +511,7 @@ class StochasticActor(nn.Module):
         pass
 
     # DDPG way
-    def deterministic_action(self, c_logits, d_logits, noise_generator, gumble=False):
+    def deterministic_action(self, c_logits, d_logits, noise_generator, gumbel=False):
         pass
 
     # PPO / SAC way
@@ -496,7 +522,7 @@ class StochasticActor(nn.Module):
         c_log_stds,
         with_logc=False,
         with_logd=False,
-        gumble=False,
+        gumbel=False,
     ):
         pass
 
@@ -505,7 +531,7 @@ class StochasticActor(nn.Module):
         continuous_means: torch.Tensor | None,
         continuous_log_std_logits: torch.Tensor | None,
         discrete_logits: list[torch.Tensor] | None,
-        gumble: bool = False,
+        gumbel: bool = False,
         log_con: bool = False,
         log_disc: bool = False,
     ) -> tuple[
@@ -560,7 +586,7 @@ class StochasticActor(nn.Module):
                 log_std = log_std.expand_as(continuous_means)
                 c_dist = torch.distributions.Normal(
                     continuous_means,
-                    torch.clip(torch.exp(log_std), min=0.05),
+                    torch.exp(log_std),
                 )
                 continuous_activations = c_dist.rsample()
 
@@ -618,11 +644,11 @@ class StochasticActor(nn.Module):
             assert (
                 discrete_logits is not None
             ), "Cant have discrete action dim and no discrete actions"
-            if gumble:
+            if gumbel:
                 discrete_actions: list[torch.Tensor] | torch.Tensor | None = []
                 for i, logits in enumerate(discrete_logits):
                     probs = F.gumbel_softmax(
-                        logits, dim=-1, tau=self.gumbel_tau, hard=self.gumble_hard
+                        logits, dim=-1, tau=self.gumbel_tau, hard=self.gumbel_hard
                     )
                     discrete_actions.append(probs)
             else:
@@ -813,7 +839,7 @@ class QMixer(nn.Module):
     Monotonicity is enforced by constraining these weights to be non-negative.
     """
 
-    def __init__(self, n_agents: int, state_dim: int, mixing_embed_dim: int = 32):
+    def __init__(self, n_agents: int, state_dim: int, mixing_embed_dim: int = 64):
         """
         Initializes the QMixer network.
 
@@ -846,7 +872,9 @@ class QMixer(nn.Module):
             nn.Linear(self.embed_dim, 1),
         )
 
-    def forward(self, agent_qs: torch.Tensor, state: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, agent_qs: torch.Tensor, state: torch.Tensor, with_grad: bool = False
+    ) -> tuple[torch.Tensor, None | torch.Tensor]:
         """
         Forward pass for the QMixer.
 
@@ -883,18 +911,33 @@ class QMixer(nn.Module):
         b2 = b2.view(batch_size, 1, 1)
 
         # Reshape agent Q-values for mixing
-        agent_qs = agent_qs.view(batch_size, 1, self.n_agents)
+        agent_qs_view = agent_qs.view(batch_size, 1, self.n_agents)
 
         # --- Perform the mixing ---
 
         # First mixing layer
         # Use ELU activation, as is common in QMIX implementations
-        hidden = F.elu(torch.bmm(agent_qs, w1) + b1)
+        hidden = F.elu(torch.bmm(agent_qs_view, w1) + b1)
 
         # Second mixing layer
         q_total = torch.bmm(hidden, w2) + b2
 
-        return q_total.view(batch_size, -1)
+        q_grads = None
+        if with_grad:
+            q_total.sum().backward()
+            q_grads = agent_qs.grad
+
+        return q_total.view(batch_size, -1), q_grads
+
+
+class VDNMixer(nn.Module):
+    def __init__(self, n_agents: int, state_dim: int, mixing_embed_dim: int = 32):
+        super(VDNMixer, self).__init__()
+
+    def forward(
+        self, agent_qs: torch.Tensor, state: torch.Tensor, with_grad: bool = False
+    ) -> tuple[torch.Tensor, None | torch.Tensor]:
+        return agent_qs.sum(dim=-1, keepdim=True), torch.ones_like(agent_qs)
 
 
 class QS(nn.Module):
@@ -917,7 +960,8 @@ class QS(nn.Module):
         QMIX_hidden_dim=64,
     ):
         super(QS, self).__init__()
-
+        if discrete_action_dims is not None and len(discrete_action_dims) == 0:
+            discrete_action_dims = None
         self.QMIX = QMIX
         # guard code
         if continuous_action_dim is None:
