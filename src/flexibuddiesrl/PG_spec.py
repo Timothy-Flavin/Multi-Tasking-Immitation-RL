@@ -541,7 +541,7 @@ def PG_hand_pick():
         advantage_type="gae",
         n_epochs=2,
         lr=1e-3,
-        mix_type="VDN",
+        mix_type=None,
         logit_reg=0.1,
         importance_schedule=[50, 1.0, 20000],
         importance_from_grad=False,

@@ -132,6 +132,7 @@ class PG(nn.Module, Agent):
         self.lr = lr
         self.logit_reg = logit_reg
         self.mean_std = 1
+        self.end_early = False
 
         self._sanitize_params()
         self._create_mixer()  # This needs to be before _get_torch_params for Adam to work
@@ -746,7 +747,8 @@ class PG(nn.Module, Agent):
                 np.log(2) - activations - F.softplus(-2 * activations)
             ).sum(dim=-1)
 
-        if torch.min(log_probs) < -20:
+        if torch.min(log_probs) < -100:
+            self.end_early = True
             print(
                 f"{self.action_clamp_type} Warning: log_probs has very low values: {torch.min(log_probs)}. "
                 "This might cause numerical instability."
@@ -1033,18 +1035,24 @@ class PG(nn.Module, Agent):
                 f"  bsize: {bsize}, Mini batch indices: {mini_batch_indices}, nbatch: {nbatch}"
             )
 
+        bnum = 0
+        self.end_early = False
         for epoch in range(self.n_epochs):
+            if self.end_early:
+                bnum = max(0.01, bnum)
+                break
             if debug:
                 print("  Starting epoch", epoch)
-            bnum = 0
 
             while self.mini_batch_size * bnum < bsize:
                 # Get Critic Loss
+                if self.end_early:
+                    break
                 bstart = self.mini_batch_size * bnum
                 bend = min(bstart + self.mini_batch_size, bsize - 1)
                 indices = mini_batch_indices[bstart:bend]
                 bnum += 1
-                print(f"bnum: {bnum}")
+                # print(f"bnum: {bnum}")
                 if debug:
                     print(
                         f"    Mini batch: {bstart}:{bend}, Indices: {indices}, {len(indices)}"
@@ -1101,12 +1109,12 @@ class PG(nn.Module, Agent):
 
                 avg_actor_loss += actor_loss.to("cpu").item()
                 avg_critic_loss += critic_loss.to("cpu").item()
-            avg_actor_loss /= nbatch
-            avg_critic_loss /= nbatch
+            # avg_actor_loss /= nbatch
+            # avg_critic_loss /= nbatch
             # print(f"actor_loss: {actor_loss.item()}")
 
-        avg_actor_loss /= self.n_epochs
-        avg_critic_loss /= self.n_epochs
+        avg_actor_loss /= bnum
+        avg_critic_loss /= bnum
         if self.wall_time:
             t = time.time() - t
         return {
@@ -1228,7 +1236,7 @@ class PG(nn.Module, Agent):
             ), "If the actor doesnt generate logits then it needs to have a global logstd"
             lstd = lstd_logits.expand_as(logits)
         # TODO: Make this track better, this is a hack
-        self.mean_std = lstd.detach().mean(0).cpu()
+        self.mean_std = torch.exp(lstd.detach().mean(0).cpu())
         dist = torch.distributions.Normal(
             loc=torch.clip(logits, min=-4.0, max=4.0), scale=torch.exp(lstd)
         )
@@ -1379,7 +1387,7 @@ class PG(nn.Module, Agent):
         # print(f"critic loss only: {critic_loss.item()}")
         if self.clip_grad:
             torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
-            if self.mixer is not None:
+            if self.mixer is not None and self.mix_type == "QMIX":
                 torch.nn.utils.clip_grad_norm_(self.mixer.parameters(), 0.5)
         self.optimizer.step()
 
@@ -1446,7 +1454,7 @@ class PG(nn.Module, Agent):
                 scaled_importance = torch.softmax(
                     scaled_importance / self.importance_temperature, dim=-1
                 )
-                print(scaled_importance)
+                # print(scaled_importance)
             else:
                 scaled_importance = (
                     scaled_importance.abs() + self.importance_temperature
@@ -1551,7 +1559,7 @@ class PG(nn.Module, Agent):
                 if self.clip_grad:
                     torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
                     torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
-                    if self.mixer is not None:
+                    if self.mixer is not None and self.mix_type == "QMIX":
                         torch.nn.utils.clip_grad_norm_(self.mixer.parameters(), 0.5)
                 loss.backward()
                 self.optimizer.step()
@@ -1559,10 +1567,10 @@ class PG(nn.Module, Agent):
                 avg_actor_loss += actor_loss.item()
                 avg_critic_loss += critic_loss.item()
                 if isinstance(mb_c_entropy, torch.Tensor):
-                    mb_c_entropy = float(mb_c_entropy.mean().cpu())
+                    mb_c_entropy = mb_c_entropy.mean().cpu()
                 avg_c_entropy += mb_c_entropy
                 if isinstance(mb_d_entropy, torch.Tensor):
-                    mb_d_entropy = float(mb_d_entropy.mean().cpu())
+                    mb_d_entropy = mb_d_entropy.mean().cpu()
                 avg_d_entropy += mb_d_entropy
 
         num_updates = self.n_epochs * (len(indices) / self.mini_batch_size)
