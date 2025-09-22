@@ -541,10 +541,10 @@ def PG_hand_pick():
         advantage_type="gae",
         n_epochs=2,
         lr=1e-3,
-        mix_type=None,
+        mix_type="VDN",
         logit_reg=0.1,
         importance_schedule=[50, 1.0, 20000],
-        importance_from_grad=True,
+        importance_from_grad=False,
     )
 
     # Print current hyper parameters before episode start
@@ -637,11 +637,11 @@ def PG_hand_pick():
             print(f"Episode {ep_num}, total reward: {rewards[-2]}")
             ep_num += 1
 
-        # if qmem_buff.steps_recorded > mini_batch_size * 8 and i % 16 == 0:
-        #     mb = qmem_buff.sample_transitions(
-        #         batch_size=mini_batch_size, as_torch=True, device=model.device
-        #     )
-        #     rl_dict = model.reinforcement_learn(mb, 0, debug=False, critic_only=True)
+        if qmem_buff.steps_recorded > mini_batch_size * 8 and i % 16 == 0:
+            mb = qmem_buff.sample_transitions(
+                batch_size=mini_batch_size, as_torch=True, device=model.device
+            )
+            rl_dict = model.reinforcement_learn(mb, 0, debug=False, critic_only=True)
 
         if mem_buff.steps_recorded == batch_size:
             # print(model.action_clamp_type)

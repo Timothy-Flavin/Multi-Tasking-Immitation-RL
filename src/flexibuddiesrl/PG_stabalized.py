@@ -1355,9 +1355,13 @@ class PG(nn.Module, Agent):
                     next_d_adv,
                     next_c_adv,
                 )
+                # print(
+                #     f"self.mixer(next_adv, obs_)[0]: {self.mixer(next_adv, obs_)[0].shape}, next_values : {next_values.shape}"
+                # )
                 next_Q = (
                     self.mixer(next_adv, obs_)[0] + next_values  # type:ignore
                 ).squeeze(-1)
+                # print(f"next_Q: {next_Q.shape}")
             global_Q, global_GAE = self._weighted_gae(
                 rewards=rewards,
                 values=Q,
