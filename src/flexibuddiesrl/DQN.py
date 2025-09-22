@@ -326,8 +326,8 @@ class DQN(nn.Module, Agent):
             if self.has_discrete:
                 dact = []
                 for dh in disc_advantages:
-                    dact.append(torch.argmax(dh, dim=-1).unsqueeze(0))
-                torch.cat(dact, dim=0)
+                    dact.append(torch.argmax(dh, dim=-1).unsqueeze(-1))
+                dact = torch.cat(dact, dim=-1)
             if self.has_continuous:
                 cact = self._cont_from_q(cont_advantages)
 
