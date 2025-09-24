@@ -916,10 +916,12 @@ class PG(nn.Module, Agent):
         )
 
         if self.ppo_clip > 0:
-            logratio = (
-                cont_log_probs
-                - old_log_probs  # batch.continuous_log_probs[agent_num, indices]
-            )
+            if cont_log_probs.ndim != old_log_probs.ndim:
+                raise Exception(
+                    f"Something is wrong: clp {cont_log_probs.shape} oldlp {old_log_probs.shape}"
+                )
+            logratio = cont_log_probs - old_log_probs
+            # batch.continuous_log_probs[agent_num, indices]
 
             ratio = logratio.exp()
             pg_loss1 = advantages * ratio
@@ -938,20 +940,10 @@ class PG(nn.Module, Agent):
             actor_loss
             + self.logit_reg * (action_means[torch.abs(action_means) > 4.0] ** 2).mean()
         )
+        if torch.isnan(actor_loss):
+            actor_loss = 0.0
         if not torch.isnan(al):
             actor_loss += al
-        if torch.isnan(actor_loss):
-            actor_loss = (
-                self.logit_reg
-                * (action_means[torch.abs(action_means) > 4.0] ** 2).mean()
-            )
-            print("NaN in actor loss, setting to zero")
-            print(continuous_policy_gradient.mean())
-            print(cont_entropy)
-            print(
-                self.logit_reg
-                * (action_means[torch.abs(action_means) > 4.0] ** 2).mean()
-            )
         return actor_loss
 
     def _discrete_actor_loss(self, actions, log_probs, logits, advantages):
@@ -961,11 +953,13 @@ class PG(nn.Module, Agent):
             entropy = dist.entropy().mean()
             selected_log_probs = dist.log_prob(actions[:, head])
             if self.ppo_clip > 0:
+                old_lp = log_probs[:, head]
+                assert (
+                    old_lp.ndim == selected_log_probs.ndim
+                ), f"Log prob dims differ: old: {old_lp.shape} new: {selected_log_probs.shape}"
                 logratio = (
                     selected_log_probs
-                    - log_probs[
-                        :, head
-                    ]  # batch.discrete_log_probs[agent_num, indices, head]
+                    - old_lp  # batch.discrete_log_probs[agent_num, indices, head]
                 )
                 ratio = logratio.exp()
                 pg_loss1 = advantages.squeeze(-1) * ratio

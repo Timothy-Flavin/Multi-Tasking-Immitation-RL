@@ -10,7 +10,7 @@ import os
 import pickle
 import warnings
 import time
-
+import copy
 from enum import Enum
 
 
@@ -150,7 +150,9 @@ class DQN(nn.Module, Agent):
             dueling=dueling,
             n_c_action_bins=n_c_action_bins,
             device=device,
-            encoder=encoder,  # pass encoder if using one for observations (like in visual DQN)
+            encoder=copy.deepcopy(
+                encoder
+            ),  # pass encoder if using one for observations (like in visual DQN)
             head_hidden_dims=(
                 np.copy(np.array(head_hidden_dim))
                 if head_hidden_dim is not None
