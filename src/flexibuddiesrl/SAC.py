@@ -100,6 +100,7 @@ class SAC(Agent):
             std_type="full",
             clamp_type="tanh",
         )
+        self.encoder = self.actor.encoder
 
         print(
             f"obs dim: {obs_dim + action_dim} hdden dims: {hidden_dims} device: {device}"
