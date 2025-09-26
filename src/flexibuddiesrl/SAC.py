@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from typing import Any, Dict, List, Optional
+import copy
 
 
 class SAC(Agent):
@@ -272,11 +273,11 @@ class SAC(Agent):
             )
 
         return {
-            "discrete_action": self.tonumpy(discrete_actions),
-            "continuous_action": self.tonumpy(continuous_actions),
-            "discrete_log_prob": self.tonumpy(discrete_log_probs),
-            "continuous_log_prob": self.tonumpy(continuous_log_probs),
-            "value": 0,
+            "discrete_actions": self.tonumpy(discrete_actions),
+            "continuous_actions": self.tonumpy(continuous_actions),
+            "discrete_log_probs": self.tonumpy(discrete_log_probs),
+            "continuous_log_probs": self.tonumpy(continuous_log_probs),
+            "values": 0,
             "time": 0,
         }
 
