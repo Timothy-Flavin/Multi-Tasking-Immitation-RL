@@ -3,7 +3,6 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from typing import Any, Dict, List, Optional
-import copy
 
 
 class SAC(Agent):
@@ -275,10 +274,6 @@ class SAC(Agent):
         return {
             "discrete_actions": self.tonumpy(discrete_actions),
             "continuous_actions": self.tonumpy(continuous_actions),
-            "discrete_log_probs": self.tonumpy(discrete_log_probs),
-            "continuous_log_probs": self.tonumpy(continuous_log_probs),
-            "values": 0,
-            "time": 0,
         }
 
     def ego_actions(self, observations, action_mask=None) -> dict:
@@ -477,7 +472,7 @@ class SAC(Agent):
     ) -> dict:
         obs = batch.__getattr__("obs")[agent_num]
         obs_ = batch.__getattr__("obs_")[agent_num]
-        rewards = batch.__getattr__("global_reward")
+        rewards = batch.__getattr__("global_rewards")
         discrete_actions = batch.__getattr__("discrete_actions")[agent_num]
         continuous_actions = batch.__getattr__("continuous_actions")[agent_num]
 
