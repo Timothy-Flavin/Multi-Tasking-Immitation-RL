@@ -67,7 +67,7 @@ class PG(nn.Module, Agent):
         relative_entropy_loss=0.05,
         wall_time=False,
         joint_kl_penalty=0.1,
-        target_kl=0.01,
+        target_kl=0.1,
     ):
         super(PG, self).__init__()
         config = locals()
@@ -301,9 +301,9 @@ class PG(nn.Module, Agent):
             action_head_hidden_dims=action_head_hidden_dims,
             std_type=st,
             clamp_type=self.action_clamp_type,
-            log_std_clamp_range=(-5.0, 1.0),
+            log_std_clamp_range=(-3.0, 1.0),
         ).to(self.device)
-
+        self.log_std_clamp_range = (-3.0, 1.0)
         self.actor_logstd = None
         self.optimizer: torch.optim.Adam
         if self.std_type == "stateless":
@@ -774,7 +774,7 @@ class PG(nn.Module, Agent):
         #     )
         # log_probs = torch.clamp(log_probs, -100, 2)
         # eloss = eloss * 100
-        eloss = dist.entropy().clamp(min=-0.1).mean()
+        eloss = dist.entropy().mean()
         return log_probs, eloss
 
     def _print_grad_norm(self):
@@ -936,14 +936,12 @@ class PG(nn.Module, Agent):
             -self.policy_loss * continuous_policy_gradient.mean()
             - self.entropy_loss * cont_entropy
         )
-        al = (
-            actor_loss
-            + self.logit_reg * (action_means[torch.abs(action_means) > 4.0] ** 2).mean()
-        )
+        al = self.logit_reg * (action_means[torch.abs(action_means) > 4.0] ** 2).mean()
         if torch.isnan(actor_loss):
             actor_loss = 0.0
         if not torch.isnan(al):
             actor_loss += al
+        self.result_dict["c_entropy"] += cont_entropy.item()
         return actor_loss
 
     def _discrete_actor_loss(self, actions, log_probs, logits, advantages):
@@ -974,6 +972,8 @@ class PG(nn.Module, Agent):
                 -self.policy_loss * discrete_policy_gradient.mean()
                 - self.entropy_loss * entropy
             )
+            self.result_dict["d_entropy"] += entropy.item()
+
         return actor_loss
 
     def reinforcement_learn(
@@ -995,6 +995,14 @@ class PG(nn.Module, Agent):
                 "c_std": 0,
                 "rl_time": 0,
             }
+        self.result_dict = {
+            "rl_actor_loss": 0,
+            "rl_critic_loss": 0,
+            "d_entropy": 0,
+            "c_entropy": 0,
+            "c_std": 0,
+            "rl_time": t,
+        }
         # print(f"mix type: {self.mix_type}, adv type: {self.advantage_type}")
         if self.mix_type == "QMIX" or self.mix_type == "VDN":
             return self._mix_reinforcement_learn(batch, agent_num, critic_only, debug)
@@ -1111,14 +1119,10 @@ class PG(nn.Module, Agent):
         avg_critic_loss /= bnum
         if self.wall_time:
             t = time.time() - t
-        return {
-            "rl_actor_loss": avg_actor_loss,
-            "rl_critic_loss": avg_critic_loss,
-            "d_entropy": 0,
-            "c_entropy": 0,
-            "c_std": 0,
-            "rl_time": t,
-        }
+            self.result_dict["rl_time"] = t
+        self.result_dict["rl_actor_loss"] = avg_actor_loss
+        self.result_dict["rl_critic_loss"] = avg_critic_loss
+        return self.result_dict
 
     def _bin_continuous_actions(self, c_actions):
         """Given continuous actions we return the discretized bins that the critic is using"""
@@ -1191,9 +1195,9 @@ class PG(nn.Module, Agent):
 
     def _weighted_gae(
         self,
-        rewards: torch.Tensor,  # shape = [n_steps]
+        rewards: torch.Tensor,  # shape = [n_steps,1]
         values: torch.Tensor,  # shape = [n_steps]
-        bootstrap_values: torch.Tensor,  # shape = [n_steps]
+        bootstrap_values: torch.Tensor,  # shape = [n_steps,1]
         terminated: torch.Tensor,  # shape = [n_steps]
         truncated: torch.Tensor,  # shape = [n_steps]
         advantage_weights: torch.Tensor,  # shape = [n_steps, n_agents]
@@ -1215,9 +1219,17 @@ class PG(nn.Module, Agent):
             last_gae_lam = (
                 weighted_delta + gamma * gae_lambda * ep_not_over * last_gae_lam
             )
-
+            # print(f"Step {step}: reward {rewards[step]}, next_value {next_value}, value {values[step]}, delta {delta}")
+            # print(f"          advantage weight: {advantage_weights[step]}, weighted delta: {weighted_delta}, last_gae_lam: {last_gae_lam}")
+            # if step>num_steps-5:
+            #     input(f"step {step} done? ep_over: {ep_not_over}")
             advantages[step] = last_gae_lam
         G = advantages + values.unsqueeze(-1)
+        # print(f"Weighted GAE advantages: {advantages}")
+        # print(f"Weighted GAE G: {G}")
+        # print(f"Weighted GAE values: {values}")
+        # print(f"Rewards: {rewards}")
+        # input()
         return G, advantages
 
     def _continuous_log_probs_per_dim(self, logits, lstd_logits, actions):
@@ -1244,42 +1256,39 @@ class PG(nn.Module, Agent):
         if self.action_clamp_type == "tanh":
             log_probs -= 2 * (np.log(2) - activations - F.softplus(-2 * activations))
 
-        # if torch.min(log_probs) < -20:
-        #     print(
-        #         f"{self.action_clamp_type} Warning: log_probs has very low values: {torch.min(log_probs)}. "
-        #         "This might cause numerical instability."
-        #     )
-        #     print(log_probs < -20)
-        #     print(
-        #         f"from raw logit means: {logits[log_probs < -20]}, scale: {torch.exp(lstd)[log_probs < -20]} actions: {actions[log_probs < -20]}"
-        #     )
-        #     print(
-        #         f"diff: {(torch.clip(logits, -4.0, 4.0) - activations)[log_probs < -20]}"
-        #     )
-        #     print(f"lstd: {torch.exp(lstd)[log_probs < -20]}")
-        #     print(f"log probs: {log_probs[log_probs < -20]}")
-        #     eloss = 0.0
-        #     input("does this make sense?")
-        return log_probs, dist.entropy().clamp(min=-0.1).sum(-1)
+        c_entropy = dist.entropy().sum(-1)
+
+        if torch.min(log_probs) < -20:
+            print(
+                f"{self.action_clamp_type} Warning: log_probs has very low values: {torch.min(log_probs)}. "
+                "This might cause numerical instability. a"
+            )
+        return log_probs, c_entropy, dist
 
     def _log_probs_per_dim(self, obs, d_actions, c_actions):
         continuous_means, continuous_log_std_logits, discrete_logits = self.actor(obs)
 
         # print(
-        #     f"continuous_means: {continuous_means}\nclstdl: {continuous_log_std_logits}"
+        #     f"continuous_means: {continuous_means}\nclstdl: {continuous_log_std_logits} {self.std_type}"
         # )
         discrete_log_probs = None
         continuous_log_probs = None
+        c_dist = None
+        d_dist = None
         lp = []
         c_entropy = 0
         if self.continuous_action_dim > 0:
-            continuous_log_probs, c_entropy = self._continuous_log_probs_per_dim(
-                continuous_means, continuous_log_std_logits, c_actions
+            continuous_log_probs, c_entropy, c_dist = (
+                self._continuous_log_probs_per_dim(
+                    continuous_means, continuous_log_std_logits, c_actions
+                )
             )
             lp.append(continuous_log_probs)
             # print(f"continuous lp: {continuous_log_probs}")
         d_entropy = 0
+        d_dists = None
         if self.discrete_action_dims is not None and len(self.discrete_action_dims) > 0:
+            d_dists = []
             discrete_log_probs = torch.zeros(
                 discrete_logits[0].shape[0],
                 len(self.discrete_action_dims),
@@ -1287,6 +1296,7 @@ class PG(nn.Module, Agent):
             )
             for i, logits in enumerate(discrete_logits):
                 d_dist = torch.distributions.Categorical(logits=logits)
+                d_dists.append(d_dist)
                 discrete_log_probs[:, i] = d_dist.log_prob(d_actions[:, i])
                 d_entropy += d_dist.entropy().squeeze(-1)
             lp.append(discrete_log_probs)
@@ -1296,38 +1306,89 @@ class PG(nn.Module, Agent):
             logit_regularization_loss = (
                 continuous_means[torch.abs(continuous_means) > 4.0] ** 2
             ).mean()
+            # std_logit_reg = 0.0
+            # if continuous_log_std_logits is not None:
+            #     std_logit_reg = (
+            #         continuous_log_std_logits[
+            #             torch.abs(continuous_log_std_logits)
+            #             > self.log_std_clamp_range[1] + 1e-3
+            #         ]
+            #         ** 2
+            #     ).mean()
+            #     std_logit_reg += (
+            #         continuous_log_std_logits[
+            #             torch.abs(continuous_log_std_logits)
+            #             < self.log_std_clamp_range[0] - 1e-3
+            #         ]
+            #         ** 2
+            #     ).mean()
+            #     if not torch.isnan(std_logit_reg):
+            #         logit_regularization_loss += std_logit_reg
             if torch.isnan(logit_regularization_loss):
                 logit_regularization_loss = 0.0
-        return lp, d_entropy, c_entropy, logit_regularization_loss
+        return lp, d_entropy, c_entropy, logit_regularization_loss, d_dists, c_dist
 
-    def _mix_actor_loss(self, old_log_probs, new_log_probs, advantages, entropy):
+    def _mix_actor_loss(
+        self,
+        old_log_probs,
+        new_log_probs,
+        advantages,
+        entropy,
+        old_d_dists,
+        new_d_dists,
+        old_c_dists,
+        new_c_dists,
+    ):
         logratio = new_log_probs - old_log_probs
+        assert (
+            new_log_probs.ndim == old_log_probs.ndim
+        ), f"new lp {new_log_probs.shape} old lp {old_log_probs.shape}"
         ratio = torch.exp(logratio)
         # ratio_joint = torch.exp(new_log_probs.sum(-1) - old_log_probs.sum(-1))
         clip_ratio = torch.clamp(ratio, 1 - self.ppo_clip, 1 + self.ppo_clip)
-
+        # print(f" log probs: new {new_log_probs}, old {old_log_probs}")
         # PG loss
         pg_loss1 = advantages * ratio
         pg_loss2 = advantages * clip_ratio
+        # print(pg_loss1.shape, pg_loss2.shape)
         policy_loss = -(torch.min(pg_loss1, pg_loss2).sum(-1)).mean()
-
+        # print(f"policy loss before entropy and kl: {policy_loss.item()}")
+        # print(f"entropy loss: {self.entropy_loss *entropy.mean().item()}")
         # Entropy Bonus
         policy_loss -= self.entropy_loss * entropy.mean()
 
         # KL Divergence for joint distribution
-        kl_div = torch.nn.functional.kl_div(
-            new_log_probs, old_log_probs, reduction="none", log_target=True
-        )
-        joint_kl = kl_div.sum(-1).mean()
+        kl_div = 0
+        if old_d_dists is not None and new_d_dists is not None:
+            for old_d, new_d in zip(old_d_dists, new_d_dists):
+                # print("Discrete KL")
+                # print(old_d)
+                # print(new_d)
+                kl_div += torch.distributions.kl_divergence(old_d, new_d)
+                # print(kl_div.mean())
+        if old_c_dists is not None and new_c_dists is not None:
+            # print("Continuous KL")
+            # print(old_c_dists)
+            # print(new_c_dists)
+            kl_div += torch.distributions.kl_divergence(old_c_dists, new_c_dists).sum(
+                -1
+            )
+            # print(kl_div.mean())
+
+        joint_kl = kl_div.mean()
+        # print(f"KL Divergence loss: {self.joint_kl_penalty * joint_kl.item()}")
         policy_loss += self.joint_kl_penalty * joint_kl
 
+        # print(f"joint_kl: {joint_kl.item()}, penalty: {self.joint_kl_penalty}")
+        # print(f"policy_loss: {policy_loss}")
         if joint_kl > self.target_kl:
             self.joint_kl_penalty *= 1.5
         elif joint_kl < self.target_kl / 1.5:
             self.joint_kl_penalty /= 1.5
-        self.joint_kl_penalty = min(max(self.joint_kl_penalty, 1e-4), 10000)
+        self.joint_kl_penalty = min(max(self.joint_kl_penalty, 1e-4), 100)
+        # input()
 
-        return policy_loss
+        return policy_loss, joint_kl
 
     def _mix_critic_only(self, batch: FlexiBatch, agent_num):
         obs = batch.__getattr__(self.batch_name_map["obs"])[agent_num]
@@ -1389,6 +1450,29 @@ class PG(nn.Module, Agent):
             "rl_critic_loss": critic_loss.item(),
         }
 
+    def _get_dists(self, obs):
+        d_dists, c_dist = None, None
+        continuous_means, continuous_log_std_logits, discrete_logits = self.actor(obs)
+        if self.discrete_action_dims is not None and len(self.discrete_action_dims) > 0:
+            d_dists = []
+            for i, logits in enumerate(discrete_logits):
+                d_dist = torch.distributions.Categorical(logits=logits)
+                d_dists.append(d_dist)
+        if self.continuous_action_dim > 0:
+            lstd = -1.0
+            if self.actor_logstd is not None:
+                lstd = self.actor_logstd.expand_as(continuous_means)
+            else:
+                assert (
+                    continuous_log_std_logits is not None
+                ), "If the actor doesnt generate logits then it needs to have a global logstd"
+                lstd = continuous_log_std_logits.expand_as(continuous_means)
+            c_dist = torch.distributions.Normal(
+                loc=torch.clip(continuous_means, min=-4.0, max=4.0),
+                scale=torch.exp(lstd),
+            )
+        return d_dists, c_dist
+
     def _mix_reinforcement_learn(
         self, batch: FlexiBatch, agent_num, critic_only, debug
     ):
@@ -1424,8 +1508,8 @@ class PG(nn.Module, Agent):
         with torch.no_grad():
             Q = (self.mixer(adv, obs)[0] + values).squeeze(-1)
             next_values, next_d_adv, next_c_adv = self.critic(obs_)
-            old_log_probs, old_d_ent, old_c_end, _ = self._log_probs_per_dim(
-                obs, d_actions, c_actions
+            old_log_probs, old_d_ent, old_c_end, _, old_d_dist, old_c_dist = (
+                self._log_probs_per_dim(obs, d_actions, c_actions)
             )
             if self.on_policy_mixer:
                 next_adv = 0
@@ -1438,10 +1522,17 @@ class PG(nn.Module, Agent):
                 next_Q = (self.mixer(next_adv, obs_)[0] + next_values).squeeze(-1)
             # critic_target = rewards + self.gamma * (1.0 - terminated) * next_Q
             if self.importance_from_grad:
+                # print(f" grad_free_adv: {grad_free_adv.shape}, adv_grad: {adv_grad.shape}")
                 scaled_importance = grad_free_adv * adv_grad
             else:
+                # print(f" raw_importance: {raw_importance.shape}, adv_grad: {adv_grad.shape}")
                 raw_importance = self._gather_importance(d_adv, c_adv.detach())
                 scaled_importance = raw_importance * adv_grad
+            # print("raw importance:")
+            # print(scaled_importance)
+            # scaled_importance = scaled_importance*0 + 1.0 # testing
+            # print("scaled importance before update:")
+            # print(scaled_importance)
             self._update_importance()
 
             if self.softmax_importance_scale:
@@ -1456,8 +1547,10 @@ class PG(nn.Module, Agent):
                 scaled_importance /= scaled_importance.sum(dim=-1).unsqueeze(-1)
 
             # So learning rate doesn't shrink with number of agents
-            scaled_importance *= grad_free_adv.shape[-1]
-
+            # scaled_importance *= grad_free_adv.shape[-1]
+            # print("scaled importance after update:")
+            # print(scaled_importance)
+            # input()
             G, gae = self._weighted_gae(
                 rewards=rewards,
                 values=Q,
@@ -1468,7 +1561,7 @@ class PG(nn.Module, Agent):
                 gamma=self.gamma,
                 gae_lambda=self.gae_lambda,
             )
-
+            # print(f"Q shape: {Q.shape}, G shape: {next_Q.shape}")
             global_Q, global_GAE = self._weighted_gae(
                 rewards=rewards,
                 values=Q,
@@ -1479,21 +1572,48 @@ class PG(nn.Module, Agent):
                 gamma=self.gamma,
                 gae_lambda=self.gae_lambda,
             )
-
+            # print(f"global_Q shape: {global_Q.shape}, global_G shape: {global_Q} gamma: {self.gamma}")
+        # print(rewards)
         indices = np.arange(0, obs.shape[0])
         avg_actor_loss = 0.0
         avg_critic_loss = 0.0
         avg_d_entropy = 0.0
         avg_c_entropy = 0.0
+        tot_joint_kl = 0.0
+        bnum = 0
 
+        # Getting old distributions for KL penalty
+
+        gae = gae.detach()
         if self.norm_advantages:
             gae = (gae - gae.mean()) / (gae.std() + 1e-8)
         for k in range(self.n_epochs):
             # Shuffle indices at the start of each epoch
             np.random.shuffle(indices)
-            # TODO: Loop through mini-batches
-            for start in range(0, len(indices), self.mini_batch_size):
 
+            with torch.no_grad():
+                old_d_dists = []
+                old_c_dists = []
+                for start in range(0, len(indices), self.mini_batch_size):
+                    end = start + self.mini_batch_size
+                    mini_batch_indices = indices[start:end]
+                    mb_obs = obs[mini_batch_indices]
+                    # print(f"mb_obs: {mb_obs.shape}")
+                    old_d_dist, old_c_dist = self._get_dists(mb_obs)
+                    old_d_dists.append(old_d_dist)
+                    old_c_dists.append(old_c_dist)
+                # print(f"Got {len(old_d_dists)} old discrete dists and {len(old_c_dists)} old continuous dists")
+                # print("old d dist example:")
+                # if old_d_dists[0] is not None and len(old_d_dists[0]) > 0:
+                #    print(old_d_dists[0][0].logits)
+                # print("old c dist example:")
+                # if old_c_dists[0] is not None:
+                #    print(old_c_dists[0].loc, old_c_dists[0].scale)
+
+            # TODO: Loop through mini-batches
+            dist_steps = 0
+            for start in range(0, len(indices), self.mini_batch_size):
+                bnum += 1
                 # Get mini batch indices
                 end = start + self.mini_batch_size
                 mini_batch_indices = indices[start:end]
@@ -1506,24 +1626,64 @@ class PG(nn.Module, Agent):
                 mb_gae = gae[mini_batch_indices]
                 mb_global_Q = global_Q[mini_batch_indices]
 
+                # for m in range(10):
+                #     mb_values, mb_d_adv, mb_c_adv = self.critic(mb_obs)
+                #     mb_adv = self._gather_observed_advantages(
+                #         mb_d_adv, mb_c_adv, mb_d_actions, mb_c_actions
+                #     )
+                #     mb_Q = (self.mixer(mb_adv, mb_obs)[0] + mb_values).squeeze(-1)
+                #     if isinstance(mb_values, torch.Tensor):
+                #         assert self.mixer(mb_adv, mb_obs)[0].shape == mb_values.shape, f"Shapes don't match in mix rl: {self.mixer(mb_adv, mb_obs)[0].shape} vs {mb_values.shape}"
+                #         assert mb_Q.shape == mb_global_Q.squeeze(-1).shape, f"Shapes don't match in mix rl: {mb_Q.shape} vs {mb_global_Q.squeeze(-1).shape}"
+                #     critic_loss = ((mb_Q - mb_global_Q.squeeze(-1)) ** 2).mean()
+                #     self.optimizer.zero_grad()
+                #     critic_loss.backward()
+                #     self.optimizer.step()
+                #     print(f"  Critic update {m}, loss: {critic_loss.item()}")
                 mb_values, mb_d_adv, mb_c_adv = self.critic(mb_obs)
                 mb_adv = self._gather_observed_advantages(
                     mb_d_adv, mb_c_adv, mb_d_actions, mb_c_actions
                 )
                 mb_Q = (self.mixer(mb_adv, mb_obs)[0] + mb_values).squeeze(-1)
+                if isinstance(mb_values, torch.Tensor):
+                    if isinstance(mb_values, torch.Tensor):
+                        assert (
+                            self.mixer(mb_adv, mb_obs)[0].shape == mb_values.shape
+                        ), f"Shapes don't match in mix rl: {self.mixer(mb_adv, mb_obs)[0].shape} vs {mb_values.shape}"
+                        assert (
+                            mb_Q.shape == mb_global_Q.squeeze(-1).shape
+                        ), f"Shapes don't match in mix rl: {mb_Q.shape} vs {mb_global_Q.squeeze(-1).shape}"
                 critic_loss = ((mb_Q - mb_global_Q.squeeze(-1)) ** 2).mean()
+                # input()
+                # print(f"mb_Q: {mb_Q.mean()}, mb_global_Q: {mb_global_Q.squeeze(-1).mean()}")
+                # input(f"are these similar? {(mb_Q - mb_global_Q.squeeze(-1)).mean()}")
+                assert (
+                    mb_Q.shape == mb_global_Q.squeeze(-1).shape
+                ), f"Shapes don't match in mix rl: {mb_Q.shape} vs {mb_global_Q.squeeze(-1).shape}"
                 # print(
                 #     f" mb_Q: {mb_Q.shape}, mb_global_Q: {mb_global_Q.squeeze(-1).shape}"
                 # )
                 # print(f"critic loss: {critic_loss.item()}")
 
-                mb_new_log_probs, mb_d_entropy, mb_c_entropy, mb_logit_regulrization = (
-                    self._log_probs_per_dim(mb_obs, mb_d_actions, mb_c_actions)
-                )
-                mb_entropy = mb_d_entropy + self.relative_entropy_loss * mb_c_entropy
-                if torch.min(mb_new_log_probs) < -15:
+                (
+                    mb_new_log_probs,
+                    mb_d_entropy,
+                    mb_c_entropy,
+                    mb_logit_regulrization,
+                    mb_d_dist,
+                    mb_c_dist,
+                ) = self._log_probs_per_dim(mb_obs, mb_d_actions, mb_c_actions)
+                # print(mb_d_entropy, mb_c_entropy)
+                if isinstance(mb_d_entropy, torch.Tensor) and isinstance(
+                    mb_c_entropy, torch.Tensor
+                ):
+                    assert (
+                        mb_d_entropy.shape == mb_c_entropy.shape
+                    ), f"Entropy shapes don't match: {mb_d_entropy.shape} vs {mb_c_entropy.shape}"
+                mb_entropy = mb_d_entropy + mb_c_entropy  # self.relative_entropy_loss *
+                if torch.min(mb_new_log_probs) < -20:
                     print(
-                        f"Bad log prob default to regularization only {torch.min(mb_new_log_probs)}"
+                        f"Bad log prob bnum {bnum} default to regularization only {torch.min(mb_new_log_probs)}"
                     )
                     # self.optimizer.state = collections.defaultdict(dict)
                     # continuous_means, continuous_log_std_logits, discrete_logits = (
@@ -1542,12 +1702,18 @@ class PG(nn.Module, Agent):
                     # continue
 
                 # Sum and Normalize loss grads
-                actor_loss = (
-                    self._mix_actor_loss(
-                        mb_old_log_probs, mb_new_log_probs, mb_gae, mb_entropy
-                    )
-                    + mb_logit_regulrization
+                actor_loss, joint_kl = self._mix_actor_loss(
+                    mb_old_log_probs,
+                    mb_new_log_probs,
+                    mb_gae,
+                    mb_entropy,
+                    old_d_dists[dist_steps],
+                    mb_d_dist,
+                    old_c_dists[dist_steps],
+                    mb_c_dist,
                 )
+                actor_loss += mb_logit_regulrization
+
                 loss = self.value_loss_coef * critic_loss + actor_loss
                 self.optimizer.zero_grad()
                 if self.clip_grad:
@@ -1561,13 +1727,16 @@ class PG(nn.Module, Agent):
                 avg_actor_loss += actor_loss.item()
                 avg_critic_loss += critic_loss.item()
                 if isinstance(mb_c_entropy, torch.Tensor):
-                    mb_c_entropy = mb_c_entropy.mean().cpu()
+                    mb_c_entropy = mb_c_entropy.mean().cpu().item()
                 avg_c_entropy += mb_c_entropy
                 if isinstance(mb_d_entropy, torch.Tensor):
-                    mb_d_entropy = mb_d_entropy.mean().cpu()
+                    mb_d_entropy = mb_d_entropy.mean().cpu().item()
                 avg_d_entropy += mb_d_entropy
-
-        num_updates = self.n_epochs * (len(indices) / self.mini_batch_size)
+                dist_steps += 1
+                if isinstance(joint_kl, torch.Tensor):
+                    tot_joint_kl += joint_kl.item()
+        num_updates = bnum  # self.n_epochs * (len(indices) / self.mini_batch_size)
+        avg_joint_kl = tot_joint_kl / num_updates
         avg_actor_loss /= num_updates
         avg_critic_loss /= num_updates
         avg_c_entropy /= num_updates
@@ -1581,6 +1750,7 @@ class PG(nn.Module, Agent):
             "c_entropy": avg_c_entropy,
             "c_std": self.mean_std,
             "rl_time": t,
+            "joint_kl": avg_joint_kl,
         }
 
     def _dump_attr(self, attr, path):
