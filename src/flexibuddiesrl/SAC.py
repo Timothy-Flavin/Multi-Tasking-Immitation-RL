@@ -3,6 +3,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from typing import Any, Dict, List, Optional
+import copy
 
 
 class SAC(Agent):
@@ -101,10 +102,12 @@ class SAC(Agent):
             clamp_type="tanh",
         )
         self.encoder = self.actor.encoder
+        # print(f" encoder in sac init: {self.encoder}")
 
-        print(
-            f"obs dim: {obs_dim + action_dim} hdden dims: {hidden_dims} device: {device}"
-        )
+        # print(
+        #     f"obs dim: {obs_dim + action_dim} hdden dims: {hidden_dims} device: {device}"
+        # )
+        # input()
         # input()
         if self.critic_mode == "V":
             self._get_V_critics()
@@ -133,7 +136,26 @@ class SAC(Agent):
         if self.discrete_action_dims is not None and len(self.discrete_action_dims) > 0:
             target_disc = float(np.sum(np.log(self.discrete_action_dims)))
         self.target_entropy = -float(self.continuous_action_dim) - target_disc
+        # if self.critic_mode == "V":
+        #     print(f"Q1 dtype: {self.Q1.l1.weight.dtype} device: {self.Q1.fc1.weight.device}")
+        #     print(f"Q2 dtype: {self.Q2.l1.weight.dtype} device: {self.Q2.fc1.weight.device}")
+        #     print(f"Target_Q1 dtype: {self.Q1_target.l1.weight.dtype} device: {self.Q1_target.fc1.weight.device}")
+        #     print(f"Target_Q2 dtype: {self.Q2_target.l1.weight.dtype} device: {self.Q2_target.fc1.weight.device}")
 
+        # else:
+        #     for p in self.Q1.parameters():
+        #         print(f"  Q1 param dtype: {p.dtype} device: {p.device}")
+        #     for p in self.Q2.parameters():
+        #         print(f"  Q2 param dtype: {p.dtype} device: {p.device}")
+        #     for p in self.Q1_target.parameters():
+        #         print(f"  Target Q1 param dtype: {p.dtype} device: {p.device}")
+        #     for p in self.Q2_target.parameters():
+        #         print(f"  Target Q2 param dtype: {p.dtype} device: {p.device}")
+        # for a in self.actor.action_layers:
+        #     for p in a.parameters():
+        #         print(f"  Actor action head param dtype: {p.dtype} device: {p.device}")
+        # print(f"encoder dtype: {self.encoder.encoder[0].weight.dtype} device: {self.encoder.encoder[0].weight.device}")
+        # input()
         # Update cadence control
         self._step_counter = 0
 
@@ -167,6 +189,12 @@ class SAC(Agent):
             activation=self.activation,
             orthogonal_init=self.orthogonal_init,
         )
+        for p in self.Q1_target.parameters():
+            p.requires_grad_(False)
+        for p in self.Q2_target.parameters():
+            p.requires_grad_(False)
+        self.Q1_target.eval()
+        self.Q2_target.eval()
 
         # Hard copy critic->target initially
         self._hard_update(self.Q1_target, self.Q1)
@@ -205,6 +233,7 @@ class SAC(Agent):
             verbose=False,
             QMIX=False,
         )
+
         self.Q1_target = QS(
             self.obs_dim + self.continuous_action_dim,
             continuous_action_dim=0,
@@ -237,6 +266,12 @@ class SAC(Agent):
             verbose=False,
             QMIX=False,
         )
+        for p in self.Q1_target.parameters():
+            p.requires_grad = False
+        for p in self.Q2_target.parameters():
+            p.requires_grad = False
+        self.Q1_target.eval()
+        self.Q2_target.eval()
         # Hard copy critic->target initially
         self._hard_update(self.Q1_target, self.Q1)
         self._hard_update(self.Q2_target, self.Q2)
@@ -463,9 +498,18 @@ class SAC(Agent):
         just like taking a train action which is equal in
         expectation to the current policy.
         """
-        # Deterministic greedy action from the current policy
-        out = self.ego_actions(obs)
-        return out.get("continuous_action"), out.get("discrete_action")
+        with torch.no_grad():
+            # Deterministic greedy action from the current policy
+            out = self.ego_actions(obs)
+            ca = out.get("continuous_action")
+            if isinstance(ca, list):
+                ca = ca[0]
+            da = out.get("discrete_action")
+            if isinstance(da, list):
+                da = np.stack(da, axis=-1)
+            da = torch.as_tensor(da, device=self.device) if da is not None else None
+            ca = torch.as_tensor(ca, device=self.device) if ca is not None else None
+        return da, ca
 
     def reinforcement_learn(
         self, batch, agent_num=0, critic_only=False, debug=False
@@ -475,6 +519,17 @@ class SAC(Agent):
         rewards = batch.__getattr__("global_rewards")
         discrete_actions = batch.__getattr__("discrete_actions")[agent_num]
         continuous_actions = batch.__getattr__("continuous_actions")[agent_num]
+
+        if obs.requires_grad:
+            obs = obs.detach()
+        if obs_.requires_grad:
+            obs_ = obs_.detach()
+        if rewards.requires_grad:
+            rewards = rewards.detach()
+        if discrete_actions is not None and discrete_actions.requires_grad:
+            discrete_actions = discrete_actions.detach()
+        if continuous_actions is not None and continuous_actions.requires_grad:
+            continuous_actions = continuous_actions.detach()
 
         # Optional fields
         try:

@@ -344,6 +344,15 @@ class StochasticActor(nn.Module):
                 activation=activation,
                 dropout=0,
             )
+        elif encoder is not None:
+            self.encoder = encoder
+            self.obs_dim = (
+                encoder.encoder[-1].out_features
+                if hasattr(encoder, "encoder")
+                else hidden_dims[-1]
+            )  # type: ignore
+
+        # print(f"Encoder in StochasticActor: {self.encoder}")
 
         assert not (
             continuous_action_dim == 0 and discrete_action_dims is None
@@ -590,7 +599,11 @@ class StochasticActor(nn.Module):
                 )
                 continuous_activations = c_dist.rsample()
 
+            assert (
+                continuous_activations.shape[-1] == self.action_scales.shape[-1]
+            ), f"make sure scales match dims {continuous_activations.shape}, {self.action_scales.shape}"
             if self.clamp_type == "tanh":
+
                 continuous_actions = (
                     torch.tanh(continuous_activations)  # torch.clamp()?
                     * self.action_scales

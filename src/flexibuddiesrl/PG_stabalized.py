@@ -67,7 +67,7 @@ class PG(nn.Module, Agent):
         relative_entropy_loss=0.05,
         wall_time=False,
         joint_kl_penalty=0.1,
-        target_kl=0.1,
+        target_kl=0.05,
     ):
         super(PG, self).__init__()
         config = locals()
@@ -96,6 +96,7 @@ class PG(nn.Module, Agent):
 
         # Set up the normal PPO params
         self.continuous_action_dim = continuous_action_dim
+        print(f"PPO.py Continuous action dim: {self.continuous_action_dim}")
         self.discrete_action_dims = discrete_action_dims
         self.batch_name_map = batch_name_map
         self.eval_mode = eval_mode
@@ -382,7 +383,7 @@ class PG(nn.Module, Agent):
                 print(
                     f"  After actor: clog {continuous_logits}, dlog{discrete_action_logits}"
                 )
-
+            # print(f"ppo.py clog: {continuous_logits}")
             try:
                 (
                     discrete_actions,
@@ -414,13 +415,14 @@ class PG(nn.Module, Agent):
         # print(f"in train action lp: {continuous_log_probs}")
         if self.wall_time:
             t = time.time() - t
-        return {
+        act = {
             "discrete_actions": self._to_numpy(discrete_actions),
             "continuous_actions": self._to_numpy(continuous_actions),
             "discrete_log_probs": self._to_numpy(discrete_log_probs),
             "continuous_log_probs": self._to_numpy(continuous_log_probs),
             "act_time": t,
         }
+        return act
 
     def stable_greedy(self, obs, legal_action):
         ad = self.train_actions(
@@ -973,7 +975,6 @@ class PG(nn.Module, Agent):
                 - self.entropy_loss * entropy
             )
             self.result_dict["d_entropy"] += entropy.item()
-
         return actor_loss
 
     def reinforcement_learn(
@@ -1195,9 +1196,9 @@ class PG(nn.Module, Agent):
 
     def _weighted_gae(
         self,
-        rewards: torch.Tensor,  # shape = [n_steps,1]
+        rewards: torch.Tensor,  # shape = [n_steps]
         values: torch.Tensor,  # shape = [n_steps]
-        bootstrap_values: torch.Tensor,  # shape = [n_steps,1]
+        bootstrap_values: torch.Tensor,  # shape = [n_steps]
         terminated: torch.Tensor,  # shape = [n_steps]
         truncated: torch.Tensor,  # shape = [n_steps]
         advantage_weights: torch.Tensor,  # shape = [n_steps, n_agents]
@@ -1219,17 +1220,9 @@ class PG(nn.Module, Agent):
             last_gae_lam = (
                 weighted_delta + gamma * gae_lambda * ep_not_over * last_gae_lam
             )
-            # print(f"Step {step}: reward {rewards[step]}, next_value {next_value}, value {values[step]}, delta {delta}")
-            # print(f"          advantage weight: {advantage_weights[step]}, weighted delta: {weighted_delta}, last_gae_lam: {last_gae_lam}")
-            # if step>num_steps-5:
-            #     input(f"step {step} done? ep_over: {ep_not_over}")
+
             advantages[step] = last_gae_lam
         G = advantages + values.unsqueeze(-1)
-        # print(f"Weighted GAE advantages: {advantages}")
-        # print(f"Weighted GAE G: {G}")
-        # print(f"Weighted GAE values: {values}")
-        # print(f"Rewards: {rewards}")
-        # input()
         return G, advantages
 
     def _continuous_log_probs_per_dim(self, logits, lstd_logits, actions):
@@ -1261,7 +1254,7 @@ class PG(nn.Module, Agent):
         if torch.min(log_probs) < -20:
             print(
                 f"{self.action_clamp_type} Warning: log_probs has very low values: {torch.min(log_probs)}. "
-                "This might cause numerical instability. a"
+                # "This might cause numerical instability."
             )
         return log_probs, c_entropy, dist
 
@@ -1306,24 +1299,6 @@ class PG(nn.Module, Agent):
             logit_regularization_loss = (
                 continuous_means[torch.abs(continuous_means) > 4.0] ** 2
             ).mean()
-            # std_logit_reg = 0.0
-            # if continuous_log_std_logits is not None:
-            #     std_logit_reg = (
-            #         continuous_log_std_logits[
-            #             torch.abs(continuous_log_std_logits)
-            #             > self.log_std_clamp_range[1] + 1e-3
-            #         ]
-            #         ** 2
-            #     ).mean()
-            #     std_logit_reg += (
-            #         continuous_log_std_logits[
-            #             torch.abs(continuous_log_std_logits)
-            #             < self.log_std_clamp_range[0] - 1e-3
-            #         ]
-            #         ** 2
-            #     ).mean()
-            #     if not torch.isnan(std_logit_reg):
-            #         logit_regularization_loss += std_logit_reg
             if torch.isnan(logit_regularization_loss):
                 logit_regularization_loss = 0.0
         return lp, d_entropy, c_entropy, logit_regularization_loss, d_dists, c_dist
