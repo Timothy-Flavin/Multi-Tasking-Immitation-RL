@@ -100,6 +100,7 @@ class SAC(Agent):
             std_type="full",
             clamp_type="tanh",
         )
+        self.encoder = self.actor.encoder
 
         print(
             f"obs dim: {obs_dim + action_dim} hdden dims: {hidden_dims} device: {device}"
@@ -271,12 +272,8 @@ class SAC(Agent):
             )
 
         return {
-            "discrete_action": self.tonumpy(discrete_actions),
-            "continuous_action": self.tonumpy(continuous_actions),
-            "discrete_log_prob": self.tonumpy(discrete_log_probs),
-            "continuous_log_prob": self.tonumpy(continuous_log_probs),
-            "value": 0,
-            "time": 0,
+            "discrete_actions": self.tonumpy(discrete_actions),
+            "continuous_actions": self.tonumpy(continuous_actions),
         }
 
     def ego_actions(self, observations, action_mask=None) -> dict:
@@ -475,7 +472,7 @@ class SAC(Agent):
     ) -> dict:
         obs = batch.__getattr__("obs")[agent_num]
         obs_ = batch.__getattr__("obs_")[agent_num]
-        rewards = batch.__getattr__("global_reward")
+        rewards = batch.__getattr__("global_rewards")
         discrete_actions = batch.__getattr__("discrete_actions")[agent_num]
         continuous_actions = batch.__getattr__("continuous_actions")[agent_num]
 

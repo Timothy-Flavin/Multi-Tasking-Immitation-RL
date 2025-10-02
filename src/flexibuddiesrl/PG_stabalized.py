@@ -1109,8 +1109,8 @@ class PG(nn.Module, Agent):
 
                 self.optimizer.step()
 
-                avg_actor_loss += actor_loss.to("cpu").item()
-                avg_critic_loss += critic_loss.to("cpu").item()
+                avg_actor_loss += actor_loss.to("cpu").detach().item()
+                avg_critic_loss += critic_loss.to("cpu").detach().item()
             # avg_actor_loss /= nbatch
             # avg_critic_loss /= nbatch
             # print(f"actor_loss: {actor_loss.item()}")
@@ -1743,7 +1743,8 @@ class PG(nn.Module, Agent):
         avg_d_entropy /= num_updates
         if self.wall_time:
             t = time.time() - t
-        return {
+
+        result = {
             "rl_actor_loss": avg_actor_loss,
             "rl_critic_loss": avg_critic_loss,
             "d_entropy": avg_d_entropy,
@@ -1752,6 +1753,20 @@ class PG(nn.Module, Agent):
             "rl_time": t,
             "joint_kl": avg_joint_kl,
         }
+        # Turn any tensor params into numpy.
+        # Detach gradient if has grad and send to cpu if on gpu
+        for k in result.keys():
+            v = result[k]
+            if isinstance(v, torch.Tensor):
+                v = v.detach()
+                if v.requires_grad:
+                    v = v.cpu()
+                if v.numel() == 1:
+                    v = v.item()
+                else:
+                    v = v.cpu().numpy()
+                result[k] = v
+        return
 
     def _dump_attr(self, attr, path):
         f = open(path, "wb")

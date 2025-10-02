@@ -226,7 +226,7 @@ def SAC_integration():
             # Build environment action
             d_act, c_act = 0, 0
             if cdim > 0:
-                c_act = act.get("continuous_action")
+                c_act = act.get("continuous_actions")
                 c_np = (
                     c_act.detach().cpu().numpy()
                     if isinstance(c_act, torch.Tensor)
@@ -238,7 +238,7 @@ def SAC_integration():
 
                 env_action = np.clip(c_np, -1.0, 1.0)
             else:
-                d_act = act.get("discrete_action")
+                d_act = act.get("discrete_actions")
                 env_action = d_act - 1  # type:ignore
 
                 # default_dact = np.array(
