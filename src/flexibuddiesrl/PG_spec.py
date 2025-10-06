@@ -467,7 +467,7 @@ def PG_integration():
 
 
 def PG_hand_pick():
-    continuous = False
+    continuous = True
     if continuous:
         cdim = 2
         ddim = None
@@ -477,7 +477,7 @@ def PG_hand_pick():
 
     ppo_clip = 0.1
     batch_size = 1024
-    mini_batch_size = 256
+    mini_batch_size = 64
 
     std_type = "stateless"
     mem_buff = FlexibleBuffer(
@@ -528,7 +528,7 @@ def PG_hand_pick():
         min_actions=(np.array([-1, -1]) if cdim > 0 else np.zeros(2)),
         max_actions=(np.array([1, 1]) if cdim > 0 else np.zeros(2)),
         device="cpu",
-        entropy_loss=0.02,
+        entropy_loss=0.01,
         ppo_clip=ppo_clip,
         value_clip=0.2,
         norm_advantages=True,
@@ -541,13 +541,13 @@ def PG_hand_pick():
         advantage_type="gae",
         n_epochs=2,
         lr=1e-3,
-        mix_type="VDN",
-        logit_reg=0.1,
+        mix_type=None,
+        logit_reg=0.0,
         importance_schedule=[50, 1.0, 20000],
         importance_from_grad=True,
         joint_kl_penalty=0.1,
         target_kl=0.1,
-        gae_lambda=0.9,
+        gae_lambda=0.95,
         on_policy_mixer=True,
         mixer_dim=256,
     )
@@ -561,7 +561,7 @@ def PG_hand_pick():
     ep_num = 0
     ep_step = 0
 
-    for i in range(100000):
+    for i in range(400000):
         with torch.no_grad():
             env_action = 0
             default_dact = np.zeros((1), dtype=np.int64)

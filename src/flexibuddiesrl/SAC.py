@@ -506,7 +506,7 @@ class SAC(Agent):
                 ca = ca[0]
             da = out.get("discrete_action")
             if isinstance(da, list):
-                da = np.stack(da, axis=-1)
+                da = torch.stack(da, dim=-1)
             da = torch.as_tensor(da, device=self.device) if da is not None else None
             ca = torch.as_tensor(ca, device=self.device) if ca is not None else None
         return da, ca
