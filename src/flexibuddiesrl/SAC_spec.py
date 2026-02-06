@@ -45,7 +45,7 @@ def SAC_test():
         name="sac_spec_buffer",
         memory_weights=False,
         global_registered_vars={
-            "global_reward": (None, np.float32),
+            "global_rewards": (None, np.float32),
         },
         individual_registered_vars={
             "obs": ([obs_dim], np.float32),
@@ -60,7 +60,7 @@ def SAC_test():
         mem_buff.save_transition(
             terminated=bool(random.randint(0, 1)),
             registered_vals={
-                "global_reward": i * 1.01,
+                "global_rewards": i * 1.01,
                 "obs": np.array([obs_batch[i]]),
                 "obs_": np.array([obs_batch_[i]]),
                 "discrete_actions": [dacs[i]],
@@ -151,17 +151,23 @@ def SAC_test():
                 mb.__getattr__("discrete_actions")[0],
             )
         except Exception as e:
-            print("SAC_spec: imitation_learn failed with: ", e)
-            print("obs shape:", mb.__getattr__("obs").shape)
-            print("ca shape:", mb.__getattr__("continuous_actions").shape)
-            print("da shape:", mb.__getattr__("discrete_actions").shape)
+            msg = f"SAC_spec: imitation_learn failed with: {e}\n"
+            msg += f"obs shape: {mb.__getattr__('obs').shape}\n"
+            msg += f"ca shape: {mb.__getattr__('continuous_actions').shape}\n"
+            msg += f"da shape: {mb.__getattr__('discrete_actions').shape}\n"
+            print(msg)
+            with open("SAC_log.txt", "a") as f:
+                f.write(msg + "\n")
             raise
 
         try:
             _ = model.reinforcement_learn(mb, 0)
         except Exception as e:
-            print("SAC_spec: reinforcement_learn failed with: ", e)
-            print("config:", h)
+            msg = f"SAC_spec: reinforcement_learn failed with: {e}\n"
+            msg += f"config: {h}\n"
+            print(msg)
+            with open("SAC_log.txt", "a") as f:
+                f.write(msg + "\n")
             raise
 
     print(tot)
@@ -187,7 +193,7 @@ def SAC_integration():
             name="sac_integration_buffer",
             memory_weights=False,
             global_registered_vars={
-                "global_reward": (None, np.float32),
+                "global_rewards": (None, np.float32),
             },
             individual_registered_vars={
                 "obs": ([8], np.float32),
@@ -252,7 +258,7 @@ def SAC_integration():
                 terminated=terminated,
                 truncated=truncated,
                 registered_vals={
-                    "global_reward": reward,
+                    "global_rewards": reward,
                     "obs": [obs.copy().astype(np.float32)],
                     "obs_": [obs_.copy().astype(np.float32)],
                     "discrete_actions": d_act,
@@ -313,5 +319,5 @@ def SAC_integration():
 
 
 if __name__ == "__main__":
-    # SAC_test()
+    SAC_test()
     SAC_integration()

@@ -204,9 +204,10 @@ def PG_test():
         if (d_acts is not None and d_acts.shape[0] != 2) or (
             c_acts is not None and c_acts.shape[0] != 5
         ):
-            print(
-                f"Training actions: c: {c_acts}, d: {d_acts}, d_log: {d_log}, c_log: {c_log}"
-            )
+            msg = f"Training actions: c: {c_acts}, d: {d_acts}, d_log: {d_log}, c_log: {c_log}"
+            print(msg)
+            with open("PPO_log.txt", "a") as f:
+                f.write(msg + "\n")
 
         _s = time.time()
         act_dict = model.train_actions(obs_batch, step=True, debug=False)
@@ -224,9 +225,10 @@ def PG_test():
             c_acts is not None
             and (c_acts.shape[0] != batch_size or c_acts.shape[1] != 5)
         ):
-            print(
-                f"Training batch actions: c: {c_acts}, d: {d_acts}, d_log: {d_log}, c_log: {c_log}"
-            )
+            msg = f"Training batch actions: c: {c_acts}, d: {d_acts}, d_log: {d_log}, c_log: {c_log}"
+            print(msg)
+            with open("PPO_log.txt", "a") as f:
+                f.write(msg + "\n")
         mb = mem_buff.sample_transitions(
             batch_size=batch_size, as_torch=True, device=h["device"]
         )
@@ -240,12 +242,14 @@ def PG_test():
                 mb.__getattr__("discrete_actions")[0],
             )
         except Exception as e:
-            print("Couldn't imitation learn ")
-            print(mb.__getattr__("obs"))
-            print(
-                f"obs: {mb.__getattr__('obs')}, ca: {mb.__getattr__('continuous_actions')}, da: {mb.__getattr__('discrete_actions')}"
-            )
-            print(h)
+            msg = "Couldn't imitation learn \n"
+            msg += str(mb.__getattr__("obs")) + "\n"
+            msg += f"obs: {mb.__getattr__('obs')}, ca: {mb.__getattr__('continuous_actions')}, da: {mb.__getattr__('discrete_actions')}\n"
+            msg += str(h) + "\n"
+            msg += str(e) + "\n"
+            print(msg)
+            with open("PPO_log.txt", "a") as f:
+                f.write(msg + "\n")
             raise e
         run_times["imitation_learn"] += time.time() - _s
 
@@ -253,7 +257,10 @@ def PG_test():
         try:
             rl_dict = model.reinforcement_learn(mb, 0)
         except Exception as e:
-            print(h)
+            msg = str(h) + "\n" + str(e) + "\n"
+            print(msg)
+            with open("PPO_log.txt", "a") as f:
+                f.write(msg + "\n")
             raise e
         run_times["reinforcement_learn"] += time.time() - _s
 
@@ -668,6 +675,6 @@ def PG_hand_pick():
 
 if __name__ == "__main__":
 
-    # PG_integration()
+    PG_integration()
     PG_test()
     PG_hand_pick()

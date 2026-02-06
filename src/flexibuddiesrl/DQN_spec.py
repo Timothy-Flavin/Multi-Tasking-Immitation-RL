@@ -196,12 +196,10 @@ def DQN_test():
                 mb.__getattr__("discrete_actions")[0],
             )
         except Exception as e:
-            print("Couldn't imitation learn ")
-            print(mb.__getattr__("obs"))
-            print(
-                f"obs: {mb.__getattr__('obs')}, ca: {mb.__getattr__('continuous_actions')}, da: {mb.__getattr__('discrete_actions')}"
-            )
-            print(h)
+            msg = f"Couldn't imitation learn\nobs: {mb.__getattr__('obs')}\nobs: {mb.__getattr__('obs')}, ca: {mb.__getattr__('continuous_actions')}, da: {mb.__getattr__('discrete_actions')}\nconfig: {h}\nError: {e}\n"
+            print(msg)
+            with open("DQN_log.txt", "a") as f:
+                f.write(msg + "\n")
             raise e
         run_times["imitation_learn"] += time.time() - _s
 
@@ -209,7 +207,10 @@ def DQN_test():
         try:
             rl_metrics = model.reinforcement_learn(mb, 0)
         except Exception as e:
-            print(h)
+            msg = f"reinforcement_learn failed\nconfig: {h}\nError: {e}\n"
+            print(msg)
+            with open("DQN_log.txt", "a") as f:
+                f.write(msg + "\n")
             raise e
         run_times["reinforcement_learn"] += time.time() - _s
         # print(f"time: {time.time()-t}")
@@ -325,9 +326,12 @@ def DQN_integration():
                 # print()
 
             if cdim > 0:
-                assert (
-                    cact is not None
-                ), f"Continuous action and log prob {cact} {clp} should not be None when cdim [{cdim}] is not 0"
+                if cact is None:
+                    msg = f"Continuous action and log prob {cact} {clp} should not be None when cdim [{cdim}] is not 0"
+                    with open("DQN_log.txt", "a") as f:
+                        f.write(f"Assertion failed: {msg}\n")
+                    raise AssertionError(msg)
+                
                 # print(f"Continuous action: {cact}, log prob: {clp}")
                 # print()
                 # input()
@@ -340,9 +344,12 @@ def DQN_integration():
                 default_cact = cact
                 # print(clp)
             else:
-                assert (
-                    dact is not None
-                ), f"Discrete action and log prob {dact} {dlp} should not be None when cdim [{cdim}] is 0"
+                if dact is None:
+                    msg = f"Discrete action and log prob {dact} {dlp} should not be None when cdim [{cdim}] is 0"
+                    with open("DQN_log.txt", "a") as f:
+                        f.write(f"Assertion failed: {msg}\n")
+                    raise AssertionError(msg)
+                
                 # print(dact.shape, dlp.shape, dact, dlp)
                 env_action = np.array([float(dact[0] - 1), float(dact[1] - 1)])
                 default_dact[0] = dact[0]

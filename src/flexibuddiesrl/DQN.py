@@ -356,7 +356,7 @@ class DQN(nn.Module, Agent):
             # print(continuous_actions.shape)
             for i in range(self.continuous_action_dims):
                 continuous_loss += nn.CrossEntropyLoss()(
-                    cont_adv[:, i], continuous_actions[:, i]
+                    cont_adv[i], continuous_actions[:, i]
                 )
 
         return discrete_loss, continuous_loss
@@ -376,7 +376,7 @@ class DQN(nn.Module, Agent):
             continuous_actions = self._discretize_actions(cont_act)
             # print(continuous_actions)
             for i in range(self.continuous_action_dims):
-                best_q, best_a = torch.max(cont_adv[:, i], -1)
+                best_q, best_a = torch.max(cont_adv[i], -1)
                 mask = best_a != continuous_actions[:, i]
                 continuous_loss += nn.MSELoss(reduction="none")(
                     best_q + mask, best_q.detach()
@@ -680,7 +680,7 @@ class DQN(nn.Module, Agent):
                             assert isinstance(
                                 combined_target, torch.Tensor
                             ), "If mixing is enabled then combined target needs to be tensor"
-                            combined_target += munchausen_reward.unsqueeze(-1)
+                            combined_target += munchausen_reward
 
         cQ = 0
         if self.has_continuous:
