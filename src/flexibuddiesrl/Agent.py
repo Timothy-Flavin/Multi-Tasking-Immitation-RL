@@ -62,7 +62,9 @@ class Agent(ABC):
         return 0.0
 
     @abstractmethod
-    def stable_greedy(self, obs, legal_action):
+    def stable_greedy(
+        self, obs, legal_action
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         """
         Sample a greedy action from this agent's target or stable
         policy. For DQN this is argmax(target_Q), for PPO this is
@@ -1022,7 +1024,16 @@ class QS(nn.Module):
         self.device = device
         self.dueling = dueling
 
-        self.tot_adv_size = continuous_action_dim * n_c_action_bins
+        if isinstance(n_c_action_bins, int):
+            self.c_action_bins = [n_c_action_bins] * continuous_action_dim
+        else:
+            self.c_action_bins = n_c_action_bins
+            if len(self.c_action_bins) != continuous_action_dim:
+                raise ValueError(
+                    f"Length of n_c_action_bins ({len(self.c_action_bins)}) must match continuous_action_dim ({continuous_action_dim})"
+                )
+
+        self.tot_adv_size = sum(self.c_action_bins)
         if discrete_action_dims is not None:
             self.tot_adv_size += sum(discrete_action_dims)
             self.n_heads += len(discrete_action_dims)
@@ -1142,19 +1153,17 @@ class QS(nn.Module):
                 start = end
 
         if self.cont_action_dim > 0 and advantages is not None:
-            cont_advantages = (
-                advantages[:, tot_disc_dims:].view(
-                    advantages.shape[0], self.cont_action_dim, -1
-                )
-                # .transpose(0, 1)  # TODO: figure out if it is worth it to transpose
-            )  # transposed because then discrete and continuous output same dim order
-            if self.dueling:  # These are mean zero when dueling or Q values when not
-                cont_advantages = cont_advantages - cont_advantages.mean(
-                    dim=-1, keepdim=True
-                )
-            if single_dim:
-                # print(f"single dim: {cont_advantages.shape}")
-                cont_advantages = cont_advantages.squeeze(0)
+            cont_advantages = []
+            start = tot_disc_dims
+            for bins in self.c_action_bins:
+                end = start + bins
+                adv = advantages[:, start:end]
+                if self.dueling:
+                    adv = adv - adv.mean(dim=-1, keepdim=True)
+                if single_dim:
+                    adv = adv.squeeze(0)
+                cont_advantages.append(adv)
+                start = end
 
         return values, disc_advantages, cont_advantages
 

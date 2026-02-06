@@ -105,7 +105,15 @@ class DQN(nn.Module, Agent):
         self.dueling = (
             dueling  # whether or not to learn True: V+Adv = Q or False: Adv = Q
         )
-        self.n_c_action_bins = n_c_action_bins  # number of discrete action bins to discretize continuous actions
+        if isinstance(n_c_action_bins, int):
+            self.n_c_action_bins = [n_c_action_bins] * continuous_action_dims
+        else:
+            self.n_c_action_bins = n_c_action_bins
+            if len(self.n_c_action_bins) != continuous_action_dims:
+                raise ValueError(
+                    f"Length of n_c_action_bins ({len(self.n_c_action_bins)}) must match continuous_action_dims ({continuous_action_dims})"
+                )
+
         self.munchausen = munchausen  # munchausen amount
         self.twin = False  # min(double q) to reduce bias
         self.init_eps = init_eps  # starting eps_greedy epsilon
@@ -200,29 +208,47 @@ class DQN(nn.Module, Agent):
             "activation",
         ]
 
-    def _cont_from_q(self, cont_act):
-        return (
-            torch.argmax(cont_act, dim=-1) / (self.n_c_action_bins - 1) - 0.5
-        ) * self.action_ranges + self.action_means
+    def _cont_from_q(self, cont_act_list):
+        res = []
+        for i, (q_vals, bins) in enumerate(zip(cont_act_list, self.n_c_action_bins)):
+            val = (
+                (torch.argmax(q_vals, dim=-1) / (bins - 1) - 0.5) * self.action_ranges[i]
+                + self.action_means[i]
+            )
+            res.append(val)
+        return torch.stack(res, dim=-1)
 
-    def _cont_from_soft_q(self, cont_act):
+    def _cont_from_soft_q(self, cont_act_list):
         # print(Categorical(logits=cont_act / self.entropy_loss_coef).probs)
-        return (
-            Categorical(logits=cont_act / self.entropy_loss_coef).sample()
-            / (self.n_c_action_bins - 1)
-            - 0.5
-        ) * self.action_ranges + self.action_means
+        res = []
+        for i, (q_vals, bins) in enumerate(zip(cont_act_list, self.n_c_action_bins)):
+            val = (
+                (
+                    Categorical(logits=q_vals / self.entropy_loss_coef).sample()
+                    / (bins - 1)
+                    - 0.5
+                )
+                * self.action_ranges[i]
+                + self.action_means[i]
+            )
+            res.append(val)
+        return torch.stack(res, dim=-1)
 
     def _discretize_actions(self, continuous_actions):
         # print(continuous_actions.shape)
-        return torch.clamp(  # inverse of _cont_from_q
-            torch.round(
-                ((continuous_actions - self.action_means) / self.action_ranges + 0.5)
-                * (self.n_c_action_bins - 1)
-            ).to(torch.int64),
-            0,
-            self.n_c_action_bins - 1,
-        )
+        res = []
+        for i, bins in enumerate(self.n_c_action_bins):
+            val = continuous_actions[:, i]
+            d = torch.clamp(
+                torch.round(
+                    ((val - self.action_means[i]) / self.action_ranges[i] + 0.5)
+                    * (bins - 1)
+                ).to(torch.int64),
+                0,
+                bins - 1,
+            )
+            res.append(d)
+        return torch.stack(res, dim=-1)
 
     def _e_greedy_train_action(
         self, observations, action_mask=None, step=False, debug=False
@@ -449,7 +475,8 @@ class DQN(nn.Module, Agent):
                     for h in dac:
                         evs.append(torch.max(h, dim=-1, keepdim=True)[0])
                 if self.continuous_action_dims > 0:
-                    evs.append(torch.max(cac, dim=-1)[0])
+                    for h in cac:
+                        evs.append(torch.max(h, dim=-1, keepdim=True)[0])
                 return torch.cat(evs, dim=-1).mean(dim=-1)
 
     def cql_loss(self, disc_adv, cont_adv, disc_act, cont_act):
@@ -462,7 +489,7 @@ class DQN(nn.Module, Agent):
                 cql_loss += (logsumexp - q_a).mean()
         for i in range(self.continuous_action_dims):
             logsumexp = torch.logsumexp(cont_adv[i], dim=-1, keepdim=True)
-            q_a = cont_adv[i].gather(1, cont_act[:, i])
+            q_a = cont_adv[i].gather(1, cont_act[:, i].unsqueeze(-1))
             cql_loss += (logsumexp - q_a).mean()
 
         return cql_loss
@@ -497,14 +524,21 @@ class DQN(nn.Module, Agent):
         return Q_
 
     def _continuous_next_q(self, values, advantages, debug=False):
-        if self.dqn_type == dqntype.Munchausen or self.dqn_type == dqntype.Soft:
-            lprobs = torch.log_softmax(advantages / self.entropy_loss_coef, dim=-1)
-            probs = torch.exp(lprobs)
-            Q_ = torch.sum(
-                probs * (advantages - self.entropy_loss_coef * lprobs), dim=-1
-            )
-        else:
-            Q_ = torch.max(advantages, dim=-1).values
+        Q_ = torch.zeros(
+            size=(advantages[0].shape[0], len(advantages)),
+            device=self.device,
+            dtype=torch.float32,
+        )
+        for i, adv in enumerate(advantages):
+            if self.dqn_type == dqntype.Munchausen or self.dqn_type == dqntype.Soft:
+                lprobs = torch.log_softmax(adv / self.entropy_loss_coef, dim=-1)
+                probs = torch.exp(lprobs)
+                Q_[:, i] = torch.sum(
+                    probs * (adv - self.entropy_loss_coef * lprobs), dim=-1
+                )
+            else:
+                Q_[:, i] = torch.max(adv, dim=-1).values
+
         if self.mix_type is None:
             # print(f"cQ_: {Q_.shape}, values: {values.shape}")
             Q_ = Q_ + values
@@ -646,36 +680,41 @@ class DQN(nn.Module, Agent):
                     continuous_actions is not None
                 ), "Cant learn on continuous actions if they are None"
                 if self.dqn_type == dqntype.Munchausen:
-                    munchausen_reward = (
-                        self.entropy_loss_coef
-                        * self.munchausen
-                        * torch.log_softmax(cont_adv / self.entropy_loss_coef, dim=-1)
-                        .gather(dim=-1, index=continuous_actions.unsqueeze(-1))
-                        .squeeze(-1)
-                    )
-                    if self.mix_type is None:
-                        assert isinstance(
-                            continuous_target, torch.Tensor
-                        ), "If no mixing then continuous target needs to be tensor"
-                        continuous_target += munchausen_reward
-                    else:
-                        assert isinstance(
-                            combined_target, torch.Tensor
-                        ), "If mixing is enabled then combined target needs to be tensor"
-                        combined_target += munchausen_reward.sum(-1)
+                    for i, adv in enumerate(cont_adv):
+                        munchausen_reward = (
+                            self.entropy_loss_coef
+                            * self.munchausen
+                            * torch.log_softmax(adv / self.entropy_loss_coef, dim=-1)
+                            .gather(
+                                dim=-1, index=continuous_actions[:, i].unsqueeze(-1)
+                            )
+                            .squeeze(-1)
+                        )
+                        if self.mix_type is None:
+                            assert isinstance(
+                                continuous_target, torch.Tensor
+                            ), "If no mixing then continuous target needs to be tensor"
+                            continuous_target[:, i] += munchausen_reward
+                        else:
+                            assert isinstance(
+                                combined_target, torch.Tensor
+                            ), "If mixing is enabled then combined target needs to be tensor"
+                            combined_target += munchausen_reward.unsqueeze(-1)
 
         cQ = 0
         if self.has_continuous:
             assert (
                 continuous_actions is not None
             ), "Cant do continuous action update if actions are None"
-            cQ = torch.gather(
-                input=cont_adv,
-                dim=-1,
-                index=continuous_actions.unsqueeze(-1),
-            ).squeeze(
-                -1
-            )  # + (values.squeeze(-1) if self.dueling else 0)
+            cQ = torch.zeros(
+                (continuous_actions.shape[0], self.continuous_action_dims),
+                device=self.device,
+            )
+            for i, adv in enumerate(cont_adv):
+                cQ[:, i] = adv.gather(
+                    dim=-1, index=continuous_actions[:, i].unsqueeze(-1)
+                ).squeeze(-1)
+            # + (values.squeeze(-1) if self.dueling else 0)
             if self.mix_type == "VDN":
                 cQ = cQ.sum(-1)
 

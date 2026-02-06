@@ -67,7 +67,7 @@ class PG(nn.Module, Agent):
         relative_entropy_loss=0.05,
         wall_time=False,
         joint_kl_penalty=0.1,
-        target_kl=0.05,
+        target_kl=0.1,
     ):
         super(PG, self).__init__()
         config = locals()
@@ -696,13 +696,6 @@ class PG(nn.Module, Agent):
             values, disc_advantages, cont_advantages = self.critic(obs)
             return values.squeeze(-1)
 
-    def _get_disc_log_probs_entropy(self, logits, actions):
-        log_probs = torch.zeros_like(actions, dtype=torch.float)
-        dist = Categorical(logits=logits)
-        log_probs = dist.log_prob(actions)
-        # print("Disc probs:", log_probs.mean(dim=0).detach().cpu().numpy())
-        return log_probs, dist.entropy().mean()
-
     def _get_cont_log_probs_entropy(
         self, logits, actions, lstd_logits: torch.Tensor | None = None
     ):
@@ -776,7 +769,7 @@ class PG(nn.Module, Agent):
         #     )
         # log_probs = torch.clamp(log_probs, -100, 2)
         # eloss = eloss * 100
-        eloss = dist.entropy().mean()
+        eloss = dist.entropy().clip(-1.0).mean()
         return log_probs, eloss
 
     def _print_grad_norm(self):
@@ -794,7 +787,8 @@ class PG(nn.Module, Agent):
     ) -> torch.Tensor:
         V_current = self.critic(
             batch.__getattr__(self.batch_name_map["obs"])[agent_num, indices]
-        )
+        ).squeeze(-1)
+        # G should be shape [batch_size] and V_current [batch_size]
         critic_loss = 0.5 * ((V_current - G[indices]) ** 2).mean()
         return critic_loss
 
@@ -977,7 +971,7 @@ class PG(nn.Module, Agent):
             self.result_dict["d_entropy"] += entropy.item()
         return actor_loss
 
-    def reinforcement_learn(
+    def reinforcement_learn(  # type:ignore
         self,
         batch: FlexiBatch,
         agent_num=0,
@@ -1249,7 +1243,7 @@ class PG(nn.Module, Agent):
         if self.action_clamp_type == "tanh":
             log_probs -= 2 * (np.log(2) - activations - F.softplus(-2 * activations))
 
-        c_entropy = dist.entropy().sum(-1)
+        c_entropy = dist.entropy().clip(-1.0).sum(-1)
 
         if torch.min(log_probs) < -20:
             print(
@@ -1314,6 +1308,12 @@ class PG(nn.Module, Agent):
         old_c_dists,
         new_c_dists,
     ):
+        """
+        Calculates PPO loss for the 'QMIX' style architecture where advantages are provided per-dimension.
+        Note: This effectively runs independent PPO updates for each action dimension (summed),
+        rather than a joint PPO update where the ratio would be prod(r_i).
+        By clipping the ratio per dimension independently, we prevent large updates on any single dimension.
+        """
         logratio = new_log_probs - old_log_probs
         assert (
             new_log_probs.ndim == old_log_probs.ndim
@@ -1349,7 +1349,7 @@ class PG(nn.Module, Agent):
                 -1
             )
             # print(kl_div.mean())
-
+        assert isinstance(kl_div, torch.Tensor)
         joint_kl = kl_div.mean()
         # print(f"KL Divergence loss: {self.joint_kl_penalty * joint_kl.item()}")
         policy_loss += self.joint_kl_penalty * joint_kl
@@ -1619,15 +1619,15 @@ class PG(nn.Module, Agent):
                 mb_adv = self._gather_observed_advantages(
                     mb_d_adv, mb_c_adv, mb_d_actions, mb_c_actions
                 )
-                mb_Q = (self.mixer(mb_adv, mb_obs)[0] + mb_values).squeeze(-1)
+                # assert self.mixer is not None
+                mb_Q = (self.mixer(mb_adv, mb_obs)[0] + mb_values).squeeze(-1)  # type: ignore
                 if isinstance(mb_values, torch.Tensor):
-                    if isinstance(mb_values, torch.Tensor):
-                        assert (
-                            self.mixer(mb_adv, mb_obs)[0].shape == mb_values.shape
-                        ), f"Shapes don't match in mix rl: {self.mixer(mb_adv, mb_obs)[0].shape} vs {mb_values.shape}"
-                        assert (
-                            mb_Q.shape == mb_global_Q.squeeze(-1).shape
-                        ), f"Shapes don't match in mix rl: {mb_Q.shape} vs {mb_global_Q.squeeze(-1).shape}"
+                    assert (
+                        self.mixer(mb_adv, mb_obs)[0].shape == mb_values.shape
+                    ), f"Shapes don't match in mix rl: {self.mixer(mb_adv, mb_obs)[0].shape} vs {mb_values.shape}"
+                    assert (
+                        mb_Q.shape == mb_global_Q.squeeze(-1).shape
+                    ), f"Shapes don't match in mix rl: {mb_Q.shape} vs {mb_global_Q.squeeze(-1).shape}"
                 critic_loss = ((mb_Q - mb_global_Q.squeeze(-1)) ** 2).mean()
                 # input()
                 # print(f"mb_Q: {mb_Q.mean()}, mb_global_Q: {mb_global_Q.squeeze(-1).mean()}")
@@ -1775,10 +1775,7 @@ class PG(nn.Module, Agent):
             checkpoint_path = "./" + self.name + "/"
 
         # for i in range(len(self.attrs)):
-        #    self.__dict__[self.attrs[i]] = self._load_attr(
-        #        checkpoint_path + f"/{self.attrs[i]}"
-        #    )
-        self._get_torch_params(self.starting_actorlogstd)
+        self._get_torch_params(self.encoder)
         self.policy_loss = 5.0
         self.actor.load_state_dict(torch.load(checkpoint_path + "/PI"))
         self.critic.load_state_dict(torch.load(checkpoint_path + "/V"))
