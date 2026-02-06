@@ -446,6 +446,7 @@ def PG_integration():
                 )
                 rl_metrics = model.reinforcement_learn(mb, 0, debug=False)
 
+                assert rl_metrics is not None
                 for k, v in rl_metrics.items():
                     if isinstance(v, torch.Tensor):
                         scalar_labels = {}

@@ -7,17 +7,6 @@ from .Util import T
 
 
 class Agent(ABC):
-    from abc import ABC, abstractmethod
-
-
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import numpy as np
-from .Util import T
-
-
-class Agent(ABC):
 
     @abstractmethod
     def train_actions(
@@ -348,6 +337,7 @@ class StochasticActor(nn.Module):
             )
         elif encoder is not None:
             self.encoder = encoder
+            assert hidden_dims is not None
             self.obs_dim = (
                 encoder.encoder[-1].out_features
                 if hasattr(encoder, "encoder")
@@ -419,6 +409,7 @@ class StochasticActor(nn.Module):
         output_dim += self.continuous_action_dim + self.log_std_dim
 
         # setting up layers for action dims. These need to be independend becaue
+        assert isinstance(last_hidden_dim, int)
         if action_head_hidden_dims is not None and len(action_head_hidden_dims) > 0:
             for i, dim in enumerate(action_head_hidden_dims):
                 if i == 0:
@@ -618,7 +609,7 @@ class StochasticActor(nn.Module):
 
                     # This is from spinningup SAC
                     continuous_log_probs = c_dist.log_prob(continuous_activations).sum(
-                        axis=-1
+                        dim=-1
                     )
                     continuous_log_probs -= (
                         2
@@ -640,7 +631,7 @@ class StochasticActor(nn.Module):
                         c_dist is not None
                     ), "Somehow we want log probs from a distirbution that doesn't exist"
                     continuous_log_probs = c_dist.log_prob(continuous_activations).sum(
-                        axis=-1
+                        dim=-1
                     )
             else:
                 continuous_actions = continuous_activations
@@ -650,7 +641,7 @@ class StochasticActor(nn.Module):
                     ), "Somehow we want log probs from a distirbution that doesn't exist"
                     # print(c_dist.log_prob(continuous_activations))
                     continuous_log_probs = c_dist.log_prob(continuous_activations).sum(
-                        axis=-1
+                        dim=-1
                     )
             # print(
             #    f"{self.clamp_type} Continuous actions: {continuous_actions}, log probs: {continuous_log_probs} from  {c_dist.log_prob(continuous_activations) if c_dist is not None else None} continuous_activations: {continuous_activations}, means: {continuous_means}, stds: {torch.exp(continuous_log_std_logits) if continuous_log_std_logits is not None else None}"
@@ -968,7 +959,7 @@ class QS(nn.Module):
         dropout=0.0,
         dueling=False,
         device="cpu",
-        n_c_action_bins=11,
+        n_c_action_bins: int | list = 11,
         head_hidden_dims=[32],  # [64],
         verbose=False,
         QMIX=True,

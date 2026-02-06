@@ -212,9 +212,8 @@ class DQN(nn.Module, Agent):
         res = []
         for i, (q_vals, bins) in enumerate(zip(cont_act_list, self.n_c_action_bins)):
             val = (
-                (torch.argmax(q_vals, dim=-1) / (bins - 1) - 0.5) * self.action_ranges[i]
-                + self.action_means[i]
-            )
+                torch.argmax(q_vals, dim=-1) / (bins - 1) - 0.5
+            ) * self.action_ranges[i] + self.action_means[i]
             res.append(val)
         return torch.stack(res, dim=-1)
 
@@ -223,14 +222,10 @@ class DQN(nn.Module, Agent):
         res = []
         for i, (q_vals, bins) in enumerate(zip(cont_act_list, self.n_c_action_bins)):
             val = (
-                (
-                    Categorical(logits=q_vals / self.entropy_loss_coef).sample()
-                    / (bins - 1)
-                    - 0.5
-                )
-                * self.action_ranges[i]
-                + self.action_means[i]
-            )
+                Categorical(logits=q_vals / self.entropy_loss_coef).sample()
+                / (bins - 1)
+                - 0.5
+            ) * self.action_ranges[i] + self.action_means[i]
             res.append(val)
         return torch.stack(res, dim=-1)
 
@@ -293,13 +288,6 @@ class DQN(nn.Module, Agent):
                         d_act[i] = torch.argmax(da).detach().cpu().item()
                     disc_act = d_act
                 if self.continuous_action_dims > 0:
-                    if debug:
-                        print(
-                            f"  cont act {cont_act}, argmax: {torch.argmax(cont_act,dim=-1).detach().cpu()}"
-                        )
-                        print(
-                            f"  Trying to store this in actions {((torch.argmax(cont_act,dim=-1)/ (self.n_c_action_bins - 1) -0.5)* self.action_ranges+ self.action_means)} calculated from da: {cont_act} with ranges: {self.action_ranges} and means: {self.action_means}"
-                        )
                     cont_act = self._cont_from_q(cont_act).cpu().numpy()
         return disc_act, cont_act
 
@@ -317,13 +305,6 @@ class DQN(nn.Module, Agent):
                     dact[i] = Categorical(logits=da).sample().cpu().item()
                 disc_act = dact  # had to store da temporarily to keep using disc_act
             if self.continuous_action_dims > 0:
-                if debug:
-                    print(
-                        f"  cont act {cont_act}, argmax: {torch.argmax(cont_act,dim=-1).detach().cpu()}"
-                    )
-                    print(
-                        f"  Trying to store this in actions {((torch.argmax(cont_act,dim=-1)/ (self.n_c_action_bins - 1) -0.5)* self.action_ranges+ self.action_means)} calculated from da: {cont_act} with ranges: {self.action_ranges} and means: {self.action_means}"
-                    )
                 cont_act = self._cont_from_soft_q(cont_act).cpu().numpy()
         return disc_act, cont_act
 
