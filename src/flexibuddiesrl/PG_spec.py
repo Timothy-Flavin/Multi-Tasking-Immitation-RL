@@ -669,5 +669,5 @@ def PG_hand_pick():
 if __name__ == "__main__":
 
     # PG_integration()
-    # PG_test()
+    PG_test()
     PG_hand_pick()
