@@ -316,9 +316,18 @@ def DQN_integration():
                 default_dact = np.zeros((2), dtype=np.int64)
                 default_cact = np.zeros((2), dtype=np.float32)
                 # input(f"obs: {obs.shape}")
-                dact, cact, dlp, clp, cactivation, v = model.train_actions(
+                # dact, cact, dlp, clp, cactivation, v = model.train_actions(
+                #    obs, step=True, debug=False
+                # )
+                act_res = model.train_actions(
                     obs, step=True, debug=False
                 )
+                dact = act_res.get("discrete_actions")
+                cact = act_res.get("continuous_actions")
+                dlp = act_res.get("discrete_log_probs")
+                clp = act_res.get("continuous_log_probs")
+                cactivation = None
+                v = None
                 # print(dact)
                 # print(cact)
                 # print(dlp)
@@ -399,14 +408,14 @@ def DQN_integration():
                 ep_num += 1
                 ep_step = 0
 
-            if mem_buff.steps_recorded > batch_size * 10 and ep_step % 2 == 0:
+            if mem_buff.steps_recorded > batch_size * 10 and ep_step % 200 == 0:
                 # print(model.action_clamp_type)
                 mb = mem_buff.sample_transitions(
                     batch_size=batch_size, as_torch=True, device=model.device
                 )
                 # for k in range(50):
-                aloss, closs = model.reinforcement_learn(mb, 0, debug=False)
-                print(f"Iteration {i}, aloss: {aloss}, closs: {closs}")
+                rl_res = model.reinforcement_learn(mb, 0, debug=False)
+                print(f"Iteration {i}, loss: {rl_res['rl_loss']}")
                 # input()
                 # mem_buff.reset()
 
