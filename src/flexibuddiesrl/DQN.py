@@ -738,7 +738,7 @@ class DQN(nn.Module, Agent):
                 dtype=torch.float32,
             )
             for d in range(len(self.discrete_action_dims)):
-                print(f"d {d} shape: {disc_adv[d].shape}")
+                # print(f"d {d} shape: {disc_adv[d].shape}")
                 dQ[:, d] = torch.gather(
                     disc_adv[d],
                     dim=-1,
