@@ -1099,13 +1099,14 @@ class QS(nn.Module):
         # print(f"starting x shape: {x.shape} {len(x.shape)}")
         if self.encoder is not None:
             x = self.encoder(x)
-        values = 0
 
         single_dim = False
         # print(f" x shape: {x.shape} {len(x.shape)}")
         if len(x.shape) == 1:
             single_dim = True
             x = x.unsqueeze(0)
+        
+        values = torch.zeros((x.shape[0], 1), device=self.device)
 
         # If the heads have their own hidden layers for a 2 layer dueling network
         if self.joint_head_layers is not None:
@@ -1113,8 +1114,9 @@ class QS(nn.Module):
                 x = torch.tanh(li(x))
         if self.dueling and self.value_head is not None:
             values = self.value_head(x[:, : self.last_hidden_dim // 2])
-            if single_dim:
-                values = values.squeeze(0)
+        
+        if single_dim:
+            values = values.squeeze(0)
 
         # half the embedding belongs to the value head if dueling
         advantages = None

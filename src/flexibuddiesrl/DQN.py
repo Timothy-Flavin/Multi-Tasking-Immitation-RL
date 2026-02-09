@@ -1,5 +1,6 @@
 # %%
 import numpy as np
+import random
 import torch.nn as nn
 import torch
 from torch.distributions import Categorical
@@ -245,6 +246,32 @@ class DQN(nn.Module, Agent):
             res.append(d)
         return torch.stack(res, dim=-1)
 
+    def _verify_action_shape(self, value, disc_act, cont_act):
+        if self.discrete_action_dims is not None and len(self.discrete_action_dims) > 0:
+            for i, dim in enumerate(self.discrete_action_dims):
+                # check if batch dim exists (value is [B], act is [B, dim])
+                if value.ndim > 0 and value.shape[0] > 1:
+                    assert disc_act[i].shape == (
+                        value.shape[0],
+                        dim,
+                    ), f"Discrete action {i} shape mismatch: {disc_act[i].shape} vs {(value.shape[0], dim)}"
+                else:
+                    # if single observation (value is [1] or scalar), act is [dim]
+                    assert disc_act[i].shape == (
+                        dim,
+                    ), f"Discrete action {i} shape mismatch (single obs): {disc_act[i].shape} vs {(dim,)}"
+        if self.continuous_action_dims > 0:
+            for i, dim in enumerate(self.n_c_action_bins):
+                if value.ndim > 0 and value.shape[0] > 1:
+                    assert cont_act[i].shape == (
+                        value.shape[0],
+                        dim,
+                    ), f"Continuous action {i} shape mismatch: {cont_act[i].shape} vs {(value.shape[0], dim)}"
+                else:
+                    assert cont_act[i].shape == (
+                        dim,
+                    ), f"Continuous action {i} shape mismatch (single obs): {cont_act[i].shape} vs {(dim,)}"
+
     def _e_greedy_train_action(
         self, observations, action_mask=None, step=False, debug=False
     ):
@@ -255,16 +282,14 @@ class DQN(nn.Module, Agent):
             )
         value = 0
         if self.init_eps > 0.0 and np.random.rand() < self.eps:
-            # print("Random action")
             if (
                 self.discrete_action_dims is not None
                 and len(self.discrete_action_dims) > 0
             ):
-                disc_act = np.zeros(
-                    shape=len(self.discrete_action_dims), dtype=np.int32
+                disc_act = np.array(
+                    [random.randrange(dim) for dim in self.discrete_action_dims],
+                    dtype=np.int32,
                 )
-                for i in range(len(self.discrete_action_dims)):
-                    disc_act[i] = np.random.randint(0, self.discrete_action_dims[i])
 
             if self.continuous_action_dims > 0:
                 cont_act = (
@@ -272,10 +297,11 @@ class DQN(nn.Module, Agent):
                 ) * self.np_action_ranges + self.np_action_means
             # print(disc_act)
         else:
-            # print("Not random action")
             with torch.no_grad():
                 # print("Getting value from Q1 for soft action selection")
                 value, disc_act, cont_act = self.Q1(observations, action_mask)
+                self._verify_action_shape(value, disc_act, cont_act)
+
                 # print("done with that")
                 # select actions from q function
                 # print(value, disc_act, cont_act)
@@ -309,12 +335,14 @@ class DQN(nn.Module, Agent):
         return disc_act, cont_act
 
     def train_actions(self, observations, action_mask=None, step=False, debug=False):
+        # print(f"  inside dqn: aranges {self.continuous_action_dims} cards {self.discrete_action_dims}")
         t = 0
         if self.wall_time:
             t = time.time()
         disc_act, cont_act = self._e_greedy_train_action(
             observations, action_mask, step, debug
         )
+        # print(f"  disc_act: {disc_act} cont act: {cont_act}")
         self.step += int(step)
         if self.wall_time:
             t = time.time() - t
@@ -710,6 +738,7 @@ class DQN(nn.Module, Agent):
                 dtype=torch.float32,
             )
             for d in range(len(self.discrete_action_dims)):
+                print(f"d {d} shape: {disc_adv[d].shape}")
                 dQ[:, d] = torch.gather(
                     disc_adv[d],
                     dim=-1,
