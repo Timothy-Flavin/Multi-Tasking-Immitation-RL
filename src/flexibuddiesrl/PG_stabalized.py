@@ -1380,11 +1380,17 @@ class PG(nn.Module, Agent):
         if truncated is None:
             truncated = torch.zeros_like(rewards)
         values, d_adv, c_adv = self.critic(obs)
+        if c_adv is not None:
+            c_adv = torch.transpose(torch.stack(c_adv, dim=0), 0, 1)
+
         adv = self._gather_observed_advantages(d_adv, c_adv, d_actions, c_actions)
         Q = (self.mixer(adv, obs)[0] + values).squeeze(-1)  # type:ignore
 
         with torch.no_grad():
             next_values, next_d_adv, next_c_adv = self.critic(obs_)
+            if next_c_adv is not None:
+                next_c_adv = torch.transpose(torch.stack(next_c_adv, dim=0), 0, 1)
+
             if self.on_policy_mixer:
                 next_adv = 0
                 next_Q = next_values
@@ -1474,6 +1480,9 @@ class PG(nn.Module, Agent):
 
         with torch.no_grad():
             values, d_adv, c_adv = self.critic(obs)
+            if c_adv is not None:
+                c_adv = torch.transpose(torch.stack(c_adv, dim=0), 0, 1)
+
             adv = self._gather_observed_advantages(d_adv, c_adv, d_actions, c_actions)
         grad_free_adv = adv.detach()
         grad_free_adv.requires_grad = True
@@ -1483,6 +1492,9 @@ class PG(nn.Module, Agent):
         with torch.no_grad():
             Q = (self.mixer(adv, obs)[0] + values).squeeze(-1)
             next_values, next_d_adv, next_c_adv = self.critic(obs_)
+            if next_c_adv is not None:
+                next_c_adv = torch.transpose(torch.stack(next_c_adv, dim=0), 0, 1)
+
             old_log_probs, old_d_ent, old_c_end, _, old_d_dist, old_c_dist = (
                 self._log_probs_per_dim(obs, d_actions, c_actions)
             )
@@ -1573,17 +1585,9 @@ class PG(nn.Module, Agent):
                     end = start + self.mini_batch_size
                     mini_batch_indices = indices[start:end]
                     mb_obs = obs[mini_batch_indices]
-                    # print(f"mb_obs: {mb_obs.shape}")
                     old_d_dist, old_c_dist = self._get_dists(mb_obs)
                     old_d_dists.append(old_d_dist)
                     old_c_dists.append(old_c_dist)
-                # print(f"Got {len(old_d_dists)} old discrete dists and {len(old_c_dists)} old continuous dists")
-                # print("old d dist example:")
-                # if old_d_dists[0] is not None and len(old_d_dists[0]) > 0:
-                #    print(old_d_dists[0][0].logits)
-                # print("old c dist example:")
-                # if old_c_dists[0] is not None:
-                #    print(old_c_dists[0].loc, old_c_dists[0].scale)
 
             # TODO: Loop through mini-batches
             dist_steps = 0
@@ -1600,22 +1604,10 @@ class PG(nn.Module, Agent):
                 mb_old_log_probs = old_log_probs[mini_batch_indices]
                 mb_gae = gae[mini_batch_indices]
                 mb_global_Q = global_Q[mini_batch_indices]
-
-                # for m in range(10):
-                #     mb_values, mb_d_adv, mb_c_adv = self.critic(mb_obs)
-                #     mb_adv = self._gather_observed_advantages(
-                #         mb_d_adv, mb_c_adv, mb_d_actions, mb_c_actions
-                #     )
-                #     mb_Q = (self.mixer(mb_adv, mb_obs)[0] + mb_values).squeeze(-1)
-                #     if isinstance(mb_values, torch.Tensor):
-                #         assert self.mixer(mb_adv, mb_obs)[0].shape == mb_values.shape, f"Shapes don't match in mix rl: {self.mixer(mb_adv, mb_obs)[0].shape} vs {mb_values.shape}"
-                #         assert mb_Q.shape == mb_global_Q.squeeze(-1).shape, f"Shapes don't match in mix rl: {mb_Q.shape} vs {mb_global_Q.squeeze(-1).shape}"
-                #     critic_loss = ((mb_Q - mb_global_Q.squeeze(-1)) ** 2).mean()
-                #     self.optimizer.zero_grad()
-                #     critic_loss.backward()
-                #     self.optimizer.step()
-                #     print(f"  Critic update {m}, loss: {critic_loss.item()}")
                 mb_values, mb_d_adv, mb_c_adv = self.critic(mb_obs)
+                if mb_c_adv is not None:
+                    mb_c_adv = torch.transpose(torch.stack(mb_c_adv, dim=0), 0, 1)
+
                 mb_adv = self._gather_observed_advantages(
                     mb_d_adv, mb_c_adv, mb_d_actions, mb_c_actions
                 )
@@ -1740,8 +1732,9 @@ class PG(nn.Module, Agent):
                     v = v.item()
                 else:
                     v = v.cpu().numpy()
+                    v = v.mean()
                 result[k] = v
-        return
+        return result
 
     def _dump_attr(self, attr, path):
         f = open(path, "wb")
