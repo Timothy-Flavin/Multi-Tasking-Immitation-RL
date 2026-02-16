@@ -181,8 +181,8 @@ def SAC_integration():
 
     for config_id in range(4):
         # Alternate between continuous-only and discrete-only setups
-        cdim = 2 if config_id % 2 == 0 else 0
-        ddim = None if config_id % 2 == 0 else [3, 3]
+        cdim = 2 if config_id % 2 == 1 else 0
+        ddim = None if config_id % 2 == 1 else [3, 3]
 
         mem_buff = FlexibleBuffer(
             num_steps=5000,
@@ -212,10 +212,10 @@ def SAC_integration():
             max_actions=(None if cdim == 0 else np.ones(cdim, dtype=np.float32)),
             device=("cuda" if torch.cuda.is_available() else "cpu"),
             hidden_dims=[128, 128],
-            lr=2e-3,
+            lr=1e-3,
             actor_every=4,
             initial_temperature=1.0,
-            mode="Q",
+            mode="V",
         )
 
         gym_env = gym.make("LunarLander-v3", continuous=True)
@@ -319,5 +319,5 @@ def SAC_integration():
 
 
 if __name__ == "__main__":
-    SAC_test()
+    # SAC_test()
     SAC_integration()

@@ -448,8 +448,7 @@ class SAC(Agent):
                 v = q - alpha * logp_sum
                 return v.squeeze(-1) if v.ndim > 1 else v
             else:
-                # Q-mode: expectation over discrete heads
-                # Ensure continuous action is a single tensor if present
+                # Q-mode: soft V via logsumexp over advantage heads
                 if c_act is not None and isinstance(c_act, (list, tuple)):
                     c_act_cat = torch.cat(c_act, dim=-1)
                 else:
@@ -461,34 +460,13 @@ class SAC(Agent):
                 )
                 v1, adv1, _ = self.Q1_target(in_vec)
                 v2, adv2, _ = self.Q2_target(in_vec)
-                # Compute pi over discrete heads
-                pi_list = (
-                    [F.softmax(logits, dim=-1) for logits in d_logits]
-                    if d_logits is not None
-                    else []
-                )
-
-                # Expected advantages per head
-                exp_adv1 = self._exp_adv(adv1, pi_list, v1)
-                exp_adv2 = self._exp_adv(adv2, pi_list, v2)
-                V1 = v1.squeeze(-1) + exp_adv1
-                V2 = v2.squeeze(-1) + exp_adv2
-                Vmin = torch.minimum(V1, V2)
-                # E log pi over discrete heads
-                logpi_d_exp = (
-                    sum(
-                        [
-                            (pi * F.log_softmax(lg, dim=-1)).sum(dim=-1)
-                            for pi, lg in zip(pi_list, d_logits)
-                        ]
-                    )
-                    if d_logits is not None
-                    else torch.zeros_like(Vmin)
-                )
+                V_soft_1 = self._soft_v(v1, adv1, alpha)
+                V_soft_2 = self._soft_v(v2, adv2, alpha)
+                V_soft_min = torch.minimum(V_soft_1, V_soft_2)
                 c_logp_agg = self._aggregate_continuous_logp(c_logp)
                 if c_logp_agg is None:
-                    c_logp_agg = torch.zeros_like(Vmin)
-                v = Vmin - alpha * (c_logp_agg + logpi_d_exp)
+                    c_logp_agg = torch.zeros_like(V_soft_min)
+                v = V_soft_min - alpha * c_logp_agg
                 return v
 
     def stable_greedy(self, obs, legal_action):
@@ -580,7 +558,8 @@ class SAC(Agent):
                 logp_next = self._sum_logps(c_logp_n, d_logp_n)
                 v_next = q_next - alpha * logp_next
             else:
-                # Q-mode: expectation over discrete heads given sampled continuous action
+                # Q-mode: soft V via logsumexp over discrete advantage heads
+                # V_soft(s',a_c') = V(s',a_c') + Σ_i α·logsumexp(A_i(s',a_c',·)/α)
                 if c_act_n is not None and isinstance(c_act_n, (list, tuple)):
                     c_act_n_cat = torch.cat(c_act_n, dim=-1)
                 else:
@@ -592,29 +571,13 @@ class SAC(Agent):
                 )
                 v1_n, adv1_n, _ = self.Q1_target(in_vec_next)
                 v2_n, adv2_n, _ = self.Q2_target(in_vec_next)
-                pi_list_n = (
-                    [F.softmax(lg, dim=-1) for lg in d_logits_n]
-                    if d_logits_n is not None
-                    else []
-                )
-
-                V1_n = v1_n.squeeze(-1) + self._exp_adv(adv1_n, pi_list_n, v1_n)
-                V2_n = v2_n.squeeze(-1) + self._exp_adv(adv2_n, pi_list_n, v2_n)
-                Vmin_n = torch.minimum(V1_n, V2_n)
-                logpi_d_exp_n = (
-                    sum(
-                        [
-                            (pi * F.log_softmax(lg, dim=-1)).sum(dim=-1)
-                            for pi, lg in zip(pi_list_n, d_logits_n)
-                        ]
-                    )
-                    if d_logits_n is not None
-                    else Vmin_n.new_zeros(Vmin_n.shape[0])
-                )
+                V_soft_1_n = self._soft_v(v1_n, adv1_n, alpha)
+                V_soft_2_n = self._soft_v(v2_n, adv2_n, alpha)
+                V_soft_min_n = torch.minimum(V_soft_1_n, V_soft_2_n)
                 c_logp_n_agg = self._aggregate_continuous_logp(c_logp_n)
                 if c_logp_n_agg is None:
-                    c_logp_n_agg = Vmin_n.new_zeros(Vmin_n.shape[0])
-                v_next = Vmin_n - alpha * (c_logp_n_agg + logpi_d_exp_n)
+                    c_logp_n_agg = V_soft_min_n.new_zeros(V_soft_min_n.shape[0])
+                v_next = V_soft_min_n - alpha * c_logp_n_agg
             y = r_t + (1.0 - d_t) * (self.gamma * v_next)
 
         # Current Q(s,a)
@@ -697,7 +660,6 @@ class SAC(Agent):
             )
             current_logp_for_alpha = None
             q_pi = None
-            Vmin_pi = None
             if self.critic_mode == "V":
                 a_sample_vec = self._flatten_actions(c_act_s, d_act_s)
                 q_pi_in = torch.cat([obs_t, a_sample_vec], dim=-1)
@@ -708,7 +670,16 @@ class SAC(Agent):
                 logp_s = self._sum_logps(c_logp_s, d_logp_s)
                 current_logp_for_alpha = logp_s
                 actor_loss = (alpha * logp_s - q_pi).mean()
+
+                self.actor_opt.zero_grad(set_to_none=True)
+                actor_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
+                self.actor_opt.step()
+
             else:
+                # ---- Q-mode actor update ----
+                # Continuous actor: maximise V_soft(s, a_c) - α·log π_c(a_c|s)
+                # Discrete actor:  minimise KL(π_θ || softmax(Q_min / α))
                 if c_act_s is not None and isinstance(c_act_s, (list, tuple)):
                     c_act_s_cat = torch.cat(c_act_s, dim=-1)
                 else:
@@ -718,39 +689,63 @@ class SAC(Agent):
                     if c_act_s_cat is not None
                     else obs_t
                 )
-                v1, adv1, _ = self.Q1(in_vec)
-                v2, adv2, _ = self.Q2(in_vec)
-                pi_list = (
-                    [F.softmax(logits, dim=-1) for logits in d_logits]
-                    if d_logits is not None
-                    else []
-                )
+                # Gradient flows through c_act_s into Q for continuous update
+                v1_pi, adv1_pi, _ = self.Q1(in_vec)
+                v2_pi, adv2_pi, _ = self.Q2(in_vec)
 
-                V1_pi = v1.squeeze(-1) + self._exp_adv(adv1, pi_list, v1)
-                V2_pi = v2.squeeze(-1) + self._exp_adv(adv2, pi_list, v2)
-                Vmin_pi = torch.minimum(V1_pi, V2_pi)
-                logpi_d_exp = (
-                    sum(
-                        [
-                            (pi * F.log_softmax(lg, dim=-1)).sum(dim=-1)
-                            for pi, lg in zip(pi_list, d_logits)
-                        ]
-                    )
-                    if d_logits is not None
-                    else v1.new_zeros(v1.shape[0])
-                )
+                # --- Continuous actor loss ---
+                # V_soft = V + Σ_i α·logsumexp(A_i/α)  (gradient to a_c)
+                V_soft_1 = self._soft_v(v1_pi, adv1_pi, alpha)
+                V_soft_2 = self._soft_v(v2_pi, adv2_pi, alpha)
+                V_soft_min = torch.minimum(V_soft_1, V_soft_2)
                 c_logp_s_agg = self._aggregate_continuous_logp(c_logp_s)
                 if c_logp_s_agg is None:
-                    c_logp_s_agg = v1.new_zeros(v1.shape[0])
-                total_logp = c_logp_s_agg + logpi_d_exp
-                current_logp_for_alpha = total_logp
-                actor_loss = (alpha * total_logp - Vmin_pi).mean()
+                    c_logp_s_agg = V_soft_min.new_zeros(V_soft_min.shape[0])
+                c_actor_loss = (alpha * c_logp_s_agg - V_soft_min).mean()
 
-            self.actor_opt.zero_grad(set_to_none=True)
-            actor_loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
-            self.actor_opt.step()
+                # --- Discrete actor loss: KL(π_θ || π_Q) per head ---
+                # π_Q_i(k) = softmax(Q_min_i(k) / α), where
+                #   Q_j_i(k) = V_j + A_j_i(k) for each critic j
+                d_kl_loss = torch.tensor(0.0, device=self.device)
+                if d_logits is not None and adv1_pi is not None:
+                    for i, logit_i in enumerate(d_logits):
+                        # Full Q per action for head i from each critic
+                        q1_i = v1_pi + adv1_pi[i]  # [B, K_i]
+                        q2_i = v2_pi + adv2_pi[i]  # [B, K_i]
+                        q_min_i = torch.minimum(q1_i, q2_i)
+                        # Soft target policy from Q (detach – target is fixed)
+                        log_target_pi_i = F.log_softmax(
+                            q_min_i / alpha.detach(), dim=-1
+                        ).detach()
+                        # Actor's policy
+                        log_pi_i = F.log_softmax(logit_i, dim=-1)
+                        pi_i = log_pi_i.exp()
+                        # KL(π_θ || π_Q) = Σ_k π_θ(k) [log π_θ(k) - log π_Q(k)]
+                        kl_i = (pi_i * (log_pi_i - log_target_pi_i)).sum(dim=-1)
+                        d_kl_loss = d_kl_loss + kl_i.mean()
 
+                actor_loss = c_actor_loss + d_kl_loss
+                self.actor_opt.zero_grad(set_to_none=True)
+                actor_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
+                self.actor_opt.step()
+
+                # For alpha update: total entropy across discrete + continuous
+                # expected discrete log-prob = -H(π_θ) per head
+                disc_logp_for_alpha = torch.tensor(0.0, device=self.device)
+                if d_logits is not None:
+                    for logit_i in d_logits:
+                        pi_i = F.softmax(logit_i.detach(), dim=-1)
+                        disc_logp_for_alpha = disc_logp_for_alpha + (
+                            pi_i * F.log_softmax(logit_i.detach(), dim=-1)
+                        ).sum(dim=-1).mean()
+                current_logp_for_alpha = (
+                    (c_logp_s_agg.detach() if c_logp_s_agg is not None
+                     else torch.zeros(1, device=self.device))
+                    + disc_logp_for_alpha
+                )
+
+            # --- Temperature (alpha) update (shared) ---
             total_logp_detached = (
                 current_logp_for_alpha.detach()
                 if current_logp_for_alpha is not None
@@ -763,6 +758,7 @@ class SAC(Agent):
             alpha_loss.backward()
             self.alpha_opt.step()
 
+            # --- Compute metrics ---
             if d_logits is not None and len(d_logits) > 0:
                 pi_list = [F.softmax(lg, dim=-1) for lg in d_logits]
                 terms = [
@@ -794,15 +790,11 @@ class SAC(Agent):
                             alpha * c_logp_agg.mean() - q_pi.detach().mean()
                         )
             else:
-                if Vmin_pi is not None:
-                    if d_logits is not None:
-                        d_actor_loss_val = (
-                            alpha * (-d_entropy) - Vmin_pi.detach().mean()
-                        )
-                    if c_logp_agg is not None:
-                        c_actor_loss_val = (
-                            alpha * c_logp_agg.mean() - Vmin_pi.detach().mean()
-                        )
+                # Q-mode metrics: report KL loss for discrete, c_actor for continuous
+                if d_logits is not None:
+                    d_actor_loss_val = d_kl_loss.detach()
+                if c_logp_agg is not None:
+                    c_actor_loss_val = c_actor_loss.detach()
 
         with torch.no_grad():
             cl = (critic_loss_1 + critic_loss_2) / 2
@@ -1031,3 +1023,21 @@ class SAC(Agent):
         for i, adv in enumerate(adv_heads):
             out = out + (pi_heads[i] * adv).sum(dim=-1)
         return out
+
+    def _soft_v(
+        self,
+        v: torch.Tensor,
+        adv_heads: Optional[List[torch.Tensor]],
+        alpha: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute soft value: V_soft(s, a_c) = V(s,a_c) + Σ_i α · logsumexp(A_i(·)/α)
+        This is the log-partition form of the soft Bellman equation for
+        the discrete action dimensions, given the additive Q decomposition
+        Q(s,a_c,a_d) = V(s,a_c) + Σ_i A_i(s,a_c,k_i).
+        """
+        sv = v.squeeze(-1)
+        if adv_heads is not None:
+            for adv in adv_heads:
+                sv = sv + alpha * torch.logsumexp(adv / alpha, dim=-1)
+        return sv
