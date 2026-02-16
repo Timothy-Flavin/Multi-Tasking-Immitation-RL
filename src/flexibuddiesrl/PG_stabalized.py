@@ -308,11 +308,12 @@ class PG(nn.Module, Agent):
         self.actor_logstd = None
         self.optimizer: torch.optim.Adam
         if self.std_type == "stateless":
-            self.actor_logstd = nn.Parameter(
-                torch.zeros(self.continuous_action_dim).to(self.device),
-                requires_grad=True,
-            )  # TODO: Check this for expand as
-            self.actor_logstd.retain_grad()
+            # Initialize so that tanh+rescale maps to log_std=0 (std=1.0)
+            # tanh(0.5493) = 0.5 → -3 + 0.5*(1-(-3))*(0.5+1) = -3 + 2*1.5 = 0.0
+            init_val = torch.full(
+                (self.continuous_action_dim,), 0.5493, device=self.device
+            )
+            self.actor_logstd = nn.Parameter(init_val, requires_grad=True)
 
         self.optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
 
@@ -378,7 +379,8 @@ class PG(nn.Module, Agent):
                 assert (
                     self.std_type == "stateless"
                 ), "Log std logits should only be none if we don't want the actor producing them aka stateless"
-                continuous_log_std_logits = self.actor_logstd
+                # Smooth tanh+rescale bounding (matches actor diagonal/full behavior)
+                continuous_log_std_logits = self._smooth_clamp_logstd()
             if debug:
                 print(
                     f"  After actor: clog {continuous_logits}, dlog{discrete_action_logits}"
@@ -503,7 +505,7 @@ class PG(nn.Module, Agent):
             continuous_log_std_logits is not None
         ), f"Inside _continuous_mle_imitation_loss: log std logits is none for type: {self.std_type}"
 
-        continuous_log_std_logits.expand_as(continuous_mean_logits)
+        continuous_log_std_logits = continuous_log_std_logits.expand_as(continuous_mean_logits)
 
         # If self.action_clamp_type == tanh, then we will use tanh to clamp both the
         # action ranges and standard deviations of the output distribution.
@@ -646,17 +648,17 @@ class PG(nn.Module, Agent):
 
         if self.continuous_action_dim > 0 and continuous_actions is not None:
             if self.naive_imitation:
-                continuous_imitation_loss = self._continuous_mle_imitation_loss(
-                    continuous_mean_logits,
-                    continuous_log_std_logits,
-                    continuous_actions,
-                )
-            else:
                 continuous_imitation_loss = self._continuous_naive_imitation_loss(
                     continuous_mean_logits,
                     continuous_log_std_logits,
                     continuous_actions,
                     0.1,
+                )
+            else:
+                continuous_imitation_loss = self._continuous_mle_imitation_loss(
+                    continuous_mean_logits,
+                    continuous_log_std_logits,
+                    continuous_actions,
                 )
         if self.discrete_action_dims is not None and discrete_actions is not None:
             discrete_imitation_loss = self._discrete_imitation_loss(
@@ -696,12 +698,19 @@ class PG(nn.Module, Agent):
             values, disc_advantages, cont_advantages = self.critic(obs)
             return values.squeeze(-1)
 
+    def _smooth_clamp_logstd(self):
+        """Smoothly bound actor_logstd to log_std_clamp_range using tanh+rescale.
+        Unlike hard clamp, gradient is never zero so the optimizer can always adjust std."""
+        low, high = self.log_std_clamp_range
+        return low + 0.5 * (high - low) * (torch.tanh(self.actor_logstd) + 1.0)
+
     def _get_cont_log_probs_entropy(
         self, logits, actions, lstd_logits: torch.Tensor | None = None
     ):
         lstd = -1.0
         if self.actor_logstd is not None:
-            lstd = self.actor_logstd.expand_as(logits)
+            # Smooth tanh+rescale bounding (never zero gradient)
+            lstd = self._smooth_clamp_logstd().expand_as(logits)
         else:
             assert (
                 lstd_logits is not None
@@ -714,30 +723,22 @@ class PG(nn.Module, Agent):
 
         if self.action_clamp_type == "tanh":
             dist = torch.distributions.Normal(
-                loc=torch.clip(logits, -4.0, 4.0), scale=torch.exp(lstd)
+                loc=logits, scale=torch.exp(lstd)
             )
             # dist = TransformedDistribution(dist, TanhTransform())
             # print("actions were tanhed so we need to get form raw to dist activations")
             # print(f"actions: {actions[:,0]}")
             activations = minmaxnorm(actions, self.min_actions, self.max_actions)
-            activations = torch.clamp(activations, -0.999329299739, 0.999329299739)
+            activations = torch.clamp(activations, -(1.0 - 1e-6), 1.0 - 1e-6)
             activations = torch.atanh(activations)
-            # print(f"inverse tanh actions: {activations[:,0]}")
-            # print(
-            #    f"from raw logit means: {logits} and scale {torch.clip(torch.exp(lstd), min=1e-6)}"
-            # )
 
         else:
             dist = torch.distributions.Normal(loc=logits, scale=torch.exp(lstd))
             activations = actions
 
         log_probs = dist.log_prob(activations).sum(dim=-1)
-        # correction = torch.zeros_like(log_probs, dtype=torch.float)
 
         if self.action_clamp_type == "tanh":
-            # print(
-            #    f"log prob shape: {log_probs.shape} activ shape: {activations.shape} softplus thing: {F.softplus(-2 * activations).shape}"
-            # )
             log_probs -= 2 * (
                 np.log(2) - activations - F.softplus(-2 * activations)
             ).sum(dim=-1)
@@ -769,7 +770,7 @@ class PG(nn.Module, Agent):
         #     )
         # log_probs = torch.clamp(log_probs, -100, 2)
         # eloss = eloss * 100
-        eloss = dist.entropy().clip(-1.0).mean()
+        eloss = dist.entropy().mean()
         return log_probs, eloss
 
     def _print_grad_norm(self):
@@ -789,7 +790,9 @@ class PG(nn.Module, Agent):
             batch.__getattr__(self.batch_name_map["obs"])[agent_num, indices]
         ).squeeze(-1)
         # G should be shape [batch_size] and V_current [batch_size]
-        critic_loss = 0.5 * ((V_current - G[indices]) ** 2).mean()
+        assert V_current.shape == G[indices].squeeze(-1).shape
+
+        critic_loss = 0.5 * ((V_current - G[indices].squeeze(-1)) ** 2).mean()
         return critic_loss
 
     def _calculate_advantages(self, batch: FlexiBatch, agent_num=0, debug=False):
@@ -1032,9 +1035,9 @@ class PG(nn.Module, Agent):
                 f"  bsize: {bsize}, Mini batch indices: {mini_batch_indices}, nbatch: {nbatch}"
             )
 
-        bnum = 0
         self.end_early = False
         for epoch in range(self.n_epochs):
+            bnum = 0
             if self.end_early:
                 bnum = max(0.01, bnum)
                 break
@@ -1222,7 +1225,7 @@ class PG(nn.Module, Agent):
     def _continuous_log_probs_per_dim(self, logits, lstd_logits, actions):
         lstd = -1.0
         if self.actor_logstd is not None:
-            lstd = self.actor_logstd.expand_as(logits)
+            lstd = self._smooth_clamp_logstd().expand_as(logits)
         else:
             assert (
                 lstd_logits is not None
@@ -1231,11 +1234,11 @@ class PG(nn.Module, Agent):
         # TODO: Make this track better, this is a hack
         self.mean_std = torch.exp(lstd.detach().mean(0).cpu())
         dist = torch.distributions.Normal(
-            loc=torch.clip(logits, min=-4.0, max=4.0), scale=torch.exp(lstd)
+            loc=logits, scale=torch.exp(lstd)
         )
         if self.action_clamp_type == "tanh":
             activations = minmaxnorm(actions, self.min_actions, self.max_actions)
-            activations = torch.clamp(activations, -0.999329299739, 0.999329299739)
+            activations = torch.clamp(activations, -(1.0 - 1e-6), 1.0 - 1e-6)
             activations = torch.atanh(activations)
         else:
             activations = actions
@@ -1243,7 +1246,7 @@ class PG(nn.Module, Agent):
         if self.action_clamp_type == "tanh":
             log_probs -= 2 * (np.log(2) - activations - F.softplus(-2 * activations))
 
-        c_entropy = dist.entropy().clip(-1.0).sum(-1)
+        c_entropy = dist.entropy().sum(-1)
 
         if torch.min(log_probs) < -20:
             print(
@@ -1442,14 +1445,14 @@ class PG(nn.Module, Agent):
         if self.continuous_action_dim > 0:
             lstd = -1.0
             if self.actor_logstd is not None:
-                lstd = self.actor_logstd.expand_as(continuous_means)
+                lstd = self._smooth_clamp_logstd().expand_as(continuous_means)
             else:
                 assert (
                     continuous_log_std_logits is not None
                 ), "If the actor doesnt generate logits then it needs to have a global logstd"
                 lstd = continuous_log_std_logits.expand_as(continuous_means)
             c_dist = torch.distributions.Normal(
-                loc=torch.clip(continuous_means, min=-4.0, max=4.0),
+                loc=continuous_means,
                 scale=torch.exp(lstd),
             )
         return d_dists, c_dist
@@ -1683,12 +1686,12 @@ class PG(nn.Module, Agent):
 
                 loss = self.value_loss_coef * critic_loss + actor_loss
                 self.optimizer.zero_grad()
+                loss.backward()
                 if self.clip_grad:
                     torch.nn.utils.clip_grad_norm_(self.actor.parameters(), 0.5)
                     torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
                     if self.mixer is not None and self.mix_type == "QMIX":
                         torch.nn.utils.clip_grad_norm_(self.mixer.parameters(), 0.5)
-                loss.backward()
                 self.optimizer.step()
 
                 avg_actor_loss += actor_loss.item()
@@ -1769,7 +1772,7 @@ class PG(nn.Module, Agent):
 
         # for i in range(len(self.attrs)):
         self._get_torch_params(self.encoder)
-        self.policy_loss = 5.0
+        self.policy_loss = 1.0
         self.actor.load_state_dict(torch.load(checkpoint_path + "/PI"))
         self.critic.load_state_dict(torch.load(checkpoint_path + "/V"))
         self.actor_logstd = torch.load(checkpoint_path + "/actor_logstd")
