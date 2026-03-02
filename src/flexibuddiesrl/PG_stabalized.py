@@ -59,9 +59,8 @@ class PG(nn.Module, Agent):
         },
         mix_type=None,  # [None, 'VDN', 'QMIX']
         mixer_dim=128,
-        importance_schedule=[10.0, 1.0, 10000],  # start end nsteps
+        importance_schedule=[0.0, 1.0, 10000],  # start_alpha, end_alpha, n_steps
         importance_from_grad=True,
-        softmax_importance_scale=True,
         on_policy_mixer=True,
         logit_reg=0.05,
         relative_entropy_loss=0.05,
@@ -85,13 +84,17 @@ class PG(nn.Module, Agent):
             return
 
         # Set up the params for Qmixed PPO
-        self.importance_temperature = importance_schedule[0]
-        self.max_importance_temperature = importance_schedule[0]
-        self.min_importance_temperature = importance_schedule[1]
-        self.importance_temperature_steps = importance_schedule[2]
+        # importance_alpha controls the power-law exponent for credit assignment:
+        #   alpha=0  -> uniform weights (safe exploration)
+        #   alpha=1  -> true importance |A_i|/sum(|A_j|)
+        #   alpha>1  -> sharpened beyond ground truth
+        # Power-law is scale-free: (c*x)^a / sum((c*x)^a) = x^a / sum(x^a)
+        self.importance_alpha = importance_schedule[0]
+        self.importance_alpha_start = importance_schedule[0]
+        self.importance_alpha_end = importance_schedule[1]
+        self.importance_alpha_steps = importance_schedule[2]
         self.importance_step = 0
         self.importance_from_grad = importance_from_grad
-        self.softmax_importance_scale = softmax_importance_scale
         self.on_policy_mixer = on_policy_mixer
         self.mixer_dim = mixer_dim
 
@@ -1340,11 +1343,12 @@ class PG(nn.Module, Agent):
         return importance
 
     def _update_importance(self):
-        # based on importance step, max and min, and nsteps, scale importance temperature
-        frac = min(self.importance_step / self.importance_temperature_steps, 1.0)
-        self.importance_temperature = (
-            self.max_importance_temperature * (1.0 - frac)
-            + self.min_importance_temperature * frac
+        # Linearly anneal alpha from start to end over n_steps updates.
+        # alpha=0 -> uniform, alpha=1 -> true importance.
+        frac = min(self.importance_step / self.importance_alpha_steps, 1.0)
+        self.importance_alpha = (
+            self.importance_alpha_start * (1.0 - frac)
+            + self.importance_alpha_end * frac
         )
         self.importance_step += 1
 
@@ -1696,16 +1700,12 @@ class PG(nn.Module, Agent):
             # print(scaled_importance)
             self._update_importance()
 
-            if self.softmax_importance_scale:
-                scaled_importance = torch.softmax(
-                    scaled_importance / self.importance_temperature, dim=-1
-                )
-                # print(scaled_importance)
-            else:
-                scaled_importance = (
-                    scaled_importance.abs() + self.importance_temperature
-                )
-                scaled_importance /= scaled_importance.sum(dim=-1).unsqueeze(-1)
+            # Power-law importance: scale-free by construction.
+            # |x_i|^alpha / sum(|x_j|^alpha) is invariant to reward scaling
+            # because (c*x)^a / sum((c*x)^a) = x^a / sum(x^a).
+            abs_imp = scaled_importance.abs() + 1e-8
+            powered = abs_imp ** self.importance_alpha
+            scaled_importance = powered / powered.sum(dim=-1, keepdim=True)
 
             # So learning rate doesn't shrink with number of agents
             # scaled_importance *= grad_free_adv.shape[-1]
