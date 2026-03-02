@@ -357,7 +357,7 @@ class DQN(nn.Module, Agent):
 
     def stable_greedy(self, obs, legal_action):
         with torch.no_grad():
-            values, disc_advantages, cont_advantages = self.Q2(obs)
+            values, disc_advantages, cont_advantages = self.Q1(obs)
             dact = None
             cact = None
             if self.has_discrete:

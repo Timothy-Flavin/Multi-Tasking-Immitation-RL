@@ -68,6 +68,7 @@ class PG(nn.Module, Agent):
         wall_time=False,
         joint_kl_penalty=0.1,
         target_kl=0.1,
+        offline_critic_buffer=False,
     ):
         super(PG, self).__init__()
         config = locals()
@@ -134,8 +135,11 @@ class PG(nn.Module, Agent):
         self.logit_reg = logit_reg
         self.mean_std = 1
         self.end_early = False
+        self.use_offline_critic_buffer = offline_critic_buffer
 
         self._sanitize_params()
+        if self.use_offline_critic_buffer:
+            self._init_offline_critic_buffer()
         self._create_mixer()  # This needs to be before _get_torch_params for Adam to work
         self._get_torch_params(encoder, action_head_hidden_dims)
 
@@ -172,6 +176,159 @@ class PG(nn.Module, Agent):
             self.total_action_dims += len(self.discrete_action_dims)
         if self.continuous_action_dim > 0:
             self.total_action_dims += self.continuous_action_dim
+
+    def _init_offline_critic_buffer(self):
+        """Create an internal replay buffer for stabilizing critic training in VDN/QMIX.
+
+        Stores transitions from on-policy rollouts so the critic can be trained
+        on a larger, more diverse set of data (similar to a DQN replay buffer),
+        breaking the correlation between consecutive samples that destabilizes
+        single-trajectory critic updates.
+        """
+        buf_size = 10000
+        individual_registered_vars = {
+            self.batch_name_map["obs"]: ([self.obs_dim], np.float32),
+            self.batch_name_map["obs_"]: ([self.obs_dim], np.float32),
+        }
+        if self.discrete_action_dims is not None:
+            individual_registered_vars[self.batch_name_map["discrete_actions"]] = (
+                [len(self.discrete_action_dims)],
+                np.int64,
+            )
+        if self.continuous_action_dim > 0:
+            individual_registered_vars[self.batch_name_map["continuous_actions"]] = (
+                [self.continuous_action_dim],
+                np.float32,
+            )
+        global_registered_vars = {
+            self.batch_name_map["rewards"]: (None, np.float32),
+        }
+        dac = (
+            self.discrete_action_dims
+            if self.discrete_action_dims is not None
+            else [1]
+        )
+        self._offline_buffer = FlexibleBuffer(
+            num_steps=buf_size,
+            n_agents=1,
+            discrete_action_cardinalities=dac,
+            track_action_mask=False,
+            path="/tmp/ppo_offline_critic",
+            name=f"{self.name}_offline_critic",
+            memory_weights=False,
+            global_registered_vars=global_registered_vars,
+            individual_registered_vars=individual_registered_vars,
+            track_truncation=True,
+        )
+
+    def _add_batch_to_offline_buffer(self, batch: FlexiBatch, agent_num=0):
+        """Copy transitions from an on-policy batch into the offline critic replay buffer."""
+        obs = batch.__getattr__(self.batch_name_map["obs"])[agent_num]
+        obs_ = batch.__getattr__(self.batch_name_map["obs_"])[agent_num]
+        rewards = batch.__getattr__(self.batch_name_map["rewards"])
+        terminated = batch.terminated
+
+        # Convert tensors to numpy for storage
+        if isinstance(obs, torch.Tensor):
+            obs = obs.detach().cpu().numpy()
+        if isinstance(obs_, torch.Tensor):
+            obs_ = obs_.detach().cpu().numpy()
+        if isinstance(rewards, torch.Tensor):
+            rewards = rewards.detach().cpu().numpy()
+        if isinstance(terminated, torch.Tensor):
+            terminated = terminated.detach().cpu().numpy()
+
+        d_actions = None
+        c_actions = None
+        if self.discrete_action_dims is not None:
+            d_actions = batch.__getattr__(self.batch_name_map["discrete_actions"])[
+                agent_num
+            ]
+            if isinstance(d_actions, torch.Tensor):
+                d_actions = d_actions.detach().cpu().numpy()
+        if self.continuous_action_dim > 0:
+            c_actions = batch.__getattr__(self.batch_name_map["continuous_actions"])[
+                agent_num
+            ]
+            if isinstance(c_actions, torch.Tensor):
+                c_actions = c_actions.detach().cpu().numpy()
+
+        for i in range(obs.shape[0]):
+            rv = {
+                self.batch_name_map["obs"]: obs[i : i + 1],
+                self.batch_name_map["obs_"]: obs_[i : i + 1],
+                self.batch_name_map["rewards"]: float(rewards[i]),
+            }
+            if d_actions is not None:
+                rv[self.batch_name_map["discrete_actions"]] = d_actions[i : i + 1]
+            if c_actions is not None:
+                rv[self.batch_name_map["continuous_actions"]] = c_actions[i : i + 1]
+            self._offline_buffer.save_transition(
+                terminated=bool(terminated[i] > 0.5),
+                registered_vals=rv,
+            )
+
+    def _offline_critic_loss(self) -> torch.Tensor:
+        """Sample a mini-batch from the offline buffer and return 1-step TD loss.
+
+        Returns a *loss tensor* (with grad) so the caller can combine it with
+        the actor loss in a single ``optimizer.step()``.  This keeps the critic
+        and actor perfectly synchronized — one gradient step each per
+        mini-batch — and avoids the instability of a separate pre-training
+        phase that can run away from the actor.
+
+        Returns:
+            torch.Tensor: Scalar critic loss (MSE of 1-step TD error).
+            Returns ``torch.zeros(1)`` if the buffer has too few samples.
+        """
+        if self._offline_buffer.steps_recorded < self.mini_batch_size:
+            return torch.zeros(1, device=self.device)
+
+        mb = self._offline_buffer.sample_transitions(
+            batch_size=self.mini_batch_size, as_torch=True, device=self.device
+        )
+
+        obs = mb.__getattr__(self.batch_name_map["obs"])[0]
+        obs_ = mb.__getattr__(self.batch_name_map["obs_"])[0]
+        rewards = mb.__getattr__(self.batch_name_map["rewards"])
+        terminated = mb.terminated
+
+        d_actions = None
+        c_actions = None
+        if self.discrete_action_dims is not None:
+            d_actions = mb.__getattr__(
+                self.batch_name_map["discrete_actions"]
+            )[0]
+        if self.continuous_action_dim > 0:
+            c_actions = mb.__getattr__(
+                self.batch_name_map["continuous_actions"]
+            )[0]
+
+        # Current Q value
+        values, d_adv, c_adv = self.critic(obs)
+        if c_adv is not None:
+            c_adv = torch.transpose(torch.stack(c_adv, dim=0), 0, 1)
+        adv = self._gather_observed_advantages(d_adv, c_adv, d_actions, c_actions)
+        Q = (self.mixer(adv, obs)[0] + values).squeeze(-1)  # type: ignore
+
+        # Target Q value (no gradient)
+        with torch.no_grad():
+            next_values, next_d_adv, next_c_adv = self.critic(obs_)
+            if self.on_policy_mixer:
+                next_Q = next_values.squeeze(-1)
+            else:
+                if next_c_adv is not None:
+                    next_c_adv = torch.transpose(
+                        torch.stack(next_c_adv, dim=0), 0, 1
+                    )
+                next_adv = self._max_advantages(next_d_adv, next_c_adv)
+                next_Q = (
+                    self.mixer(next_adv, obs_)[0] + next_values  # type: ignore
+                ).squeeze(-1)
+
+            target_Q = rewards + self.gamma * (1.0 - terminated) * next_Q
+
+        return ((Q - target_Q) ** 2).mean()
 
     def _assert_params(self):
         assert (
@@ -1467,6 +1624,14 @@ class PG(nn.Module, Agent):
             t = time.time()
         if critic_only:
             return self._mix_critic_only(batch, agent_num)
+
+        # Offline critic buffer: store the on-policy transitions so the
+        # replay buffer grows over time.  The actual critic updates are
+        # interleaved inside the mini-batch loop below (one replay-sampled
+        # TD update per actor mini-batch step) so the two never desynchronise.
+        if self.use_offline_critic_buffer:
+            self._add_batch_to_offline_buffer(batch, agent_num)
+
         obs = batch.__getattr__(self.batch_name_map["obs"])[agent_num]
         obs_ = batch.__getattr__(self.batch_name_map["obs_"])[agent_num]
         d_actions = batch.__getattr__(self.batch_name_map["discrete_actions"])[
@@ -1493,6 +1658,12 @@ class PG(nn.Module, Agent):
         self.mixer.zero_grad()
 
         with torch.no_grad():
+            # V(s) from the dueling critic — used as the GAE baseline so that
+            # per-dimension advantages reflect true action quality.
+            # Previously Q(s,a) = V(s) + mixer(A_i) was used here, which
+            # subtracted the critic's own advantage estimate from the TD errors
+            # and starved the actor of gradient signal as the critic improved.
+            V = values.squeeze(-1)
             Q = (self.mixer(adv, obs)[0] + values).squeeze(-1)
             next_values, next_d_adv, next_c_adv = self.critic(obs_)
             if next_c_adv is not None:
@@ -1503,13 +1674,13 @@ class PG(nn.Module, Agent):
             )
             if self.on_policy_mixer:
                 next_adv = 0
-                next_Q = next_values
+                next_V = next_values.squeeze(-1)
             else:
                 next_adv = self._max_advantages(
                     next_d_adv,
                     next_c_adv,
                 )
-                next_Q = (self.mixer(next_adv, obs_)[0] + next_values).squeeze(-1)
+                next_V = (self.mixer(next_adv, obs_)[0] + next_values).squeeze(-1)
             # critic_target = rewards + self.gamma * (1.0 - terminated) * next_Q
             if self.importance_from_grad:
                 # print(f" grad_free_adv: {grad_free_adv.shape}, adv_grad: {adv_grad.shape}")
@@ -1543,26 +1714,34 @@ class PG(nn.Module, Agent):
             # input()
             G, gae = self._weighted_gae(
                 rewards=rewards,
-                values=Q,
-                bootstrap_values=next_Q,
+                values=V,
+                bootstrap_values=next_V,
                 terminated=terminated,  # type:ignore
                 truncated=truncated,  # type:ignore
                 advantage_weights=scaled_importance,
                 gamma=self.gamma,
                 gae_lambda=self.gae_lambda,
             )
-            # print(f"Q shape: {Q.shape}, G shape: {next_Q.shape}")
-            global_Q, global_GAE = self._weighted_gae(
+            # Critic target: GAE returns based on V(s), used to fit Q(s,a).
+            # G_global = standard_GAE + V(s), which is the correct return
+            # estimate that the decomposed Q should predict.
+            G_critic, global_GAE = self._weighted_gae(
                 rewards=rewards,
-                values=Q,
-                bootstrap_values=next_Q,
+                values=V,
+                bootstrap_values=next_V,
                 terminated=terminated,  # type:ignore
                 truncated=truncated,  # type:ignore
                 advantage_weights=torch.ones_like(rewards).unsqueeze(-1),
                 gamma=self.gamma,
                 gae_lambda=self.gae_lambda,
             )
-            # print(f"global_Q shape: {global_Q.shape}, global_G shape: {global_Q} gamma: {self.gamma}")
+            # print(f"G_critic shape: {G_critic.shape}, gamma: {self.gamma}")
+        # Store per-dimension importance weights for credit-assignment analysis
+        # scaled_importance shape: [n_steps, n_action_dims]
+        importance_per_dim = scaled_importance.mean(dim=0).detach().cpu().numpy()
+        # Full per-step importance for external correlation analysis
+        importance_raw = scaled_importance.detach().cpu().numpy()
+
         # print(rewards)
         indices = np.arange(0, obs.shape[0])
         avg_actor_loss = 0.0
@@ -1606,34 +1785,32 @@ class PG(nn.Module, Agent):
                 mb_c_actions = c_actions[mini_batch_indices]
                 mb_old_log_probs = old_log_probs[mini_batch_indices]
                 mb_gae = gae[mini_batch_indices]
-                mb_global_Q = global_Q[mini_batch_indices]
-                mb_values, mb_d_adv, mb_c_adv = self.critic(mb_obs)
-                if mb_c_adv is not None:
-                    mb_c_adv = torch.transpose(torch.stack(mb_c_adv, dim=0), 0, 1)
+                mb_G_critic = G_critic[mini_batch_indices]
 
-                mb_adv = self._gather_observed_advantages(
-                    mb_d_adv, mb_c_adv, mb_d_actions, mb_c_actions
-                )
-                # assert self.mixer is not None
-                mb_Q = (self.mixer(mb_adv, mb_obs)[0] + mb_values).squeeze(-1)  # type: ignore
-                if isinstance(mb_values, torch.Tensor):
+                # Critic loss — either from on-policy mini-batch or from
+                # the offline replay buffer (interleaved, 1 step per actor step).
+                if self.use_offline_critic_buffer:
+                    critic_loss = self._offline_critic_loss()
+                else:
+                    mb_values, mb_d_adv, mb_c_adv = self.critic(mb_obs)
+                    if mb_c_adv is not None:
+                        mb_c_adv = torch.transpose(torch.stack(mb_c_adv, dim=0), 0, 1)
+
+                    mb_adv = self._gather_observed_advantages(
+                        mb_d_adv, mb_c_adv, mb_d_actions, mb_c_actions
+                    )
+                    mb_Q = (self.mixer(mb_adv, mb_obs)[0] + mb_values).squeeze(-1)  # type: ignore
+                    if isinstance(mb_values, torch.Tensor):
+                        assert (
+                            self.mixer(mb_adv, mb_obs)[0].shape == mb_values.shape
+                        ), f"Shapes don't match in mix rl: {self.mixer(mb_adv, mb_obs)[0].shape} vs {mb_values.shape}"
+                        assert (
+                            mb_Q.shape == mb_G_critic.squeeze(-1).shape
+                        ), f"Shapes don't match in mix rl: {mb_Q.shape} vs {mb_G_critic.squeeze(-1).shape}"
+                    critic_loss = ((mb_Q - mb_G_critic.squeeze(-1)) ** 2).mean()
                     assert (
-                        self.mixer(mb_adv, mb_obs)[0].shape == mb_values.shape
-                    ), f"Shapes don't match in mix rl: {self.mixer(mb_adv, mb_obs)[0].shape} vs {mb_values.shape}"
-                    assert (
-                        mb_Q.shape == mb_global_Q.squeeze(-1).shape
-                    ), f"Shapes don't match in mix rl: {mb_Q.shape} vs {mb_global_Q.squeeze(-1).shape}"
-                critic_loss = ((mb_Q - mb_global_Q.squeeze(-1)) ** 2).mean()
-                # input()
-                # print(f"mb_Q: {mb_Q.mean()}, mb_global_Q: {mb_global_Q.squeeze(-1).mean()}")
-                # input(f"are these similar? {(mb_Q - mb_global_Q.squeeze(-1)).mean()}")
-                assert (
-                    mb_Q.shape == mb_global_Q.squeeze(-1).shape
-                ), f"Shapes don't match in mix rl: {mb_Q.shape} vs {mb_global_Q.squeeze(-1).shape}"
-                # print(
-                #     f" mb_Q: {mb_Q.shape}, mb_global_Q: {mb_global_Q.squeeze(-1).shape}"
-                # )
-                # print(f"critic loss: {critic_loss.item()}")
+                        mb_Q.shape == mb_G_critic.squeeze(-1).shape
+                    ), f"Shapes don't match in mix rl: {mb_Q.shape} vs {mb_G_critic.squeeze(-1).shape}"
 
                 (
                     mb_new_log_probs,
@@ -1722,10 +1899,14 @@ class PG(nn.Module, Agent):
             "c_std": self.mean_std,
             "rl_time": t,
             "joint_kl": avg_joint_kl,
+            "importance_per_dim": importance_per_dim,
+            "importance_raw": importance_raw,
         }
         # Turn any tensor params into numpy.
         # Detach gradient if has grad and send to cpu if on gpu
         for k in result.keys():
+            if k in ("importance_per_dim", "importance_raw"):
+                continue  # keep as ndarray
             v = result[k]
             if isinstance(v, torch.Tensor):
                 v = v.detach()

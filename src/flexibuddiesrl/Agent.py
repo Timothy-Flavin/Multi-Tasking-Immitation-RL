@@ -899,12 +899,15 @@ class QMixer(nn.Module):
         # --- Generate weights and biases from the state using hypernetworks ---
 
         # First layer weights and biases
-        # Enforce non-negativity on weights for monotonicity
-        w1 = torch.abs(self.hyper_w1(state))
+        # Enforce non-negativity on weights for monotonicity.
+        # softplus allows weights to approach 0 much more easily than abs(),
+        # which helps the mixer learn to *ignore* an agent when the state
+        # indicates its action is irrelevant (e.g. context-dependent credit).
+        w1 = F.softplus(self.hyper_w1(state))
         b1 = self.hyper_b1(state)
 
         # Second layer weights and the final bias (V(s))
-        w2 = torch.abs(self.hyper_w2(state))
+        w2 = F.softplus(self.hyper_w2(state))
         b2 = self.hyper_b2(state)
 
         # --- Reshape for batch matrix multiplication ---
