@@ -12,6 +12,8 @@ from torch.distributions import TransformedDistribution, TanhTransform
 import torch.nn.functional as F
 import collections
 
+_LOG2 = float(np.log(2.0))
+
 
 class PG(nn.Module, Agent):
     def __init__(
@@ -157,13 +159,12 @@ class PG(nn.Module, Agent):
             self.discrete_action_dims = None
         if self.mix_type is not None and self.mix_type.lower() == "none":
             self.mix_type = None
-        for k in ["VDN", "QMIX"]:
-            if self.mix_type is not None and self.mix_type.lower() == "vdn":
-                self.mix_type = "VDN"
-                self.advantage_type = "qmix"
-            if self.mix_type is not None and self.mix_type.lower() == "qmix":
-                self.mix_type = "QMIX"
-                self.advantage_type = "qmix"
+        if self.mix_type is not None and self.mix_type.lower() == "vdn":
+            self.mix_type = "VDN"
+            self.advantage_type = "qmix"
+        elif self.mix_type is not None and self.mix_type.lower() == "qmix":
+            self.mix_type = "QMIX"
+            self.advantage_type = "qmix"
 
         if self.continuous_action_dim is not None and self.continuous_action_dim > 0:
             if isinstance(self.max_actions, list):
@@ -490,8 +491,6 @@ class PG(nn.Module, Agent):
                 ],
                 axis=-1,
             )
-        elif x is None:
-            return None
         else:
             return np.array(x)
 
@@ -517,7 +516,7 @@ class PG(nn.Module, Agent):
         if not torch.is_tensor(observations):
             observations = T(observations, device=self.device, dtype=torch.float)
         if action_mask is not None and not torch.is_tensor(action_mask):
-            action_mask = torch.tensor(action_mask, dtype=torch.float).to(self.device)
+            action_mask = torch.tensor(action_mask, dtype=torch.float, device=self.device)
 
         if debug:
             print(f"  After tensor check: Observations{observations}")
@@ -592,9 +591,9 @@ class PG(nn.Module, Agent):
         )
         adiscrete, acontinuous = None, None
         if ad["discrete_actions"] is not None:
-            adiscrete = torch.tensor(ad["discrete_actions"]).to(self.device)
+            adiscrete = torch.tensor(ad["discrete_actions"], device=self.device)
         if ad["continuous_actions"] is not None:
-            acontinuous = torch.tensor(ad["continuous_actions"]).to(self.device)
+            acontinuous = torch.tensor(ad["continuous_actions"], device=self.device)
         return adiscrete, acontinuous
 
     # takes the observations and returns the action with the highest probability
@@ -844,7 +843,7 @@ class PG(nn.Module, Agent):
 
     def utility_function(self, observations, actions=None):
         if not torch.is_tensor(observations):
-            observations = torch.tensor(observations, dtype=torch.float).to(self.device)
+            observations = torch.tensor(observations, dtype=torch.float, device=self.device)
         if actions is not None:
             return self.critic(observations, actions)
         else:
@@ -900,7 +899,7 @@ class PG(nn.Module, Agent):
 
         if self.action_clamp_type == "tanh":
             log_probs -= 2 * (
-                np.log(2) - activations - F.softplus(-2 * activations)
+                _LOG2 - activations - F.softplus(-2 * activations)
             ).sum(dim=-1)
 
         if torch.min(log_probs) < -100:
@@ -1366,17 +1365,15 @@ class PG(nn.Module, Agent):
         advantages = torch.zeros_like(advantage_weights).to(advantage_weights.device)
         num_steps = len(rewards)
         last_gae_lam = torch.zeros(advantage_weights.shape[1]).to(self.device)
+        not_terminated = (terminated < 0.1).float()
+        not_done = ((terminated < 0.1) & (truncated < 0.1)).float()
         for step in reversed(range(num_steps)):
-            if terminated[step] > 0.1:
-                next_value = 0.0
-            else:
-                next_value = gamma * bootstrap_values[step]
+            next_value = gamma * bootstrap_values[step] * not_terminated[step]
 
-            ep_not_over = float((terminated[step] < 0.1) and (truncated[step] < 0.1))
             delta = rewards[step] + next_value - values[step]
             weighted_delta = delta * advantage_weights[step]
             last_gae_lam = (
-                weighted_delta + gamma * gae_lambda * ep_not_over * last_gae_lam
+                weighted_delta + gamma * gae_lambda * not_done[step] * last_gae_lam
             )
 
             advantages[step] = last_gae_lam
@@ -1405,7 +1402,7 @@ class PG(nn.Module, Agent):
             activations = actions
         log_probs = dist.log_prob(activations)
         if self.action_clamp_type == "tanh":
-            log_probs -= 2 * (np.log(2) - activations - F.softplus(-2 * activations))
+            log_probs -= 2 * (_LOG2 - activations - F.softplus(-2 * activations))
 
         c_entropy = dist.entropy().sum(-1)
 
@@ -1799,11 +1796,12 @@ class PG(nn.Module, Agent):
                     mb_adv = self._gather_observed_advantages(
                         mb_d_adv, mb_c_adv, mb_d_actions, mb_c_actions
                     )
-                    mb_Q = (self.mixer(mb_adv, mb_obs)[0] + mb_values).squeeze(-1)  # type: ignore
+                    mb_mixer_out = self.mixer(mb_adv, mb_obs)[0]
+                    mb_Q = (mb_mixer_out + mb_values).squeeze(-1)  # type: ignore
                     if isinstance(mb_values, torch.Tensor):
                         assert (
-                            self.mixer(mb_adv, mb_obs)[0].shape == mb_values.shape
-                        ), f"Shapes don't match in mix rl: {self.mixer(mb_adv, mb_obs)[0].shape} vs {mb_values.shape}"
+                            mb_mixer_out.shape == mb_values.shape
+                        ), f"Shapes don't match in mix rl: {mb_mixer_out.shape} vs {mb_values.shape}"
                         assert (
                             mb_Q.shape == mb_G_critic.squeeze(-1).shape
                         ), f"Shapes don't match in mix rl: {mb_Q.shape} vs {mb_G_critic.squeeze(-1).shape}"
