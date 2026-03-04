@@ -1096,7 +1096,23 @@ class QS(nn.Module):
         ), "Cant qmix factorize q values if the mixing network has not been initialized"
         return self.mixing_network(qs, state)
 
-    def forward(self, x, action_mask=None):
+    def forward(self, x, action_mask=None, policy_weights=None):
+        """
+        Args:
+            x: observations, shape (batch_size, obs_dim) or (obs_dim,)
+            action_mask: optional action mask (not yet implemented)
+            policy_weights: optional gradient-free policy probabilities used to
+                centre dueling advantages.  When ``None`` (default) the uniform
+                mean is subtracted (standard dueling).  When provided it should
+                be a dict with optional keys:
+                    "discrete": list of tensors, one per discrete action dim,
+                        each shaped (batch_size, cardinality_i).  Probabilities
+                        must sum to 1 along the last dimension.
+                    "continuous": list of tensors, one per continuous bin group,
+                        each shaped (batch_size, n_bins_i).
+                All tensors are detached internally so no gradient flows through
+                the weighting.
+        """
         # TODO: action mask implementation
         x = T(x, self.device)
         # print(f"starting x shape: {x.shape} {len(x.shape)}")
@@ -1128,6 +1144,13 @@ class QS(nn.Module):
         elif self.advantage_heads is not None:
             advantages = self.advantage_heads(x)
 
+        # Unpack optional policy weights for advantage centering
+        disc_policy = None
+        cont_policy = None
+        if policy_weights is not None:
+            disc_policy = policy_weights.get("discrete", None)
+            cont_policy = policy_weights.get("continuous", None)
+
         tot_disc_dims = 0
         disc_advantages = None
         cont_advantages = None
@@ -1138,12 +1161,19 @@ class QS(nn.Module):
             for i, dim in enumerate(self.disc_action_dims):
                 end = start + dim
                 disc_advantages.append(advantages[:, start:end])
-                if (
-                    self.dueling
-                ):  # These are mean zero when dueling or Q values when not
-                    disc_advantages[-1] = disc_advantages[-1] - disc_advantages[
-                        -1
-                    ].mean(dim=-1, keepdim=True)
+                if self.dueling:
+                    # Centre advantages: policy-weighted mean if weights
+                    # are supplied, uniform mean otherwise.
+                    if disc_policy is not None and i < len(disc_policy):
+                        pi = disc_policy[i].detach()  # (batch, cardinality_i)
+                        weighted_mean = (pi * disc_advantages[-1]).sum(
+                            dim=-1, keepdim=True
+                        )
+                        disc_advantages[-1] = disc_advantages[-1] - weighted_mean
+                    else:
+                        disc_advantages[-1] = disc_advantages[-1] - disc_advantages[
+                            -1
+                        ].mean(dim=-1, keepdim=True)
                 if single_dim:
                     disc_advantages[-1] = disc_advantages[-1].squeeze(0)
                 start = end
@@ -1151,11 +1181,16 @@ class QS(nn.Module):
         if self.cont_action_dim > 0 and advantages is not None:
             cont_advantages = []
             start = tot_disc_dims
-            for bins in self.c_action_bins:
+            for j, bins in enumerate(self.c_action_bins):
                 end = start + bins
                 adv = advantages[:, start:end]
                 if self.dueling:
-                    adv = adv - adv.mean(dim=-1, keepdim=True)
+                    if cont_policy is not None and j < len(cont_policy):
+                        pi = cont_policy[j].detach()  # (batch, n_bins_j)
+                        weighted_mean = (pi * adv).sum(dim=-1, keepdim=True)
+                        adv = adv - weighted_mean
+                    else:
+                        adv = adv - adv.mean(dim=-1, keepdim=True)
                 if single_dim:
                     adv = adv.squeeze(0)
                 cont_advantages.append(adv)

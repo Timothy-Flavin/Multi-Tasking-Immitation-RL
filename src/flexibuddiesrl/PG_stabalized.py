@@ -309,26 +309,27 @@ class PG(nn.Module, Agent):
             )[0]
 
         # Current Q value
-        values, d_adv, c_adv = self.critic(obs)
+        pw = self._get_policy_weights(obs) if self.on_policy_mixer else None
+        values, d_adv, c_adv = self.critic(obs, policy_weights=pw)
         if c_adv is not None:
             c_adv = torch.transpose(torch.stack(c_adv, dim=0), 0, 1)
         adv = self._gather_observed_advantages(d_adv, c_adv, d_actions, c_actions)
         Q = (self.mixer(adv, obs)[0] + values).squeeze(-1)  # type: ignore
 
-        # Target Q value (no gradient)
+        # Target Q value (no gradient) — value-only target, no advantage centering needed
         with torch.no_grad():
             next_values, next_d_adv, next_c_adv = self.critic(obs_)
-            if self.on_policy_mixer:
-                next_Q = next_values.squeeze(-1)
-            else:
-                if next_c_adv is not None:
-                    next_c_adv = torch.transpose(
-                        torch.stack(next_c_adv, dim=0), 0, 1
-                    )
-                next_adv = self._max_advantages(next_d_adv, next_c_adv)
-                next_Q = (
-                    self.mixer(next_adv, obs_)[0] + next_values  # type: ignore
-                ).squeeze(-1)
+            #if self.on_policy_mixer:
+            next_Q = next_values.squeeze(-1)
+            # else:
+            #     if next_c_adv is not None:
+            #         next_c_adv = torch.transpose(
+            #             torch.stack(next_c_adv, dim=0), 0, 1
+            #         )
+            #     next_adv = self._max_advantages(next_d_adv, next_c_adv)
+            #     next_Q = (
+            #         self.mixer(next_adv, obs_)[0] + next_values  # type: ignore
+            #     ).squeeze(-1)
 
             target_Q = rewards + self.gamma * (1.0 - terminated) * next_Q
 
@@ -1540,7 +1541,8 @@ class PG(nn.Module, Agent):
         truncated = batch.truncated
         if truncated is None:
             truncated = torch.zeros_like(rewards)
-        values, d_adv, c_adv = self.critic(obs)
+        pw = self._get_policy_weights(obs) if self.on_policy_mixer else None
+        values, d_adv, c_adv = self.critic(obs, policy_weights=pw)
         if c_adv is not None:
             c_adv = torch.transpose(torch.stack(c_adv, dim=0), 0, 1)
 
@@ -1548,25 +1550,26 @@ class PG(nn.Module, Agent):
         Q = (self.mixer(adv, obs)[0] + values).squeeze(-1)  # type:ignore
 
         with torch.no_grad():
+            # Value-only target — no advantage centering needed for V(s')
             next_values, next_d_adv, next_c_adv = self.critic(obs_)
-            if next_c_adv is not None:
-                next_c_adv = torch.transpose(torch.stack(next_c_adv, dim=0), 0, 1)
+            #if next_c_adv is not None:
+            #    next_c_adv = torch.transpose(torch.stack(next_c_adv, dim=0), 0, 1)
 
-            if self.on_policy_mixer:
-                next_adv = 0
-                next_Q = next_values
-            else:
-                next_adv = self._max_advantages(
-                    next_d_adv,
-                    next_c_adv,
-                )
-                # print(
-                #     f"self.mixer(next_adv, obs_)[0]: {self.mixer(next_adv, obs_)[0].shape}, next_values : {next_values.shape}"
-                # )
-                next_Q = (
-                    self.mixer(next_adv, obs_)[0] + next_values  # type:ignore
-                ).squeeze(-1)
-                # print(f"next_Q: {next_Q.shape}")
+            #if self.on_policy_mixer:
+            next_adv = 0
+            next_Q = next_values
+            # else:
+            #     next_adv = self._max_advantages(
+            #         next_d_adv,
+            #         next_c_adv,
+            #     )
+            #     # print(
+            #     #     f"self.mixer(next_adv, obs_)[0]: {self.mixer(next_adv, obs_)[0].shape}, next_values : {next_values.shape}"
+            #     # )
+            #     next_Q = (
+            #         self.mixer(next_adv, obs_)[0] + next_values  # type:ignore
+            #     ).squeeze(-1)
+            #     # print(f"next_Q: {next_Q.shape}")
             global_Q, global_GAE = self._weighted_gae(
                 rewards=rewards,
                 values=Q,
@@ -1591,6 +1594,35 @@ class PG(nn.Module, Agent):
         return {
             "rl_critic_loss": critic_loss.item(),
         }
+
+    @torch.no_grad()
+    def _get_policy_weights(self, obs: torch.Tensor) -> dict | None:
+        """Return gradient-free policy probabilities for dueling advantage centering.
+
+        Computes softmax probabilities for every discrete action head from
+        the current actor.  Called once on the full observation tensor before
+        the mini-batch loop so the actor forward pass is not repeated per batch.
+
+        Continuous action bins are intentionally **not** weighted here:
+        computing the exact probability mass in each bin requires evaluating
+        the CDF of the squashed Gaussian (tanh-Normal) at every bin edge for
+        every sample and every action dimension — O(batch * c_dim * n_bins)
+        erf/erfinv calls with no efficient batched closed-form — making it
+        prohibitively expensive for a quantity that only slightly biases the
+        advantage baseline.
+
+        Returns:
+            dict with key ``"discrete"`` mapping to a list of
+            ``(batch, cardinality_i)`` probability tensors, or ``None`` when
+            there are no discrete action dims.
+        """
+        if self.discrete_action_dims is None:
+            return None
+        _, _, discrete_logits = self.actor(obs)
+        disc_probs = [
+            torch.softmax(logits, dim=-1) for logits in discrete_logits
+        ]
+        return {"discrete": disc_probs}
 
     def _get_dists(self, obs):
         d_dists, c_dist = None, None
@@ -1647,8 +1679,14 @@ class PG(nn.Module, Agent):
         if truncated is None:
             truncated = torch.zeros_like(rewards)
 
+        # Compute policy weights once for all obs before the mini-batch
+        # loop.  Only discrete probs are included (continuous bin probs are
+        # prohibitively expensive — see _get_policy_weights docstring).
+        # Target uses V(s') only, so no policy weights needed for obs_.
+        pw = self._get_policy_weights(obs) if self.on_policy_mixer else None
+
         with torch.no_grad():
-            values, d_adv, c_adv = self.critic(obs)
+            values, d_adv, c_adv = self.critic(obs, policy_weights=pw)
             if c_adv is not None:
                 c_adv = torch.transpose(torch.stack(c_adv, dim=0), 0, 1)
 
@@ -1666,6 +1704,7 @@ class PG(nn.Module, Agent):
             # and starved the actor of gradient signal as the critic improved.
             V = values.squeeze(-1)
             Q = (self.mixer(adv, obs)[0] + values).squeeze(-1)
+            # Value-only target — no advantage centering needed for V(s')
             next_values, next_d_adv, next_c_adv = self.critic(obs_)
             if next_c_adv is not None:
                 next_c_adv = torch.transpose(torch.stack(next_c_adv, dim=0), 0, 1)
@@ -1784,12 +1823,19 @@ class PG(nn.Module, Agent):
                 mb_gae = gae[mini_batch_indices]
                 mb_G_critic = G_critic[mini_batch_indices]
 
+                # Slice pre-computed policy weights for this mini-batch
+                mb_pw = None
+                if pw is not None:
+                    mb_pw = {
+                        "discrete": [p[mini_batch_indices] for p in pw["discrete"]]
+                    }
+
                 # Critic loss — either from on-policy mini-batch or from
                 # the offline replay buffer (interleaved, 1 step per actor step).
                 if self.use_offline_critic_buffer:
                     critic_loss = self._offline_critic_loss()
                 else:
-                    mb_values, mb_d_adv, mb_c_adv = self.critic(mb_obs)
+                    mb_values, mb_d_adv, mb_c_adv = self.critic(mb_obs, policy_weights=mb_pw)
                     if mb_c_adv is not None:
                         mb_c_adv = torch.transpose(torch.stack(mb_c_adv, dim=0), 0, 1)
 
