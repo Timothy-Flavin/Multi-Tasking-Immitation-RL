@@ -28,12 +28,12 @@ from toy_env import ContextualDecouplerEnv
 # -- Hyper-parameters ---------------------------------------------------------
 N_ACTIONS = 5
 OBS_DIM = 3  # [context, target_0, target_1]
-TOTAL_STEPS = 150_000
+TOTAL_STEPS = 50_000
 BATCH_SIZE = 1024
 MINI_BATCH_SIZE = 128
 N_EPOCHS = 3
-LR = 3e-4
-SEEDS = [0, 1, 2]
+LR = 1e-3
+SEEDS = [0, 1]
 
 CONFIGS = {
     # "independent": dict(

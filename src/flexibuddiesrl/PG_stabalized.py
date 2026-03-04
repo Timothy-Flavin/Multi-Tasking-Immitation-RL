@@ -1599,30 +1599,111 @@ class PG(nn.Module, Agent):
     def _get_policy_weights(self, obs: torch.Tensor) -> dict | None:
         """Return gradient-free policy probabilities for dueling advantage centering.
 
-        Computes softmax probabilities for every discrete action head from
-        the current actor.  Called once on the full observation tensor before
-        the mini-batch loop so the actor forward pass is not repeated per batch.
+        Computes softmax probabilities for every discrete action head and
+        Normal-CDF bin probabilities for every continuous action dimension
+        from the current actor.  Called once on the full observation tensor
+        before the mini-batch loop so the actor forward pass is not repeated
+        per batch.
 
-        Continuous action bins are intentionally **not** weighted here:
-        computing the exact probability mass in each bin requires evaluating
-        the CDF of the squashed Gaussian (tanh-Normal) at every bin edge for
-        every sample and every action dimension — O(batch * c_dim * n_bins)
-        erf/erfinv calls with no efficient batched closed-form — making it
-        prohibitively expensive for a quantity that only slightly biases the
-        advantage baseline.
+        For continuous dims with ``action_clamp_type == "tanh"`` (squashed
+        Gaussian), bin edges in action-space are mapped back through atanh
+        into pre-squash space where the Normal CDF can be evaluated directly.
+        For ``"clamp"`` or ``None``, the CDF is evaluated on the raw edges.
+        This is O(batch * c_dim * n_bins) of vectorised erfc calls — cheap.
 
         Returns:
-            dict with key ``"discrete"`` mapping to a list of
-            ``(batch, cardinality_i)`` probability tensors, or ``None`` when
-            there are no discrete action dims.
+            dict with optional keys:
+                ``"discrete"``: list of (batch, cardinality_i) prob tensors
+                ``"continuous"``: list of (batch, n_bins_i) prob tensors
+            Returns ``None`` only when there are no action dims at all.
         """
-        if self.discrete_action_dims is None:
+        has_discrete = self.discrete_action_dims is not None
+        has_continuous = self.continuous_action_dim > 0
+
+        if not has_discrete and not has_continuous:
             return None
-        _, _, discrete_logits = self.actor(obs)
-        disc_probs = [
-            torch.softmax(logits, dim=-1) for logits in discrete_logits
-        ]
-        return {"discrete": disc_probs}
+
+        continuous_means, continuous_log_std_logits, discrete_logits = self.actor(obs)
+
+        result: dict = {}
+
+        # ---- Discrete probs ----
+        if has_discrete:
+            result["discrete"] = [
+                torch.softmax(logits, dim=-1) for logits in discrete_logits
+            ]
+
+        # ---- Continuous bin probs via Normal CDF ----
+        if has_continuous and self.min_actions is not None and self.max_actions is not None:
+            # Resolve log-std the same way _get_cont_log_probs_entropy does
+            if self.actor_logstd is not None:
+                lstd = self._smooth_clamp_logstd().expand_as(continuous_means)
+            else:
+                assert continuous_log_std_logits is not None
+                lstd = continuous_log_std_logits.expand_as(continuous_means)
+            std = torch.exp(lstd)  # (batch, c_dim)
+
+            c_bin_probs = []
+            dim_offset = 0
+            for d, n_bins in enumerate(self.critic.c_action_bins):
+                mu_d = continuous_means[:, d]    # (batch,)
+                std_d = std[:, d]                # (batch,)
+                lo = self.min_actions[d].item()
+                hi = self.max_actions[d].item()
+
+                # n_bins edges between lo and hi (inclusive), giving n_bins-1
+                # interior intervals plus 2 tails = n_bins bins total
+                # Actually the critic uses n_bins outputs, with bin centres at
+                # linspace(lo, hi, n_bins).  The edges sit at half-bin-widths
+                # outside each centre, giving n_bins+1 edges (first = -inf,
+                # last = +inf for the tails).
+                centres = torch.linspace(lo, hi, n_bins, device=obs.device)
+                if n_bins > 1:
+                    half_bw = (centres[1] - centres[0]) * 0.5
+                    # Interior edges between adjacent centres
+                    interior_edges = (centres[:-1] + centres[1:]) * 0.5  # (n_bins-1,)
+                else:
+                    interior_edges = torch.tensor([], device=obs.device)
+
+                # Map edges to pre-squash space if using tanh squashing
+                if self.action_clamp_type == "tanh":
+                    # Clamp within (-1+eps, 1-eps) to keep atanh finite
+                    interior_edges = interior_edges.clamp(-1 + 1e-6, 1 - 1e-6)
+                    u_edges = torch.atanh(interior_edges)  # (n_bins-1,)
+                else:
+                    u_edges = interior_edges
+
+                # Normal CDF at each interior edge: Phi((u - mu) / sigma)
+                # u_edges: (n_bins-1,)  mu_d, std_d: (batch,)
+                if len(u_edges) > 0:
+                    z = (u_edges.unsqueeze(0) - mu_d.unsqueeze(1)) / (
+                        std_d.unsqueeze(1) + 1e-8
+                    )  # (batch, n_bins-1)
+                    cdf_vals = 0.5 * (1.0 + torch.erf(z / 1.4142135623730951))
+                    # Prepend 0 and append 1 for the leftmost/rightmost tails
+                    zeros = torch.zeros(cdf_vals.shape[0], 1, device=obs.device)
+                    ones = torch.ones(cdf_vals.shape[0], 1, device=obs.device)
+                    cdf_full = torch.cat([zeros, cdf_vals, ones], dim=-1)  # (batch, n_bins+1)
+                else:
+                    # Single bin: all probability mass
+                    cdf_full = torch.cat(
+                        [
+                            torch.zeros(obs.shape[0], 1, device=obs.device),
+                            torch.ones(obs.shape[0], 1, device=obs.device),
+                        ],
+                        dim=-1,
+                    )
+
+                bin_probs = cdf_full[:, 1:] - cdf_full[:, :-1]  # (batch, n_bins)
+                # Clamp to avoid negative probs from floating point
+                bin_probs = bin_probs.clamp(min=1e-8)
+                # Re-normalise so probs sum to 1
+                bin_probs = bin_probs / bin_probs.sum(dim=-1, keepdim=True)
+                c_bin_probs.append(bin_probs)
+
+            result["continuous"] = c_bin_probs
+
+        return result if result else None
 
     def _get_dists(self, obs):
         d_dists, c_dist = None, None
@@ -1826,9 +1907,11 @@ class PG(nn.Module, Agent):
                 # Slice pre-computed policy weights for this mini-batch
                 mb_pw = None
                 if pw is not None:
-                    mb_pw = {
-                        "discrete": [p[mini_batch_indices] for p in pw["discrete"]]
-                    }
+                    mb_pw = {}
+                    if "discrete" in pw:
+                        mb_pw["discrete"] = [p[mini_batch_indices] for p in pw["discrete"]]
+                    if "continuous" in pw:
+                        mb_pw["continuous"] = [p[mini_batch_indices] for p in pw["continuous"]]
 
                 # Critic loss — either from on-policy mini-batch or from
                 # the offline replay buffer (interleaved, 1 step per actor step).
