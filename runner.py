@@ -18,8 +18,10 @@ import sys, os
 
 sys.path.insert(0, os.path.dirname(__file__))
 
+import json
 import numpy as np
 import torch
+import matplotlib.pyplot as plt
 from flexibuddiesrl.PG_stabalized import PG
 from flexibuff import FlexibleBuffer
 from torch.utils.tensorboard import SummaryWriter
@@ -28,23 +30,23 @@ from toy_env import ContextualDecouplerEnv
 # -- Hyper-parameters ---------------------------------------------------------
 N_ACTIONS = 5
 OBS_DIM = 3  # [context, target_0, target_1]
-TOTAL_STEPS = 50_000
+TOTAL_STEPS = 100_000
 BATCH_SIZE = 1024
 MINI_BATCH_SIZE = 128
-N_EPOCHS = 3
+N_EPOCHS = 4
 LR = 1e-3
-SEEDS = [0, 1]
+SEEDS = [0, 1, 2, 3, 4]
 
 CONFIGS = {
-    # "independent": dict(
-    #     independent=True,
-    # ),
-    # "shared_nomix": dict(
-    #     discrete_action_dims=[N_ACTIONS, N_ACTIONS],
-    #     mix_type=None,
-    #     offline_critic_buffer=False,
-    #     advantage_type="gae",
-    # ),
+    "independent": dict(
+        independent=True,
+    ),
+    "shared_nomix": dict(
+        discrete_action_dims=[N_ACTIONS, N_ACTIONS],
+        mix_type=None,
+        offline_critic_buffer=False,
+        advantage_type="gae",
+    ),
     "VDN": dict(
         discrete_action_dims=[N_ACTIONS, N_ACTIONS],
         mix_type="VDN",
@@ -78,6 +80,7 @@ def _make_common_kwargs():
         max_actions=np.zeros(1),
         device="cpu",
         entropy_loss=0.01,
+        hidden_dims=[64, 64],
         ppo_clip=0.2,
         value_clip=0.2,
         norm_advantages=True,
@@ -237,8 +240,9 @@ def run_joint(config_name, cfg, seed, writer):
     updates = 0
     batch_contexts = []  # context per step in current batch
 
-    # Accumulate importance metrics over training for final report
+    # Accumulate time-series for plotting
     importance_history = []
+    reward_curve = []  # (update_idx, smoothed_reward)
 
     for step in range(TOTAL_STEPS):
         obs_f = obs.astype(np.float32)
@@ -267,6 +271,7 @@ def run_joint(config_name, cfg, seed, writer):
             writer.add_scalar("Reward/episode", ep_reward, ep_num)
             smoothed_reward = 0.95 * smoothed_reward + 0.05 * ep_reward
             writer.add_scalar("Reward/smoothed", smoothed_reward, ep_num)
+            reward_curve.append((step, smoothed_reward))
             ep_num += 1
             ep_reward = 0.0
             obs, _ = env.reset()
@@ -306,6 +311,7 @@ def run_joint(config_name, cfg, seed, writer):
     return {
         "smoothed_reward": smoothed_reward,
         "importance_history": importance_history,
+        "reward_curve": reward_curve,
     }
 
 
@@ -337,6 +343,7 @@ def run_independent(seed, writer):
     ep_num = 0
     smoothed_reward = 0.0
     updates = 0
+    reward_curve = []
 
     for step in range(TOTAL_STEPS):
         obs_f = obs.astype(np.float32)
@@ -372,6 +379,7 @@ def run_independent(seed, writer):
             writer.add_scalar("Reward/episode", ep_reward, ep_num)
             smoothed_reward = 0.95 * smoothed_reward + 0.05 * ep_reward
             writer.add_scalar("Reward/smoothed", smoothed_reward, ep_num)
+            reward_curve.append((step, smoothed_reward))
             ep_num += 1
             ep_reward = 0.0
             obs, _ = env.reset()
@@ -398,7 +406,7 @@ def run_independent(seed, writer):
 
     writer.close()
     print(f"  [independent seed={seed}] done - smoothed reward = {smoothed_reward:.2f}")
-    return {"smoothed_reward": smoothed_reward, "importance_history": []}
+    return {"smoothed_reward": smoothed_reward, "importance_history": [], "reward_curve": reward_curve}
 
 
 # -- Main ----------------------------------------------------------------------
@@ -464,6 +472,171 @@ def main():
             print(f"      Context=1  corr={c1:+.3f}  head1_dominance={d1:.1%}")
     print("=" * 72)
 
+    # -- Save raw data so plots can be regenerated without re-running ---------
+    _save_results(results, "experiment_results.json")
+
+    # -- Matplotlib figures for paper sanity check ----------------------------
+    _plot_results(results)
+
+
+def _smooth_series(x, y, window=20):
+    """Simple moving-average smoother for plotting."""
+    x, y = np.array(x), np.array(y)
+    if len(y) <= window:
+        return x, y
+    kernel = np.ones(window) / window
+    y_smooth = np.convolve(y, kernel, mode="valid")
+    x_smooth = x[window - 1 :]
+    return x_smooth, y_smooth
+
+
+def _interpolate_to_common_steps(curves, n_points=500):
+    """Interpolate variable-length reward curves to a common step axis.
+
+    Returns:
+        common_steps: (n_points,)
+        matrix: (n_seeds, n_points)
+    """
+    if not curves:
+        return None, None
+    max_step = max(c[-1][0] for c in curves if len(c) > 0)
+    common_steps = np.linspace(0, max_step, n_points)
+    matrix = np.full((len(curves), n_points), np.nan)
+    for i, curve in enumerate(curves):
+        if len(curve) == 0:
+            continue
+        xs, ys = zip(*curve)
+        matrix[i] = np.interp(common_steps, xs, ys)
+    return common_steps, matrix
+
+
+def _plot_results(results):
+    """Generate two publication-style figures: reward curves and importance analysis."""
+
+    # ---- Figure 1: Reward learning curves (mean ± std over seeds) ----------
+    fig1, ax1 = plt.subplots(figsize=(8, 5))
+    colors = plt.cm.tab10.colors  # type: ignore
+    for ci, (cfg_name, runs) in enumerate(results.items()):
+        curves = [r["reward_curve"] for r in runs]
+        curves = [c for c in curves if len(c) > 0]
+        if not curves:
+            continue
+        steps, matrix = _interpolate_to_common_steps(curves)
+        if steps is None:
+            continue
+        mean = np.nanmean(matrix, axis=0)
+        std = np.nanstd(matrix, axis=0)
+        color = colors[ci % len(colors)]
+        ax1.plot(steps, mean, label=cfg_name, color=color, linewidth=1.5)
+        ax1.fill_between(steps, mean - std, mean + std, alpha=0.18, color=color)
+    ax1.set_xlabel("Environment Steps", fontsize=16)
+    ax1.set_ylabel("Smoothed Episode Reward", fontsize=16)
+    ax1.set_title("VDN-PPO Sanity Check: Reward Curves (mean ± 1 std, n={})".format(len(SEEDS)), fontsize=16)
+    ax1.legend(fontsize=14, ncol=2)
+    ax1.grid(True, alpha=0.3)
+    fig1.tight_layout()
+    fig1.savefig("reward_curves.png", dpi=50)
+    print("\n  Saved reward_curves.png")
+
+    # ---- Figure 2: Importance / credit-assignment analysis -----------------
+    # For configs with a mixer, plot head-0 dominance when ctx=0 and
+    # head-1 dominance when ctx=1 over training updates.
+    mixer_cfgs = [
+        (name, runs)
+        for name, runs in results.items()
+        if any(len(r["importance_history"]) > 0 for r in runs)
+    ]
+    if not mixer_cfgs:
+        return
+
+    n_plots = len(mixer_cfgs)
+    fig2, axes = plt.subplots(1, n_plots, figsize=(5 * n_plots, 4.5), squeeze=False)
+
+    for pi, (cfg_name, runs) in enumerate(mixer_cfgs):
+        ax = axes[0, pi]
+        for si, r in enumerate(runs):
+            hist = r["importance_history"]
+            if len(hist) == 0:
+                continue
+            updates = np.arange(len(hist))
+            # Head-0 dominance when context=0
+            h0_dom = np.array([h.get("ctx0_h0_dom", np.nan) for h in hist])
+            # Head-1 dominance when context=1
+            h1_dom = np.array([h.get("ctx1_h1_dom", np.nan) for h in hist])
+            # Overall correlation
+            ov_corr = np.array([h.get("overall_corr", np.nan) for h in hist])
+
+            alpha = 0.35 if len(SEEDS) > 1 else 1.0
+            if si == 0:  # only label once
+                ax.plot(updates, h0_dom, color="C0", alpha=alpha, linewidth=0.8, label="ctx=0 h0 dom")
+                ax.plot(updates, h1_dom, color="C1", alpha=alpha, linewidth=0.8, label="ctx=1 h1 dom")
+                ax.plot(updates, ov_corr, color="C2", alpha=alpha, linewidth=0.8, label="overall corr")
+            else:
+                ax.plot(updates, h0_dom, color="C0", alpha=alpha, linewidth=0.8)
+                ax.plot(updates, h1_dom, color="C1", alpha=alpha, linewidth=0.8)
+                ax.plot(updates, ov_corr, color="C2", alpha=alpha, linewidth=0.8)
+
+        # Plot mean across seeds on top
+        all_hists = [r["importance_history"] for r in runs if len(r["importance_history"]) > 0]
+        if all_hists:
+            min_len = min(len(h) for h in all_hists)
+            mean_h0 = np.nanmean([[h["ctx0_h0_dom"] for h in hist[:min_len] if "ctx0_h0_dom" in h] or [np.nan] for hist in all_hists], axis=0)
+            mean_h1 = np.nanmean([[h["ctx1_h1_dom"] for h in hist[:min_len] if "ctx1_h1_dom" in h] or [np.nan] for hist in all_hists], axis=0)
+            mean_corr = np.nanmean([[h["overall_corr"] for h in hist[:min_len] if "overall_corr" in h] or [np.nan] for hist in all_hists], axis=0)
+            upd = np.arange(len(mean_h0))
+            ax.plot(upd, mean_h0, color="C0", linewidth=2.2, label="mean h0 dom (ctx=0)")
+            ax.plot(upd, mean_h1, color="C1", linewidth=2.2, label="mean h1 dom (ctx=1)")
+            ax.plot(upd, mean_corr, color="C2", linewidth=2.2, linestyle="--", label="mean overall corr")
+
+        ax.axhline(0.5, color="gray", linestyle=":", alpha=0.5, label="chance")
+        ax.set_xlabel("Training Updates", fontsize=12)
+        ax.set_ylabel("Dominance / Correlation", fontsize=12)
+        ax.set_title(cfg_name, fontsize=12)
+        ax.set_ylim(-0.15, 1.05)
+        ax.legend(fontsize=10, loc="lower right")
+        ax.grid(True, alpha=0.3)
+
+    fig2.suptitle(
+        "Credit Assignment: Per-Context Head Dominance (n={})".format(len(SEEDS)),
+        fontsize=11,
+    )
+    fig2.tight_layout()
+    fig2.savefig("importance_analysis.png", dpi=150)
+    print("  Saved importance_analysis.png")
+
+    plt.show()
+
+
+def _save_results(results, path):
+    """Serialise experiment results to JSON so plots can be regenerated."""
+    serialisable = {}
+    for cfg_name, runs in results.items():
+        serialisable[cfg_name] = []
+        for r in runs:
+            entry = {
+                "smoothed_reward": float(r["smoothed_reward"]),
+                "reward_curve": [[float(s), float(v)] for s, v in r["reward_curve"]],
+                "importance_history": [
+                    {k: float(v) for k, v in h.items()} for h in r["importance_history"]
+                ],
+            }
+            serialisable[cfg_name].append(entry)
+    with open(path, "w") as f:
+        json.dump(serialisable, f)
+    print(f"\n  Saved experiment data to {path}")
+
+
+def _load_results(path):
+    """Load previously saved results from JSON."""
+    with open(path, "r") as f:
+        return json.load(f)
+
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) > 1 and sys.argv[1] == "--plot-only":
+        path = sys.argv[2] if len(sys.argv) > 2 else "experiment_results.json"
+        print(f"Loading saved data from {path}...")
+        results = _load_results(path)
+        _plot_results(results)
+    else:
+        main()
