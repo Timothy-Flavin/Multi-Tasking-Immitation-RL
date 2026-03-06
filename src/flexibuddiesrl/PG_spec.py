@@ -461,7 +461,8 @@ def PG_integration():
                         writer.add_scalars("StDev", scalar_labels, i)
                     else:
                         print(f"k: {k} v: {v}")
-                        writer.add_scalar(f"RL/{k}", v, i)
+                        if k not in ["importance_per_dim", "importance_raw"]:
+                            writer.add_scalar(f"RL/{k}", v, i)
                 print(f"Iteration {i}, {rl_metrics}")
                 mem_buff.reset()
         print(model)
