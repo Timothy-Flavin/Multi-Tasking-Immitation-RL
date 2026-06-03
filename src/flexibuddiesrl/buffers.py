@@ -118,6 +118,7 @@ class BaseBuffer(ABC):
         action_space: spaces.Space = None,
         device: th.device | str = "auto",
         n_envs: int = 1,
+        n_agents: int = 1,
         obs_shape: tuple[int, ...] = None,
         action_dim: int = None,
         action_dtype: th.dtype = th.float32,
@@ -126,6 +127,7 @@ class BaseBuffer(ABC):
         self.buffer_size = buffer_size
         self.device = get_device(device)
         self.n_envs = n_envs
+        self.n_agents = n_agents
         self.action_dtype = action_dtype
         # 1. Auto-infer integer dtype if the action space is discrete/binary
         if action_space is not None and isinstance(action_space, (spaces.Discrete, spaces.MultiDiscrete, spaces.MultiBinary)):
@@ -153,10 +155,19 @@ class BaseBuffer(ABC):
 
     @staticmethod
     def swap_and_flatten(tensor: th.Tensor) -> th.Tensor:
+        """
+        Swap and flatten Time, Agent, and Env dimensions into a single batch dimension.
+        Input shape: [Time, Agent, Env, ...]
+        Output shape: [Time * Agent * Env, ...]
+        """
         shape = tensor.shape
-        if len(shape) < 3:
+        if len(shape) < 4:
+            # Add a dummy dimension if needed to ensure we have at least [T, A, E, 1]
             shape = (*shape, 1)
-        return tensor.transpose(0, 1).reshape(shape[0] * shape[1], *shape[2:])
+        # Transpose to [Agent, Env, Time, ...] is not what we want.
+        # We want to keep time-order within each stream if possible, 
+        # but usually we just flatten everything for off-policy.
+        return tensor.reshape(-1, *shape[3:])
 
     def size(self) -> int:
         return self.buffer_size if self.full else self.pos
@@ -194,6 +205,7 @@ class ReplayBuffer(BaseBuffer):
         action_space: spaces.Space = None,
         device: th.device | str = "auto",
         n_envs: int = 1,
+        n_agents: int = 1,
         obs_shape: tuple[int, ...] = None,
         action_dim: int = None,
         optimize_memory_usage: bool = False,
@@ -201,23 +213,23 @@ class ReplayBuffer(BaseBuffer):
         action_dtype: th.dtype = th.float32,
     ):
         super().__init__(
-            buffer_size, observation_space, action_space, device, n_envs, 
+            buffer_size, observation_space, action_space, device, n_envs, n_agents,
             obs_shape=obs_shape, action_dim=action_dim, action_dtype=action_dtype
         )
         
-        self.buffer_size = max(buffer_size // n_envs, 1)
+        self.buffer_size = max(buffer_size // (n_envs * n_agents), 1)
         self.optimize_memory_usage = optimize_memory_usage
         self.handle_timeout_termination = handle_timeout_termination
 
-        # Initialize Pinned Tensors
-        self.observations = _pin(th.zeros((self.buffer_size, self.n_envs, *self.obs_shape), dtype=th.float32))
+        # Initialize Pinned Tensors [Time, Agent, Env, ...]
+        self.observations = _pin(th.zeros((self.buffer_size, self.n_agents, self.n_envs, *self.obs_shape), dtype=th.float32))
         if not optimize_memory_usage:
-            self.next_observations = _pin(th.zeros((self.buffer_size, self.n_envs, *self.obs_shape), dtype=th.float32))
+            self.next_observations = _pin(th.zeros((self.buffer_size, self.n_agents, self.n_envs, *self.obs_shape), dtype=th.float32))
 
-        self.actions = _pin(th.zeros((self.buffer_size, self.n_envs, self.action_dim), dtype=self.action_dtype))
-        self.rewards = _pin(th.zeros((self.buffer_size, self.n_envs), dtype=th.float32))
-        self.terms = _pin(th.zeros((self.buffer_size, self.n_envs), dtype=th.float32))
-        self.truncs = _pin(th.zeros((self.buffer_size, self.n_envs), dtype=th.float32))
+        self.actions = _pin(th.zeros((self.buffer_size, self.n_agents, self.n_envs, self.action_dim), dtype=self.action_dtype))
+        self.rewards = _pin(th.zeros((self.buffer_size, self.n_agents, self.n_envs), dtype=th.float32))
+        self.terms = _pin(th.zeros((self.buffer_size, self.n_agents, self.n_envs), dtype=th.float32))
+        self.truncs = _pin(th.zeros((self.buffer_size, self.n_agents, self.n_envs), dtype=th.float32))
 
     def add(
         self,
@@ -228,34 +240,38 @@ class ReplayBuffer(BaseBuffer):
         term: np.ndarray | th.Tensor,
         trunc: np.ndarray | th.Tensor,
     ) -> None:
-        self.observations[self.pos].copy_(th.as_tensor(obs).reshape((self.n_envs, *self.obs_shape)))
+        # Expect inputs to be shaped [n_agents, n_envs, ...]
+        self.observations[self.pos].copy_(th.as_tensor(obs).reshape((self.n_agents, self.n_envs, *self.obs_shape)))
         if self.optimize_memory_usage:
-            self.observations[(self.pos + 1) % self.buffer_size].copy_(th.as_tensor(next_obs).reshape((self.n_envs, *self.obs_shape)))
+            self.observations[(self.pos + 1) % self.buffer_size].copy_(th.as_tensor(next_obs).reshape((self.n_agents, self.n_envs, *self.obs_shape)))
         else:
-            self.next_observations[self.pos].copy_(th.as_tensor(next_obs).reshape((self.n_envs, *self.obs_shape)))
+            self.next_observations[self.pos].copy_(th.as_tensor(next_obs).reshape((self.n_agents, self.n_envs, *self.obs_shape)))
 
-        self.actions[self.pos].copy_(th.as_tensor(action).reshape((self.n_envs, self.action_dim)))
-        self.rewards[self.pos].copy_(th.as_tensor(reward))
-        self.terms[self.pos].copy_(th.as_tensor(term))
-        self.truncs[self.pos].copy_(th.as_tensor(trunc))
+        self.actions[self.pos].copy_(th.as_tensor(action).reshape((self.n_agents, self.n_envs, self.action_dim)))
+        self.rewards[self.pos].copy_(th.as_tensor(reward).reshape((self.n_agents, self.n_envs)))
+        self.terms[self.pos].copy_(th.as_tensor(term).reshape((self.n_agents, self.n_envs)))
+        self.truncs[self.pos].copy_(th.as_tensor(trunc).reshape((self.n_agents, self.n_envs)))
 
         self.pos = (self.pos + 1) % self.buffer_size
         if self.pos == 0:
             self.full = True
 
     def _get_samples(self, batch_inds: th.Tensor) -> ReplayBufferSamples:
+        # Sample random agent and env for each time index
+        agent_indices = th.randint(0, self.n_agents, (len(batch_inds),))
         env_indices = th.randint(0, self.n_envs, (len(batch_inds),))
-        obs = self.observations[batch_inds, env_indices]
-        actions = self.actions[batch_inds, env_indices]
+        
+        obs = self.observations[batch_inds, agent_indices, env_indices]
+        actions = self.actions[batch_inds, agent_indices, env_indices]
         
         if self.optimize_memory_usage:
-            next_obs = self.observations[(batch_inds + 1) % self.buffer_size, env_indices]
+            next_obs = self.observations[(batch_inds + 1) % self.buffer_size, agent_indices, env_indices]
         else:
-            next_obs = self.next_observations[batch_inds, env_indices]
+            next_obs = self.next_observations[batch_inds, agent_indices, env_indices]
 
-        rewards = self.rewards[batch_inds, env_indices].reshape(-1, 1)
-        terms = self.terms[batch_inds, env_indices].reshape(-1, 1)
-        truncs = self.truncs[batch_inds, env_indices].reshape(-1, 1)
+        rewards = self.rewards[batch_inds, agent_indices, env_indices].reshape(-1, 1)
+        terms = self.terms[batch_inds, agent_indices, env_indices].reshape(-1, 1)
+        truncs = self.truncs[batch_inds, agent_indices, env_indices].reshape(-1, 1)
 
         return ReplayBufferSamples(
             self.to_torch(obs), self.to_torch(actions), self.to_torch(next_obs),
@@ -271,6 +287,7 @@ class RolloutBuffer(BaseBuffer):
         action_space: spaces.Space = None,
         device: th.device | str = "auto",
         n_envs: int = 1,
+        n_agents: int = 1,
         obs_shape: tuple[int, ...] = None,
         action_dim: int = None,
         gae_lambda: float = 1.0,
@@ -278,7 +295,7 @@ class RolloutBuffer(BaseBuffer):
         action_dtype: th.dtype = th.float32,
     ):
         super().__init__(
-            buffer_size, observation_space, action_space, device, n_envs,
+            buffer_size, observation_space, action_space, device, n_envs, n_agents,
             obs_shape=obs_shape, action_dim=action_dim, action_dtype=action_dtype
         )
         self.gae_lambda = gae_lambda
@@ -287,33 +304,31 @@ class RolloutBuffer(BaseBuffer):
         self.reset()
 
     def reset(self) -> None:
-        self.observations = _pin(th.zeros((self.buffer_size, self.n_envs, *self.obs_shape), dtype=th.float32))
-        self.actions = _pin(th.zeros((self.buffer_size, self.n_envs, self.action_dim), dtype=self.action_dtype))
-        self.rewards = _pin(th.zeros((self.buffer_size, self.n_envs), dtype=th.float32))
-        self.returns = _pin(th.zeros((self.buffer_size, self.n_envs), dtype=th.float32))
-        self.terminations = _pin(th.zeros((self.buffer_size, self.n_envs), dtype=th.float32))
-        self.truncations = _pin(th.zeros((self.buffer_size, self.n_envs), dtype=th.float32))
-        self.values = _pin(th.zeros((self.buffer_size, self.n_envs), dtype=th.float32))
-        self.log_probs = _pin(th.zeros((self.buffer_size, self.n_envs), dtype=th.float32))
-        self.advantages = _pin(th.zeros((self.buffer_size, self.n_envs), dtype=th.float32))
+        self.observations = _pin(th.zeros((self.buffer_size, self.n_agents, self.n_envs, *self.obs_shape), dtype=th.float32))
+        self.actions = _pin(th.zeros((self.buffer_size, self.n_agents, self.n_envs, self.action_dim), dtype=self.action_dtype))
+        self.rewards = _pin(th.zeros((self.buffer_size, self.n_agents, self.n_envs), dtype=th.float32))
+        self.returns = _pin(th.zeros((self.buffer_size, self.n_agents, self.n_envs), dtype=th.float32))
+        self.terminations = _pin(th.zeros((self.buffer_size, self.n_agents, self.n_envs), dtype=th.float32))
+        self.truncations = _pin(th.zeros((self.buffer_size, self.n_agents, self.n_envs), dtype=th.float32))
+        self.values = _pin(th.zeros((self.buffer_size, self.n_agents, self.n_envs), dtype=th.float32))
+        self.log_probs = _pin(th.zeros((self.buffer_size, self.n_agents, self.n_envs), dtype=th.float32))
+        self.advantages = _pin(th.zeros((self.buffer_size, self.n_agents, self.n_envs), dtype=th.float32))
         self.generator_ready = False
         super().reset()
 
     def compute_returns_and_advantage(
         self, last_values: th.Tensor, terminations: np.ndarray, truncations: np.ndarray
     ) -> None:
-        last_values = last_values.flatten()
-        last_gae_lam = 0
+        # last_values expected shape [n_agents, n_envs]
+        last_values = last_values.reshape(self.n_agents, self.n_envs)
+        last_gae_lam = th.zeros((self.n_agents, self.n_envs), device=self.device)
         
-        terms_t = th.as_tensor(terminations, dtype=th.float32).flatten()
-        truncs_t = th.as_tensor(truncations, dtype=th.float32).flatten()
+        terms_t = th.as_tensor(terminations, dtype=th.float32).reshape(self.n_agents, self.n_envs)
+        truncs_t = th.as_tensor(truncations, dtype=th.float32).reshape(self.n_agents, self.n_envs)
 
         for step in reversed(range(self.buffer_size)):
             if step == self.buffer_size - 1:
-                # Value bootstrap applies if episode truncates, but not if it terminates natively.
                 next_non_terminal = 1.0 - terms_t
-                
-                # Prevent GAE advantage from bleeding over an episode boundary (either terminated or truncated)
                 next_episode_continuation = 1.0 - th.clamp(terms_t + truncs_t, 0.0, 1.0)
                 next_values = last_values
             else:
@@ -328,13 +343,13 @@ class RolloutBuffer(BaseBuffer):
         self.returns.copy_(self.advantages + self.values)
 
     def add(self, obs, action, reward, termination, truncation, value, log_prob) -> None:
-        self.observations[self.pos].copy_(th.as_tensor(obs).reshape((self.n_envs, *self.obs_shape)))
-        self.actions[self.pos].copy_(th.as_tensor(action).reshape((self.n_envs, self.action_dim)))
-        self.rewards[self.pos].copy_(th.as_tensor(reward))
-        self.terminations[self.pos].copy_(th.as_tensor(termination))
-        self.truncations[self.pos].copy_(th.as_tensor(truncation))
-        self.values[self.pos].copy_(value.flatten())
-        self.log_probs[self.pos].copy_(log_prob.reshape(self.n_envs))
+        self.observations[self.pos].copy_(th.as_tensor(obs).reshape((self.n_agents, self.n_envs, *self.obs_shape)))
+        self.actions[self.pos].copy_(th.as_tensor(action).reshape((self.n_agents, self.n_envs, self.action_dim)))
+        self.rewards[self.pos].copy_(th.as_tensor(reward).reshape((self.n_agents, self.n_envs)))
+        self.terminations[self.pos].copy_(th.as_tensor(termination).reshape((self.n_agents, self.n_envs)))
+        self.truncations[self.pos].copy_(th.as_tensor(truncation).reshape((self.n_agents, self.n_envs)))
+        self.values[self.pos].copy_(value.reshape(self.n_agents, self.n_envs))
+        self.log_probs[self.pos].copy_(log_prob.reshape(self.n_agents, self.n_envs))
         
         self.pos += 1
         if self.pos == self.buffer_size:
@@ -342,10 +357,8 @@ class RolloutBuffer(BaseBuffer):
 
     def get(self, batch_size: int | None = None) -> Generator[RolloutBufferSamples, None, None]:
         assert self.full, "Rollout buffer must be full before sampling"
-        indices = np.random.permutation(self.buffer_size * self.n_envs)
+        indices = np.random.permutation(self.buffer_size * self.n_agents * self.n_envs)
 
-        # Prepare the data by swapping and flattening (Time, Envs) -> (Time * Envs)
-        # We use the staticmethod swap_and_flatten from BaseBuffer
         observations = self.swap_and_flatten(self.observations)
         actions = self.swap_and_flatten(self.actions)
         values = self.swap_and_flatten(self.values)
@@ -354,9 +367,8 @@ class RolloutBuffer(BaseBuffer):
         returns = self.swap_and_flatten(self.returns)
 
         start_idx = 0
-        while start_idx < self.buffer_size * self.n_envs:
-            # If batch_size is None, return all data at once
-            end_idx = start_idx + (batch_size if batch_size is not None else self.buffer_size * self.n_envs)
+        while start_idx < self.buffer_size * self.n_agents * self.n_envs:
+            end_idx = start_idx + (batch_size if batch_size is not None else self.buffer_size * self.n_agents * self.n_envs)
             yield self._get_samples(indices[start_idx:end_idx], 
                                     observations, actions, values, 
                                     log_probs, advantages, returns)
