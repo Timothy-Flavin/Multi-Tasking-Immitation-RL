@@ -254,6 +254,11 @@ def run_profiling(agent_type, mode, total_steps=50000, device=None):
     print(f"Updates performed: {len(update_times)}")
 
     # Save plot of rewards over time
+    os.makedirs("profile_results", exist_ok=True)
+    np.save(
+        f"profile_results/rewards_{agent_type}_{mode}_{device}.npy",
+        np.array(rewards),
+    )
     plt.figure(figsize=(10, 5))
     plt.plot(rewards, label="Episode Rewards")
     plt.xlabel("Episode")
@@ -261,7 +266,7 @@ def run_profiling(agent_type, mode, total_steps=50000, device=None):
     plt.title(f"{agent_type} ({mode}) Rewards Over Time")
     plt.legend()
     plt.grid()
-    plt.savefig(f"{agent_type}_{mode}_{device}_rewards.png")
+    plt.savefig(f"profile_results/{agent_type}_{mode}_{device}_rewards.png")
     plt.close()
 
     return {

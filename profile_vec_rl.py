@@ -301,7 +301,11 @@ def run_profiling_new(
     sps = steps_done / duration
 
     print(f"Profiling Results: {sps:.2f} SPS | Duration: {duration:.4f}s")
-
+    os.makedirs("profile_results", exist_ok=True)
+    np.save(
+        f"profile_results/rewards_{agent_type}_{mode}_{device.type}_fullgpu_{full_gpu}.npy",
+        np.array(rewards_history),
+    )
     plt.figure(figsize=(10, 5))
     plt.plot(rewards_history, label="Episode Rewards")
     plt.xlabel("Episode")
@@ -309,7 +313,7 @@ def run_profiling_new(
     plt.title(f"{agent_type} ({mode}) EnvPool Rewards | GPU={full_gpu}")
     plt.grid()
     plt.savefig(
-        f"new_profiler_{agent_type}_{mode}_{device.type}_fullgpu_{full_gpu}.png"
+        f"profile_results/new_profiler_{agent_type}_{mode}_{device.type}_fullgpu_{full_gpu}.png"
     )
     plt.close()
 

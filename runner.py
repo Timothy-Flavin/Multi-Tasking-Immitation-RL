@@ -23,6 +23,8 @@ import numpy as np
 import torch
 import matplotlib.pyplot as plt
 from flexibuddiesrl.PG_stabalized import PG
+from flexibuddiesrl.SAC import SAC
+from flexibuddiesrl.DQN import DQN
 from flexibuff import FlexibleBuffer
 from torch.utils.tensorboard import SummaryWriter
 from toy_env import ContextualDecouplerEnv
@@ -67,6 +69,26 @@ CONFIGS = {
         discrete_action_dims=[N_ACTIONS, N_ACTIONS],
         mix_type="QMIX",
         offline_critic_buffer=True,
+        mixer_dim=64,
+    ),
+    "SAC_shared_nomix": dict(
+        algo="SAC",
+        discrete_action_dims=[N_ACTIONS, N_ACTIONS],
+    ),
+    "DQN_shared_nomix": dict(
+        algo="DQN",
+        discrete_action_dims=[N_ACTIONS, N_ACTIONS],
+        mix_type=None,
+    ),
+    "DQN_VDN": dict(
+        algo="DQN",
+        discrete_action_dims=[N_ACTIONS, N_ACTIONS],
+        mix_type="VDN",
+    ),
+    "DQN_QMIX": dict(
+        algo="DQN",
+        discrete_action_dims=[N_ACTIONS, N_ACTIONS],
+        mix_type="QMIX",
         mixer_dim=64,
     ),
 }
@@ -145,8 +167,9 @@ def _pearson_r(a, b):
     return float(np.corrcoef(a, b)[0, 1])
 
 
-def _importance_analysis(importance_raw, batch_contexts, writer, update_step,
-                         prefix="Importance"):
+def _importance_analysis(
+    importance_raw, batch_contexts, writer, update_step, prefix="Importance"
+):
     """Log detailed importance metrics given per-step importance and contexts.
 
     Args:
@@ -183,14 +206,17 @@ def _importance_analysis(importance_raw, batch_contexts, writer, update_step,
         true_ctx0 = true_imp[ctx0_mask]
         corr_ctx0 = _pearson_r(imp_ctx0, true_ctx0)
         writer.add_scalar(f"{prefix}/corr_ctx0", corr_ctx0, update_step)
-        writer.add_scalar(f"{prefix}/ctx0_head0_mean", imp_ctx0[:, 0].mean(),
-                          update_step)
-        writer.add_scalar(f"{prefix}/ctx0_head1_mean", imp_ctx0[:, 1].mean(),
-                          update_step)
+        writer.add_scalar(
+            f"{prefix}/ctx0_head0_mean", imp_ctx0[:, 0].mean(), update_step
+        )
+        writer.add_scalar(
+            f"{prefix}/ctx0_head1_mean", imp_ctx0[:, 1].mean(), update_step
+        )
         # Head-0 dominance when context=0 (should be > 0.5)
         writer.add_scalar(
             f"{prefix}/ctx0_head0_dominance",
-            (imp_ctx0[:, 0] > imp_ctx0[:, 1]).mean(), update_step,
+            (imp_ctx0[:, 0] > imp_ctx0[:, 1]).mean(),
+            update_step,
         )
         metrics["corr_ctx0"] = corr_ctx0
         metrics["ctx0_h0_dom"] = float((imp_ctx0[:, 0] > imp_ctx0[:, 1]).mean())
@@ -200,14 +226,17 @@ def _importance_analysis(importance_raw, batch_contexts, writer, update_step,
         true_ctx1 = true_imp[ctx1_mask]
         corr_ctx1 = _pearson_r(imp_ctx1, true_ctx1)
         writer.add_scalar(f"{prefix}/corr_ctx1", corr_ctx1, update_step)
-        writer.add_scalar(f"{prefix}/ctx1_head0_mean", imp_ctx1[:, 0].mean(),
-                          update_step)
-        writer.add_scalar(f"{prefix}/ctx1_head1_mean", imp_ctx1[:, 1].mean(),
-                          update_step)
+        writer.add_scalar(
+            f"{prefix}/ctx1_head0_mean", imp_ctx1[:, 0].mean(), update_step
+        )
+        writer.add_scalar(
+            f"{prefix}/ctx1_head1_mean", imp_ctx1[:, 1].mean(), update_step
+        )
         # Head-1 dominance when context=1 (should be > 0.5)
         writer.add_scalar(
             f"{prefix}/ctx1_head1_dominance",
-            (imp_ctx1[:, 1] > imp_ctx1[:, 0]).mean(), update_step,
+            (imp_ctx1[:, 1] > imp_ctx1[:, 0]).mean(),
+            update_step,
         )
         metrics["corr_ctx1"] = corr_ctx1
         metrics["ctx1_h1_dom"] = float((imp_ctx1[:, 1] > imp_ctx1[:, 0]).mean())
@@ -306,7 +335,9 @@ def run_joint(config_name, cfg, seed, writer):
             buf.reset()
 
     writer.close()
-    print(f"  [{config_name} seed={seed}] done - smoothed reward = {smoothed_reward:.2f}")
+    print(
+        f"  [{config_name} seed={seed}] done - smoothed reward = {smoothed_reward:.2f}"
+    )
 
     return {
         "smoothed_reward": smoothed_reward,
@@ -406,7 +437,11 @@ def run_independent(seed, writer):
 
     writer.close()
     print(f"  [independent seed={seed}] done - smoothed reward = {smoothed_reward:.2f}")
-    return {"smoothed_reward": smoothed_reward, "importance_history": [], "reward_curve": reward_curve}
+    return {
+        "smoothed_reward": smoothed_reward,
+        "importance_history": [],
+        "reward_curve": reward_curve,
+    }
 
 
 # -- Main ----------------------------------------------------------------------
@@ -439,7 +474,9 @@ def main():
     # -- Print importance analysis ---------------------------------------------
     print("\n" + "=" * 72)
     print("IMPORTANCE / CREDIT-ASSIGNMENT ANALYSIS")
-    print("  Ground truth: context=0 -> head_0 important;  context=1 -> head_1 important")
+    print(
+        "  Ground truth: context=0 -> head_0 important;  context=1 -> head_1 important"
+    )
     print("-" * 72)
     for cfg_name, runs in results.items():
         any_history = any(len(r["importance_history"]) > 0 for r in runs)
@@ -453,7 +490,7 @@ def main():
             if len(hist) == 0:
                 continue
             # Analyse last 20% of training
-            tail = hist[max(0, len(hist) - len(hist) // 5):]
+            tail = hist[max(0, len(hist) - len(hist) // 5) :]
             if len(tail) == 0:
                 tail = hist
 
@@ -473,7 +510,7 @@ def main():
     print("=" * 72)
 
     # -- Save raw data so plots can be regenerated without re-running ---------
-    _save_results(results, "experiment_results.json")
+    _save_results(results, "dependence_results/experiment_results.json")
 
     # -- Matplotlib figures for paper sanity check ----------------------------
     _plot_results(results)
@@ -531,11 +568,14 @@ def _plot_results(results):
         ax1.fill_between(steps, mean - std, mean + std, alpha=0.18, color=color)
     ax1.set_xlabel("Environment Steps", fontsize=16)
     ax1.set_ylabel("Smoothed Episode Reward", fontsize=16)
-    ax1.set_title("VDN-PPO Sanity Check: Reward Curves (mean ± 1 std, n={})".format(len(SEEDS)), fontsize=16)
+    ax1.set_title(
+        "VDN-PPO Sanity Check: Reward Curves (mean ± 1 std, n={})".format(len(SEEDS)),
+        fontsize=16,
+    )
     ax1.legend(fontsize=14, ncol=2)
     ax1.grid(True, alpha=0.3)
     fig1.tight_layout()
-    fig1.savefig("reward_curves.png", dpi=50)
+    fig1.savefig("dependence_results/reward_curves.png", dpi=50)
     print("\n  Saved reward_curves.png")
 
     # ---- Figure 2: Importance / credit-assignment analysis -----------------
@@ -568,25 +608,80 @@ def _plot_results(results):
 
             alpha = 0.35 if len(SEEDS) > 1 else 1.0
             if si == 0:  # only label once
-                ax.plot(updates, h0_dom, color="C0", alpha=alpha, linewidth=0.8, label="ctx=0 h0 dom")
-                ax.plot(updates, h1_dom, color="C1", alpha=alpha, linewidth=0.8, label="ctx=1 h1 dom")
-                ax.plot(updates, ov_corr, color="C2", alpha=alpha, linewidth=0.8, label="overall corr")
+                ax.plot(
+                    updates,
+                    h0_dom,
+                    color="C0",
+                    alpha=alpha,
+                    linewidth=0.8,
+                    label="ctx=0 h0 dom",
+                )
+                ax.plot(
+                    updates,
+                    h1_dom,
+                    color="C1",
+                    alpha=alpha,
+                    linewidth=0.8,
+                    label="ctx=1 h1 dom",
+                )
+                ax.plot(
+                    updates,
+                    ov_corr,
+                    color="C2",
+                    alpha=alpha,
+                    linewidth=0.8,
+                    label="overall corr",
+                )
             else:
                 ax.plot(updates, h0_dom, color="C0", alpha=alpha, linewidth=0.8)
                 ax.plot(updates, h1_dom, color="C1", alpha=alpha, linewidth=0.8)
                 ax.plot(updates, ov_corr, color="C2", alpha=alpha, linewidth=0.8)
 
         # Plot mean across seeds on top
-        all_hists = [r["importance_history"] for r in runs if len(r["importance_history"]) > 0]
+        all_hists = [
+            r["importance_history"] for r in runs if len(r["importance_history"]) > 0
+        ]
         if all_hists:
             min_len = min(len(h) for h in all_hists)
-            mean_h0 = np.nanmean([[h["ctx0_h0_dom"] for h in hist[:min_len] if "ctx0_h0_dom" in h] or [np.nan] for hist in all_hists], axis=0)
-            mean_h1 = np.nanmean([[h["ctx1_h1_dom"] for h in hist[:min_len] if "ctx1_h1_dom" in h] or [np.nan] for hist in all_hists], axis=0)
-            mean_corr = np.nanmean([[h["overall_corr"] for h in hist[:min_len] if "overall_corr" in h] or [np.nan] for hist in all_hists], axis=0)
+            mean_h0 = np.nanmean(
+                [
+                    [h["ctx0_h0_dom"] for h in hist[:min_len] if "ctx0_h0_dom" in h]
+                    or [np.nan]
+                    for hist in all_hists
+                ],
+                axis=0,
+            )
+            mean_h1 = np.nanmean(
+                [
+                    [h["ctx1_h1_dom"] for h in hist[:min_len] if "ctx1_h1_dom" in h]
+                    or [np.nan]
+                    for hist in all_hists
+                ],
+                axis=0,
+            )
+            mean_corr = np.nanmean(
+                [
+                    [h["overall_corr"] for h in hist[:min_len] if "overall_corr" in h]
+                    or [np.nan]
+                    for hist in all_hists
+                ],
+                axis=0,
+            )
             upd = np.arange(len(mean_h0))
-            ax.plot(upd, mean_h0, color="C0", linewidth=2.2, label="mean h0 dom (ctx=0)")
-            ax.plot(upd, mean_h1, color="C1", linewidth=2.2, label="mean h1 dom (ctx=1)")
-            ax.plot(upd, mean_corr, color="C2", linewidth=2.2, linestyle="--", label="mean overall corr")
+            ax.plot(
+                upd, mean_h0, color="C0", linewidth=2.2, label="mean h0 dom (ctx=0)"
+            )
+            ax.plot(
+                upd, mean_h1, color="C1", linewidth=2.2, label="mean h1 dom (ctx=1)"
+            )
+            ax.plot(
+                upd,
+                mean_corr,
+                color="C2",
+                linewidth=2.2,
+                linestyle="--",
+                label="mean overall corr",
+            )
 
         ax.axhline(0.5, color="gray", linestyle=":", alpha=0.5, label="chance")
         ax.set_xlabel("Training Updates", fontsize=12)
@@ -601,7 +696,7 @@ def _plot_results(results):
         fontsize=11,
     )
     fig2.tight_layout()
-    fig2.savefig("importance_analysis.png", dpi=150)
+    fig2.savefig("dependence_results/importance_analysis.png", dpi=150)
     print("  Saved importance_analysis.png")
 
     plt.show()

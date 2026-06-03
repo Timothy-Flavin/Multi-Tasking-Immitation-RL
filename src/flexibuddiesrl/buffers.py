@@ -82,6 +82,18 @@ def _pin(t: th.Tensor) -> th.Tensor:
     return t.pin_memory() if th.cuda.is_available() else t
 
 
+def _numpy_to_pinned(src, dtype: th.dtype) -> th.Tensor:
+    """Wrap a numpy array as a contiguous CPU tensor and pin it.
+
+    Pinned (page-locked) memory is required for the CUDA DMA engine to perform
+    asynchronous H2D transfers via copy_(non_blocking=True).  Without pinning,
+    the driver falls back to a synchronous pageable-memory transfer, negating
+    any non_blocking benefit.
+    """
+    t = th.as_tensor(np.ascontiguousarray(src), dtype=dtype)
+    return t.pin_memory() if th.cuda.is_available() else t
+
+
 def get_device(device: th.device | str = "auto") -> th.device:
     if device == "auto":
         device = "cuda" if th.cuda.is_available() else "cpu"
@@ -164,14 +176,17 @@ class BaseBuffer(ABC):
 
     @staticmethod
     def swap_and_flatten(tensor: th.Tensor) -> th.Tensor:
-        """
-        Swap and flatten Time, Agent, and Env dimensions into a single batch dimension.
-        Input shape: [Time, Agent, Env, ...]
-        Output shape: [Time * Agent * Env, ...]
+        """Flatten the leading [T, A, E] dimensions into a single batch axis.
+
+        Storage layout is [T, A, E, ...]. This collapses the first three dims
+        into one, returning [T*A*E, ...].  Because the underlying storage is
+        C-contiguous, reshape() returns a view — zero allocation, zero copy.
+
+        Input:  [T, A, E, ...]  or  [T, A, E]  (scalars per step)
+        Output: [T*A*E, ...]    or  [T*A*E, 1]
         """
         shape = tensor.shape
         if len(shape) < 4:
-            # Add a dummy dimension if needed to ensure we have at least [T, A, E, 1]
             shape = (*shape, 1)
         return tensor.reshape(-1, *shape[3:])
 
@@ -203,6 +218,25 @@ class BaseBuffer(ABC):
         if tensor.device == self.device:
             return tensor
         return tensor.to(self.device, non_blocking=not self.full_gpu)
+
+    def _prep_src(self, src, dtype: th.dtype, shape: tuple) -> th.Tensor:
+        """Prepare a source value for a zero-staging copy into a buffer slot.
+
+        - If src is already a Tensor: reshape only; caller owns device placement.
+        - If src is numpy / array-like: wrap as contiguous CPU tensor, pin it
+          when full_gpu is enabled so that the subsequent copy_(non_blocking=True)
+          can hand the transfer to the CUDA DMA engine and return immediately.
+
+        Wrapping a contiguous numpy array with th.as_tensor is zero-copy (the
+        tensor shares the array's memory).  Only one real copy happens:
+        CPU→pinned (reshape) then DMA into VRAM.
+        """
+        if isinstance(src, th.Tensor):
+            return src.reshape(shape).to(dtype=dtype)
+        t = th.as_tensor(np.ascontiguousarray(src), dtype=dtype).reshape(shape)
+        if self.full_gpu and th.cuda.is_available():
+            t = t.pin_memory()
+        return t
 
 
 class ReplayBuffer(BaseBuffer):
@@ -250,43 +284,55 @@ class ReplayBuffer(BaseBuffer):
         term: np.ndarray | th.Tensor,
         trunc: np.ndarray | th.Tensor,
     ) -> None:
-        # Expect inputs to be shaped [n_agents, n_envs, ...]
-        self.observations[self.pos].copy_(th.as_tensor(obs, device=self.observations.device).reshape((self.n_agents, self.n_envs, *self.obs_shape)))
-        if self.optimize_memory_usage:
-            self.observations[(self.pos + 1) % self.buffer_size].copy_(th.as_tensor(next_obs, device=self.observations.device).reshape((self.n_agents, self.n_envs, *self.obs_shape)))
-        else:
-            self.next_observations[self.pos].copy_(th.as_tensor(next_obs, device=self.observations.device).reshape((self.n_agents, self.n_envs, *self.obs_shape)))
+        # Expect inputs to be shaped [n_agents, n_envs, ...].
+        # _prep_src wraps numpy inputs as pinned CPU tensors when full_gpu=True
+        # so copy_(non_blocking=True) can use the CUDA DMA engine.
+        nb = self.full_gpu
+        obs_shape  = (self.n_agents, self.n_envs, *self.obs_shape)
+        flat_shape = (self.n_agents, self.n_envs)
 
-        self.actions[self.pos].copy_(th.as_tensor(action, device=self.actions.device).reshape((self.n_agents, self.n_envs, self.action_dim)))
-        self.rewards[self.pos].copy_(th.as_tensor(reward, device=self.rewards.device).reshape((self.n_agents, self.n_envs)))
-        self.terms[self.pos].copy_(th.as_tensor(term, device=self.terms.device).reshape((self.n_agents, self.n_envs)))
-        self.truncs[self.pos].copy_(th.as_tensor(trunc, device=self.truncs.device).reshape((self.n_agents, self.n_envs)))
+        self.observations[self.pos].copy_(self._prep_src(obs, th.float32, obs_shape), non_blocking=nb)
+        if self.optimize_memory_usage:
+            self.observations[(self.pos + 1) % self.buffer_size].copy_(self._prep_src(next_obs, th.float32, obs_shape), non_blocking=nb)
+        else:
+            self.next_observations[self.pos].copy_(self._prep_src(next_obs, th.float32, obs_shape), non_blocking=nb)
+
+        self.actions[self.pos].copy_(self._prep_src(action, self.action_dtype, (self.n_agents, self.n_envs, self.action_dim)), non_blocking=nb)
+        self.rewards[self.pos].copy_(self._prep_src(reward, th.float32, flat_shape), non_blocking=nb)
+        self.terms[self.pos].copy_(self._prep_src(term,   th.float32, flat_shape), non_blocking=nb)
+        self.truncs[self.pos].copy_(self._prep_src(trunc,  th.float32, flat_shape), non_blocking=nb)
 
         self.pos = (self.pos + 1) % self.buffer_size
         if self.pos == 0:
             self.full = True
 
     def _get_samples(self, batch_inds: th.Tensor) -> ReplayBufferSamples:
-        # Sample random agent and env for each time index
+        # Multi-dim fancy indexing always produces a new pageable CPU tensor —
+        # the result loses the pin even though the source was pinned.  Re-pin
+        # before to_torch so the async H2D transfer can use DMA.
+        need_pin = not self.full_gpu and th.cuda.is_available()
+
+        def _fetch(t: th.Tensor, t_inds, a_inds, e_inds) -> th.Tensor:
+            s = t[t_inds, a_inds, e_inds]
+            if need_pin:
+                s = s.pin_memory()
+            return self.to_torch(s)
+
         agent_indices = th.randint(0, self.n_agents, (len(batch_inds),))
-        env_indices = th.randint(0, self.n_envs, (len(batch_inds),))
-        
-        obs = self.observations[batch_inds, agent_indices, env_indices]
-        actions = self.actions[batch_inds, agent_indices, env_indices]
-        
+        env_indices   = th.randint(0, self.n_envs,   (len(batch_inds),))
+
+        obs     = _fetch(self.observations, batch_inds, agent_indices, env_indices)
+        actions = _fetch(self.actions,      batch_inds, agent_indices, env_indices)
         if self.optimize_memory_usage:
-            next_obs = self.observations[(batch_inds + 1) % self.buffer_size, agent_indices, env_indices]
+            next_obs = _fetch(self.observations, (batch_inds + 1) % self.buffer_size, agent_indices, env_indices)
         else:
-            next_obs = self.next_observations[batch_inds, agent_indices, env_indices]
+            next_obs = _fetch(self.next_observations, batch_inds, agent_indices, env_indices)
 
-        rewards = self.rewards[batch_inds, agent_indices, env_indices].reshape(-1, 1)
-        terms = self.terms[batch_inds, agent_indices, env_indices].reshape(-1, 1)
-        truncs = self.truncs[batch_inds, agent_indices, env_indices].reshape(-1, 1)
+        rewards = _fetch(self.rewards, batch_inds, agent_indices, env_indices).reshape(-1, 1)
+        terms   = _fetch(self.terms,   batch_inds, agent_indices, env_indices).reshape(-1, 1)
+        truncs  = _fetch(self.truncs,  batch_inds, agent_indices, env_indices).reshape(-1, 1)
 
-        return ReplayBufferSamples(
-            self.to_torch(obs), self.to_torch(actions), self.to_torch(next_obs),
-            self.to_torch(terms), self.to_torch(truncs), self.to_torch(rewards)
-        )
+        return ReplayBufferSamples(obs, actions, next_obs, terms, truncs, rewards)
 
 
 class RolloutBuffer(BaseBuffer):
@@ -333,67 +379,83 @@ class RolloutBuffer(BaseBuffer):
 
     def compute_returns_and_advantage(
         self, last_values: th.Tensor, terminations: np.ndarray, truncations: np.ndarray,
-        get_value_fn=None # Optional function to compute values for final observations
+        get_value_fn=None,
     ) -> None:
-        # Move inputs to device for consistent calculation
-        last_values = last_values.reshape(self.n_agents, self.n_envs).to(self.device)
-        last_gae_lam = th.zeros((self.n_agents, self.n_envs), device=self.device)
-        
-        terms_t = th.as_tensor(terminations, dtype=th.float32, device=self.device).reshape(self.n_agents, self.n_envs)
-        truncs_t = th.as_tensor(truncations, dtype=th.float32, device=self.device).reshape(self.n_agents, self.n_envs)
+        """Compute GAE advantages and returns in-place.
 
-        for step in reversed(range(self.buffer_size)):
-            # Tensors are already on device if full_gpu=True
-            rewards_step = self.rewards[step]
-            values_step = self.values[step]
-            terms_step = self.terminations[step]
-            truncs_step = self.truncations[step]
-            
-            if not self.full_gpu:
-                rewards_step = rewards_step.to(self.device)
-                values_step = values_step.to(self.device)
-                terms_step = terms_step.to(self.device)
-                truncs_step = truncs_step.to(self.device)
+        Layout violation fixed: the original code did 4 per-step H2D transfers
+        (rewards, values, terms, truncs) plus 1 per-step D2H write (advantages)
+        inside the reversed loop — 5*T small transfers total.  This version does
+        4 bulk H2D transfers before the loop and 1 bulk D2H write after, reducing
+        PCIe round-trips from O(T) to O(1) regardless of rollout length.
 
-            if step == self.buffer_size - 1:
-                next_non_terminal = 1.0 - terms_t
+        For full_gpu=True the .to(device) calls are no-ops (data already on GPU).
+        """
+        dev = self.device
+        T   = self.buffer_size
+
+        # --- One bulk H2D transfer per array (pinned → VRAM via DMA) ---
+        # For full_gpu the slices are already on-device; .to() is a no-op.
+        rewards = self.rewards.to(dev, non_blocking=True)       # [T, A, E]
+        values  = self.values.to(dev, non_blocking=True)        # [T, A, E]
+        terms   = self.terminations.to(dev, non_blocking=True)  # [T, A, E]
+        truncs  = self.truncations.to(dev, non_blocking=True)   # [T, A, E]
+
+        last_values  = last_values.reshape(self.n_agents, self.n_envs).to(dev)
+        last_gae_lam = th.zeros((self.n_agents, self.n_envs), device=dev)
+
+        terms_t  = th.as_tensor(terminations, dtype=th.float32, device=dev).reshape(self.n_agents, self.n_envs)
+        truncs_t = th.as_tensor(truncations,  dtype=th.float32, device=dev).reshape(self.n_agents, self.n_envs)
+
+        # Accumulate advantages fully on-device.
+        advantages = th.empty((T, self.n_agents, self.n_envs), device=dev)
+
+        for step in reversed(range(T)):
+            if step == T - 1:
+                next_non_terminal         = 1.0 - terms_t
                 next_episode_continuation = 1.0 - th.clamp(terms_t + truncs_t, 0.0, 1.0)
-                next_values = last_values
+                next_vals = last_values
             else:
-                next_non_terminal = 1.0 - terms_step
-                next_episode_continuation = 1.0 - th.clamp(terms_step + truncs_step, 0.0, 1.0)
-                next_values = self.values[step + 1]
-                if not self.full_gpu: next_values = next_values.to(self.device)
-            
-            # Special handling for truncated bootstrap values
-            if get_value_fn is not None and len(self.final_observations) > 0:
-                for (t_step, agent_idx, env_idx), final_obs in self.final_observations.items():
-                    if t_step == step:
-                        f_val = get_value_fn(final_obs.to(self.device))
-                        next_values[agent_idx, env_idx] = f_val
+                next_non_terminal         = 1.0 - terms[step]
+                next_episode_continuation = 1.0 - th.clamp(terms[step] + truncs[step], 0.0, 1.0)
+                next_vals = values[step + 1]
 
-            delta = rewards_step + self.gamma * next_values * next_non_terminal - values_step
+            # Truncation bootstrap: override next_vals for specific (agent, env) pairs.
+            # Clone first so we never mutate a view into the bulk `values` tensor.
+            if get_value_fn is not None and self.final_observations:
+                for (t_step, a_idx, e_idx), final_obs in self.final_observations.items():
+                    if t_step == step:
+                        next_vals = next_vals.clone()
+                        next_vals[a_idx, e_idx] = get_value_fn(final_obs.to(dev))
+
+            delta = rewards[step] + self.gamma * next_vals * next_non_terminal - values[step]
             last_gae_lam = delta + self.gamma * self.gae_lambda * next_episode_continuation * last_gae_lam
-            
-            if self.full_gpu:
-                self.advantages[step] = last_gae_lam
-            else:
-                self.advantages[step].copy_(last_gae_lam.cpu())
-        
+            advantages[step] = last_gae_lam
+
+        # --- One bulk D2H write-back (VRAM → pinned host via DMA) ---
+        # Compute returns on-device to avoid re-transferring values from host.
         if self.full_gpu:
-            self.returns.copy_(self.advantages + self.values)
+            self.advantages.copy_(advantages)
+            self.returns.copy_(advantages + values)
         else:
-            self.returns.copy_((self.advantages + self.values).cpu())
+            adv_cpu = advantages.cpu()          # single D2H transfer
+            self.advantages.copy_(adv_cpu)
+            # values is still in CPU pinned memory; addition stays on CPU.
+            self.returns.copy_(adv_cpu + self.values)
 
     def add(self, obs, action, reward, termination, truncation, value, log_prob, final_obs=None) -> None:
-        dev = self.observations.device
-        self.observations[self.pos].copy_(th.as_tensor(obs, device=dev).reshape((self.n_agents, self.n_envs, *self.obs_shape)))
-        self.actions[self.pos].copy_(th.as_tensor(action, device=dev).reshape((self.n_agents, self.n_envs, self.action_dim)))
-        self.rewards[self.pos].copy_(th.as_tensor(reward, device=dev).reshape((self.n_agents, self.n_envs)))
-        self.terminations[self.pos].copy_(th.as_tensor(termination, device=dev).reshape((self.n_agents, self.n_envs)))
-        self.truncations[self.pos].copy_(th.as_tensor(truncation, device=dev).reshape((self.n_agents, self.n_envs)))
-        self.values[self.pos].copy_(value.reshape(self.n_agents, self.n_envs))
-        self.log_probs[self.pos].copy_(log_prob.reshape(self.n_agents, self.n_envs, self.log_probs_dim))
+        # _prep_src wraps numpy inputs as pinned CPU tensors when full_gpu=True so
+        # copy_(non_blocking=True) activates the CUDA DMA engine for each field.
+        nb         = self.full_gpu
+        flat_shape = (self.n_agents, self.n_envs)
+
+        self.observations[self.pos].copy_(self._prep_src(obs, th.float32, (self.n_agents, self.n_envs, *self.obs_shape)), non_blocking=nb)
+        self.actions[self.pos].copy_(self._prep_src(action, self.action_dtype, (self.n_agents, self.n_envs, self.action_dim)), non_blocking=nb)
+        self.rewards[self.pos].copy_(self._prep_src(reward, th.float32, flat_shape), non_blocking=nb)
+        self.terminations[self.pos].copy_(self._prep_src(termination, th.float32, flat_shape), non_blocking=nb)
+        self.truncations[self.pos].copy_(self._prep_src(truncation,  th.float32, flat_shape), non_blocking=nb)
+        self.values[self.pos].copy_(self._prep_src(value, th.float32, flat_shape), non_blocking=nb)
+        self.log_probs[self.pos].copy_(self._prep_src(log_prob, th.float32, (self.n_agents, self.n_envs, self.log_probs_dim)), non_blocking=nb)
         
         if final_obs is not None:
             if isinstance(final_obs, dict):
@@ -437,11 +499,23 @@ class RolloutBuffer(BaseBuffer):
         advantages: th.Tensor,
         returns: th.Tensor,
     ) -> RolloutBufferSamples:
+        # Fancy indexing (t[batch_inds]) allocates a new pageable CPU tensor —
+        # the result is no longer pinned even though the source was.  Re-pin
+        # so that to_torch(non_blocking=True) can hand the transfer to the
+        # CUDA DMA engine and return immediately instead of blocking.
+        need_pin = not self.full_gpu and th.cuda.is_available()
+
+        def _fetch(t: th.Tensor) -> th.Tensor:
+            s = t[batch_inds]
+            if need_pin:
+                s = s.pin_memory()
+            return self.to_torch(s)
+
         return RolloutBufferSamples(
-            observations=self.to_torch(observations[batch_inds]),
-            actions=self.to_torch(actions[batch_inds]),
-            old_values=self.to_torch(values[batch_inds]),
-            old_log_prob=self.to_torch(log_probs[batch_inds]),
-            advantages=self.to_torch(advantages[batch_inds]),
-            returns=self.to_torch(returns[batch_inds]),
+            observations=_fetch(observations),
+            actions=_fetch(actions),
+            old_values=_fetch(values),
+            old_log_prob=_fetch(log_probs),
+            advantages=_fetch(advantages),
+            returns=_fetch(returns),
         )

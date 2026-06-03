@@ -7,7 +7,7 @@ __pycache__/
 *$py.class
 *.png
 old_results
-
+profile_results
 # C extensions
 *.so
 
