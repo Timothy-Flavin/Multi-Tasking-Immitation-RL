@@ -1088,13 +1088,13 @@ class QS(nn.Module):
             )
         self.to(device)
 
-    def factorize_Q(self, qs, state):
+    def factorize_Q(self, qs, state, with_grad=False):
         if self.encoder is not None:
             state = self.encoder(state)
         assert (
             self.mixing_network is not None
         ), "Cant qmix factorize q values if the mixing network has not been initialized"
-        return self.mixing_network(qs, state)
+        return self.mixing_network(qs, state, with_grad=with_grad)
 
     def forward(self, x, action_mask=None, policy_weights=None):
         """

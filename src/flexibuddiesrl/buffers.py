@@ -122,6 +122,7 @@ class BaseBuffer(ABC):
         obs_shape: tuple[int, ...] = None,
         action_dim: int = None,
         action_dtype: th.dtype = th.float32,
+        full_gpu: bool = False,
     ):
         super().__init__()
         self.buffer_size = buffer_size
@@ -129,6 +130,8 @@ class BaseBuffer(ABC):
         self.n_envs = n_envs
         self.n_agents = n_agents
         self.action_dtype = action_dtype
+        self.full_gpu = full_gpu
+
         # 1. Auto-infer integer dtype if the action space is discrete/binary
         if action_space is not None and isinstance(action_space, (spaces.Discrete, spaces.MultiDiscrete, spaces.MultiBinary)):
             if self.action_dtype == th.float32: # Override the default float32
@@ -153,6 +156,12 @@ class BaseBuffer(ABC):
         self.pos = 0
         self.full = False
 
+    def _init_storage(self, shape, dtype):
+        if self.full_gpu:
+            return th.zeros(shape, dtype=dtype, device=self.device)
+        else:
+            return _pin(th.zeros(shape, dtype=dtype))
+
     @staticmethod
     def swap_and_flatten(tensor: th.Tensor) -> th.Tensor:
         """
@@ -164,9 +173,6 @@ class BaseBuffer(ABC):
         if len(shape) < 4:
             # Add a dummy dimension if needed to ensure we have at least [T, A, E, 1]
             shape = (*shape, 1)
-        # Transpose to [Agent, Env, Time, ...] is not what we want.
-        # We want to keep time-order within each stream if possible, 
-        # but usually we just flatten everything for off-policy.
         return tensor.reshape(-1, *shape[3:])
 
     def size(self) -> int:
@@ -194,7 +200,9 @@ class BaseBuffer(ABC):
         raise NotImplementedError()
 
     def to_torch(self, tensor: th.Tensor) -> th.Tensor:
-        return tensor.to(self.device, non_blocking=True)
+        if tensor.device == self.device:
+            return tensor
+        return tensor.to(self.device, non_blocking=not self.full_gpu)
 
 
 class ReplayBuffer(BaseBuffer):
@@ -211,25 +219,27 @@ class ReplayBuffer(BaseBuffer):
         optimize_memory_usage: bool = False,
         handle_timeout_termination: bool = True,
         action_dtype: th.dtype = th.float32,
+        full_gpu: bool = False,
     ):
         super().__init__(
             buffer_size, observation_space, action_space, device, n_envs, n_agents,
-            obs_shape=obs_shape, action_dim=action_dim, action_dtype=action_dtype
+            obs_shape=obs_shape, action_dim=action_dim, action_dtype=action_dtype,
+            full_gpu=full_gpu
         )
         
         self.buffer_size = max(buffer_size // (n_envs * n_agents), 1)
         self.optimize_memory_usage = optimize_memory_usage
         self.handle_timeout_termination = handle_timeout_termination
 
-        # Initialize Pinned Tensors [Time, Agent, Env, ...]
-        self.observations = _pin(th.zeros((self.buffer_size, self.n_agents, self.n_envs, *self.obs_shape), dtype=th.float32))
+        # Initialize storage
+        self.observations = self._init_storage((self.buffer_size, self.n_agents, self.n_envs, *self.obs_shape), th.float32)
         if not optimize_memory_usage:
-            self.next_observations = _pin(th.zeros((self.buffer_size, self.n_agents, self.n_envs, *self.obs_shape), dtype=th.float32))
+            self.next_observations = self._init_storage((self.buffer_size, self.n_agents, self.n_envs, *self.obs_shape), th.float32)
 
-        self.actions = _pin(th.zeros((self.buffer_size, self.n_agents, self.n_envs, self.action_dim), dtype=self.action_dtype))
-        self.rewards = _pin(th.zeros((self.buffer_size, self.n_agents, self.n_envs), dtype=th.float32))
-        self.terms = _pin(th.zeros((self.buffer_size, self.n_agents, self.n_envs), dtype=th.float32))
-        self.truncs = _pin(th.zeros((self.buffer_size, self.n_agents, self.n_envs), dtype=th.float32))
+        self.actions = self._init_storage((self.buffer_size, self.n_agents, self.n_envs, self.action_dim), self.action_dtype)
+        self.rewards = self._init_storage((self.buffer_size, self.n_agents, self.n_envs), th.float32)
+        self.terms = self._init_storage((self.buffer_size, self.n_agents, self.n_envs), th.float32)
+        self.truncs = self._init_storage((self.buffer_size, self.n_agents, self.n_envs), th.float32)
 
     def add(
         self,
@@ -241,16 +251,16 @@ class ReplayBuffer(BaseBuffer):
         trunc: np.ndarray | th.Tensor,
     ) -> None:
         # Expect inputs to be shaped [n_agents, n_envs, ...]
-        self.observations[self.pos].copy_(th.as_tensor(obs).reshape((self.n_agents, self.n_envs, *self.obs_shape)))
+        self.observations[self.pos].copy_(th.as_tensor(obs, device=self.observations.device).reshape((self.n_agents, self.n_envs, *self.obs_shape)))
         if self.optimize_memory_usage:
-            self.observations[(self.pos + 1) % self.buffer_size].copy_(th.as_tensor(next_obs).reshape((self.n_agents, self.n_envs, *self.obs_shape)))
+            self.observations[(self.pos + 1) % self.buffer_size].copy_(th.as_tensor(next_obs, device=self.observations.device).reshape((self.n_agents, self.n_envs, *self.obs_shape)))
         else:
-            self.next_observations[self.pos].copy_(th.as_tensor(next_obs).reshape((self.n_agents, self.n_envs, *self.obs_shape)))
+            self.next_observations[self.pos].copy_(th.as_tensor(next_obs, device=self.observations.device).reshape((self.n_agents, self.n_envs, *self.obs_shape)))
 
-        self.actions[self.pos].copy_(th.as_tensor(action).reshape((self.n_agents, self.n_envs, self.action_dim)))
-        self.rewards[self.pos].copy_(th.as_tensor(reward).reshape((self.n_agents, self.n_envs)))
-        self.terms[self.pos].copy_(th.as_tensor(term).reshape((self.n_agents, self.n_envs)))
-        self.truncs[self.pos].copy_(th.as_tensor(trunc).reshape((self.n_agents, self.n_envs)))
+        self.actions[self.pos].copy_(th.as_tensor(action, device=self.actions.device).reshape((self.n_agents, self.n_envs, self.action_dim)))
+        self.rewards[self.pos].copy_(th.as_tensor(reward, device=self.rewards.device).reshape((self.n_agents, self.n_envs)))
+        self.terms[self.pos].copy_(th.as_tensor(term, device=self.terms.device).reshape((self.n_agents, self.n_envs)))
+        self.truncs[self.pos].copy_(th.as_tensor(trunc, device=self.truncs.device).reshape((self.n_agents, self.n_envs)))
 
         self.pos = (self.pos + 1) % self.buffer_size
         if self.pos == 0:
@@ -293,64 +303,107 @@ class RolloutBuffer(BaseBuffer):
         gae_lambda: float = 1.0,
         gamma: float = 0.99,
         action_dtype: th.dtype = th.float32,
+        log_probs_dim: int = 1,
+        full_gpu: bool = False,
     ):
         super().__init__(
             buffer_size, observation_space, action_space, device, n_envs, n_agents,
-            obs_shape=obs_shape, action_dim=action_dim, action_dtype=action_dtype
+            obs_shape=obs_shape, action_dim=action_dim, action_dtype=action_dtype,
+            full_gpu=full_gpu
         )
         self.gae_lambda = gae_lambda
         self.gamma = gamma
+        self.log_probs_dim = log_probs_dim
         self.generator_ready = False
         self.reset()
 
     def reset(self) -> None:
-        self.observations = _pin(th.zeros((self.buffer_size, self.n_agents, self.n_envs, *self.obs_shape), dtype=th.float32))
-        self.actions = _pin(th.zeros((self.buffer_size, self.n_agents, self.n_envs, self.action_dim), dtype=self.action_dtype))
-        self.rewards = _pin(th.zeros((self.buffer_size, self.n_agents, self.n_envs), dtype=th.float32))
-        self.returns = _pin(th.zeros((self.buffer_size, self.n_agents, self.n_envs), dtype=th.float32))
-        self.terminations = _pin(th.zeros((self.buffer_size, self.n_agents, self.n_envs), dtype=th.float32))
-        self.truncations = _pin(th.zeros((self.buffer_size, self.n_agents, self.n_envs), dtype=th.float32))
-        self.values = _pin(th.zeros((self.buffer_size, self.n_agents, self.n_envs), dtype=th.float32))
-        self.log_probs = _pin(th.zeros((self.buffer_size, self.n_agents, self.n_envs), dtype=th.float32))
-        self.advantages = _pin(th.zeros((self.buffer_size, self.n_agents, self.n_envs), dtype=th.float32))
+        self.observations = self._init_storage((self.buffer_size, self.n_agents, self.n_envs, *self.obs_shape), th.float32)
+        self.actions = self._init_storage((self.buffer_size, self.n_agents, self.n_envs, self.action_dim), self.action_dtype)
+        self.rewards = self._init_storage((self.buffer_size, self.n_agents, self.n_envs), th.float32)
+        self.returns = self._init_storage((self.buffer_size, self.n_agents, self.n_envs), th.float32)
+        self.terminations = self._init_storage((self.buffer_size, self.n_agents, self.n_envs), th.float32)
+        self.truncations = self._init_storage((self.buffer_size, self.n_agents, self.n_envs), th.float32)
+        self.values = self._init_storage((self.buffer_size, self.n_agents, self.n_envs), th.float32)
+        self.log_probs = self._init_storage((self.buffer_size, self.n_agents, self.n_envs, self.log_probs_dim), th.float32)
+        self.advantages = self._init_storage((self.buffer_size, self.n_agents, self.n_envs), th.float32)
+        self.final_observations = {} # Key: (pos, agent_idx, env_idx), Val: obs tensor
         self.generator_ready = False
         super().reset()
 
     def compute_returns_and_advantage(
-        self, last_values: th.Tensor, terminations: np.ndarray, truncations: np.ndarray
+        self, last_values: th.Tensor, terminations: np.ndarray, truncations: np.ndarray,
+        get_value_fn=None # Optional function to compute values for final observations
     ) -> None:
-        # last_values expected shape [n_agents, n_envs]
-        last_values = last_values.reshape(self.n_agents, self.n_envs)
+        # Move inputs to device for consistent calculation
+        last_values = last_values.reshape(self.n_agents, self.n_envs).to(self.device)
         last_gae_lam = th.zeros((self.n_agents, self.n_envs), device=self.device)
         
-        terms_t = th.as_tensor(terminations, dtype=th.float32).reshape(self.n_agents, self.n_envs)
-        truncs_t = th.as_tensor(truncations, dtype=th.float32).reshape(self.n_agents, self.n_envs)
+        terms_t = th.as_tensor(terminations, dtype=th.float32, device=self.device).reshape(self.n_agents, self.n_envs)
+        truncs_t = th.as_tensor(truncations, dtype=th.float32, device=self.device).reshape(self.n_agents, self.n_envs)
 
         for step in reversed(range(self.buffer_size)):
+            # Tensors are already on device if full_gpu=True
+            rewards_step = self.rewards[step]
+            values_step = self.values[step]
+            terms_step = self.terminations[step]
+            truncs_step = self.truncations[step]
+            
+            if not self.full_gpu:
+                rewards_step = rewards_step.to(self.device)
+                values_step = values_step.to(self.device)
+                terms_step = terms_step.to(self.device)
+                truncs_step = truncs_step.to(self.device)
+
             if step == self.buffer_size - 1:
                 next_non_terminal = 1.0 - terms_t
                 next_episode_continuation = 1.0 - th.clamp(terms_t + truncs_t, 0.0, 1.0)
                 next_values = last_values
             else:
-                next_non_terminal = 1.0 - self.terminations[step]
-                next_episode_continuation = 1.0 - th.clamp(self.terminations[step] + self.truncations[step], 0.0, 1.0)
+                next_non_terminal = 1.0 - terms_step
+                next_episode_continuation = 1.0 - th.clamp(terms_step + truncs_step, 0.0, 1.0)
                 next_values = self.values[step + 1]
+                if not self.full_gpu: next_values = next_values.to(self.device)
             
-            delta = self.rewards[step] + self.gamma * next_values * next_non_terminal - self.values[step]
-            last_gae_lam = delta + self.gamma * self.gae_lambda * next_episode_continuation * last_gae_lam
-            self.advantages[step] = last_gae_lam
-        
-        self.returns.copy_(self.advantages + self.values)
+            # Special handling for truncated bootstrap values
+            if get_value_fn is not None and len(self.final_observations) > 0:
+                for (t_step, agent_idx, env_idx), final_obs in self.final_observations.items():
+                    if t_step == step:
+                        f_val = get_value_fn(final_obs.to(self.device))
+                        next_values[agent_idx, env_idx] = f_val
 
-    def add(self, obs, action, reward, termination, truncation, value, log_prob) -> None:
-        self.observations[self.pos].copy_(th.as_tensor(obs).reshape((self.n_agents, self.n_envs, *self.obs_shape)))
-        self.actions[self.pos].copy_(th.as_tensor(action).reshape((self.n_agents, self.n_envs, self.action_dim)))
-        self.rewards[self.pos].copy_(th.as_tensor(reward).reshape((self.n_agents, self.n_envs)))
-        self.terminations[self.pos].copy_(th.as_tensor(termination).reshape((self.n_agents, self.n_envs)))
-        self.truncations[self.pos].copy_(th.as_tensor(truncation).reshape((self.n_agents, self.n_envs)))
-        self.values[self.pos].copy_(value.reshape(self.n_agents, self.n_envs))
-        self.log_probs[self.pos].copy_(log_prob.reshape(self.n_agents, self.n_envs))
+            delta = rewards_step + self.gamma * next_values * next_non_terminal - values_step
+            last_gae_lam = delta + self.gamma * self.gae_lambda * next_episode_continuation * last_gae_lam
+            
+            if self.full_gpu:
+                self.advantages[step] = last_gae_lam
+            else:
+                self.advantages[step].copy_(last_gae_lam.cpu())
         
+        if self.full_gpu:
+            self.returns.copy_(self.advantages + self.values)
+        else:
+            self.returns.copy_((self.advantages + self.values).cpu())
+
+    def add(self, obs, action, reward, termination, truncation, value, log_prob, final_obs=None) -> None:
+        dev = self.observations.device
+        self.observations[self.pos].copy_(th.as_tensor(obs, device=dev).reshape((self.n_agents, self.n_envs, *self.obs_shape)))
+        self.actions[self.pos].copy_(th.as_tensor(action, device=dev).reshape((self.n_agents, self.n_envs, self.action_dim)))
+        self.rewards[self.pos].copy_(th.as_tensor(reward, device=dev).reshape((self.n_agents, self.n_envs)))
+        self.terminations[self.pos].copy_(th.as_tensor(termination, device=dev).reshape((self.n_agents, self.n_envs)))
+        self.truncations[self.pos].copy_(th.as_tensor(truncation, device=dev).reshape((self.n_agents, self.n_envs)))
+        self.values[self.pos].copy_(value.reshape(self.n_agents, self.n_envs))
+        self.log_probs[self.pos].copy_(log_prob.reshape(self.n_agents, self.n_envs, self.log_probs_dim))
+        
+        if final_obs is not None:
+            if isinstance(final_obs, dict):
+                for (a_idx, e_idx), f_obs in final_obs.items():
+                    self.final_observations[(self.pos, a_idx, e_idx)] = th.as_tensor(f_obs).clone()
+            else:
+                trunc_indices = np.where(truncation.reshape(self.n_agents, self.n_envs))
+                for a_idx, e_idx in zip(*trunc_indices):
+                    self.final_observations[(self.pos, a_idx, e_idx)] = th.as_tensor(final_obs[a_idx, e_idx]).clone()
+
         self.pos += 1
         if self.pos == self.buffer_size:
             self.full = True

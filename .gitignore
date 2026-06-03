@@ -5,6 +5,8 @@ SAC_log.txt
 __pycache__/
 *.py[cod]
 *$py.class
+*.png
+old_results
 
 # C extensions
 *.so
