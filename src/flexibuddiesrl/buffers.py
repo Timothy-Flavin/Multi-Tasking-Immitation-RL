@@ -321,9 +321,11 @@ class ReplayBuffer(BaseBuffer):
                 s = s.pin_memory()
             return self.to_torch(s)
 
-        # Storage is [T, E, A, ...] — sample E then A for each selected T.
-        env_indices   = th.randint(0, self.n_envs,   (len(batch_inds),))
-        agent_indices = th.randint(0, self.n_agents, (len(batch_inds),))
+        # Storage is [T, E, A, ...].  One randint call instead of three;
+        # integer division decomposes the flat EA index into (e, a).
+        ea_inds       = th.randint(0, self.n_envs * self.n_agents, (len(batch_inds),))
+        env_indices   = ea_inds // self.n_agents
+        agent_indices = ea_inds %  self.n_agents
 
         obs     = _fetch(self.observations, batch_inds, env_indices, agent_indices)
         actions = _fetch(self.actions,      batch_inds, env_indices, agent_indices)

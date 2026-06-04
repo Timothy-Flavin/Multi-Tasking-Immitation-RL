@@ -592,7 +592,7 @@ class PG(nn.Module, Agent):
         return actor_loss
 
     def _discrete_actor_loss(self, actions, log_probs, logits, advantages):
-        actor_loss = torch.zeros(1, device=self.device)
+        actor_loss = 0.0
         for head in range(actions.shape[-1]):
             dist = Categorical(logits=logits[head])
             entropy = dist.entropy().mean()
@@ -677,7 +677,7 @@ class PG(nn.Module, Agent):
                     critic_loss = 0.5 * F.mse_loss(values, returns)
 
                 # Actor Loss
-                actor_loss = torch.zeros(1, device=self.device)
+                actor_loss = 0.0
                 continuous_means, continuous_log_std_logits, discrete_logits = self.actor(obs)
                 
                 # Split old_log_prob back into discrete and continuous parts
@@ -958,15 +958,15 @@ class PG(nn.Module, Agent):
             # Squeeze the trailing unit dimension produced by uniform-weight GAE
             G_critic = G_critic.squeeze(-1)
 
-        # Mini-batch training over flattened data
-        obs_flat = obs.reshape(-1, self.obs_dim)
-        actions_flat = actions.reshape(-1, self.total_action_dims)
-        gae_flat = gae.reshape(-1, self.total_action_dims)
-        G_critic_flat = G_critic.reshape(-1)
-        
-        # Get old log probs for PPO clip
+        # Move all flat training arrays to device once — avoids per-mini-batch H2D transfers
+        obs_flat      = obs.reshape(-1, self.obs_dim).to(self.device)
+        actions_flat  = actions.reshape(-1, self.total_action_dims).to(self.device)
+        gae_flat      = gae.reshape(-1, self.total_action_dims).to(self.device)
+        G_critic_flat = G_critic.reshape(-1).to(self.device)
+
+        # Get old log probs for PPO clip (d/c_actions_f already on device from above)
         with torch.no_grad():
-            old_lp_flat, _, _, _, _, _ = self._log_probs_per_dim(obs_flat.to(self.device), d_actions_f, c_actions_f)
+            old_lp_flat, _, _, _, _, _ = self._log_probs_per_dim(obs_flat, d_actions_f, c_actions_f)
 
         # Compute importance metrics for analysis
         importance_per_dim = scaled_importance.mean(dim=0).reshape(-1).detach().cpu().numpy()
@@ -984,27 +984,37 @@ class PG(nn.Module, Agent):
         for epoch in range(self.n_epochs):
             np.random.shuffle(indices)
 
-            # Pre-compute old distributions for this epoch (for actual KL divergence)
+            # Snapshot old-policy parameters once per epoch (one full actor forward),
+            # then create per-mini-batch distributions cheaply by slicing the tensors.
             with torch.no_grad():
-                old_d_dists_epoch = []
-                old_c_dists_epoch = []
-                for start in range(0, len(indices), self.mini_batch_size):
-                    mb_idx = indices[start:start+self.mini_batch_size]
-                    mb_obs_e = obs_flat[mb_idx].to(self.device)
-                    od, oc = self._get_dists(mb_obs_e)
-                    old_d_dists_epoch.append(od)
-                    old_c_dists_epoch.append(oc)
+                old_c_means_full, old_c_lstd_full, old_d_logits_full = self.actor(obs_flat)
+                if old_c_lstd_full is None and self.continuous_action_dim > 0:
+                    old_c_lstd_full = self._smooth_clamp_logstd().expand_as(old_c_means_full)
 
             dist_step = 0
             for start in range(0, len(indices), self.mini_batch_size):
                 bnum += 1
                 mb_idx = indices[start:start+self.mini_batch_size]
 
-                mb_obs = obs_flat[mb_idx].to(self.device)
-                mb_actions = actions_flat[mb_idx].to(self.device)
-                mb_gae = gae_flat[mb_idx].to(self.device)
-                mb_G_critic = G_critic_flat[mb_idx].to(self.device)
-                mb_old_lp = old_lp_flat[mb_idx].to(self.device)
+                # All arrays already on device — plain indexing, no H2D transfer
+                mb_obs      = obs_flat[mb_idx]
+                mb_actions  = actions_flat[mb_idx]
+                mb_gae      = gae_flat[mb_idx]
+                mb_G_critic = G_critic_flat[mb_idx]
+                mb_old_lp   = old_lp_flat[mb_idx]
+
+                # Build old distributions for this mini-batch by slicing cached logits
+                old_d_dists_mb = (
+                    [torch.distributions.Categorical(logits=lg[mb_idx]) for lg in old_d_logits_full]
+                    if old_d_logits_full is not None else None
+                )
+                if self.continuous_action_dim > 0:
+                    old_c_lstd_mb = old_c_lstd_full[mb_idx].expand_as(old_c_means_full[mb_idx])
+                    old_c_dist_mb = torch.distributions.Normal(
+                        loc=old_c_means_full[mb_idx], scale=torch.exp(old_c_lstd_mb)
+                    )
+                else:
+                    old_c_dist_mb = None
 
                 mb_d_act = mb_actions[:, :len(self.discrete_action_dims)].long() if self.discrete_action_dims else None
                 mb_c_act = mb_actions[:, -self.continuous_action_dim:] if self.continuous_action_dim > 0 else None
@@ -1034,8 +1044,8 @@ class PG(nn.Module, Agent):
 
                 actor_loss, joint_kl = self._mix_actor_loss(
                     mb_old_lp, mb_new_lp, mb_gae, mb_entropy,
-                    old_d_dists_epoch[dist_step], mb_d_dist,
-                    old_c_dists_epoch[dist_step], mb_c_dist,
+                    old_d_dists_mb, mb_d_dist,
+                    old_c_dist_mb, mb_c_dist,
                 )
                 actor_loss = actor_loss + mb_logit_reg
 
@@ -1071,37 +1081,39 @@ class PG(nn.Module, Agent):
         return bin_indices.long()
 
     def _gather_observed_advantages(self, d_adv, c_adv, d_actions, c_actions):
-        advantages = []
-        if d_adv is not None:
-            for h in range(len(d_adv)):
-                advantages.append(d_adv[h].gather(dim=-1, index=d_actions[:, h].unsqueeze(-1)))
+        n_d = len(d_adv) if d_adv is not None else 0
+        n_c = c_adv.shape[1] if c_adv is not None else 0
+        ref = d_adv[0] if d_adv is not None else c_adv
+        out = ref.new_zeros(ref.shape[0], n_d + n_c)
+        for h in range(n_d):
+            out[:, h] = d_adv[h].gather(dim=-1, index=d_actions[:, h].unsqueeze(-1)).squeeze(-1)
         if c_adv is not None:
             c_indices = self._bin_continuous_actions(c_actions)
-            advantages.append(c_adv.gather(dim=-1, index=c_indices.unsqueeze(-1)).squeeze(-1))
-        return torch.cat(advantages, dim=-1)
+            out[:, n_d:] = c_adv.gather(dim=-1, index=c_indices.unsqueeze(-1)).squeeze(-1)
+        return out
 
     def _max_advantages(self, d_adv, c_adv):
-        advantages = []
-        if d_adv is not None:
-            for h in range(len(d_adv)):
-                advantages.append(d_adv[h].max(dim=-1).values.unsqueeze(-1))
+        n_d = len(d_adv) if d_adv is not None else 0
+        n_c = c_adv.shape[1] if c_adv is not None else 0
+        ref = d_adv[0] if d_adv is not None else c_adv
+        out = ref.new_zeros(ref.shape[0], n_d + n_c)
+        for h in range(n_d):
+            out[:, h] = d_adv[h].max(dim=-1).values
         if c_adv is not None:
-            advantages.append(c_adv.max(dim=-1).values)
-        return torch.cat(advantages, dim=-1)
+            out[:, n_d:] = c_adv.max(dim=-1).values
+        return out
 
     def _gather_importance(self, d_adv, c_adv):
-        importance = []
-        if d_adv is not None:
-            for h in range(len(d_adv)):
-                adv_h = d_adv[h].detach()
-                importance.append(
-                    adv_h.max(dim=-1).values.unsqueeze(-1)
-                    - adv_h.min(dim=-1).values.unsqueeze(-1)
-                )
+        n_d = len(d_adv) if d_adv is not None else 0
+        n_c = c_adv.shape[1] if c_adv is not None else 0
+        ref = d_adv[0] if d_adv is not None else c_adv
+        out = ref.new_zeros(ref.shape[0], n_d + n_c)
+        for h in range(n_d):
+            adv_h = d_adv[h].detach()
+            out[:, h] = adv_h.max(dim=-1).values - adv_h.min(dim=-1).values
         if c_adv is not None:
-            importance.append(c_adv.max(dim=-1).values - c_adv.min(dim=-1).values)
-        importance = torch.cat(importance, dim=-1)
-        return importance
+            out[:, n_d:] = c_adv.max(dim=-1).values - c_adv.min(dim=-1).values
+        return out
 
     def _update_importance(self):
         frac = min(self.importance_step / self.importance_alpha_steps, 1.0)

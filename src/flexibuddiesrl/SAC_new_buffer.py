@@ -225,8 +225,8 @@ class SAC(nn.Module, Agent):
             )
             if is_v:
                 a_next_vec = self._flatten_actions(c_act_n, d_act_n)
-                q_next = torch.minimum(self.Q1_target(torch.cat([obs_next_t, a_next_vec], dim=-1)),
-                                       self.Q2_target(torch.cat([obs_next_t, a_next_vec], dim=-1))).squeeze(-1)
+                q_in_next = torch.cat([obs_next_t, a_next_vec], dim=-1)
+                q_next = torch.minimum(self.Q1_target(q_in_next), self.Q2_target(q_in_next)).squeeze(-1)
                 ent_pen_n = obs_next_t.new_zeros(obs_next_t.shape[0])
                 if self.has_continuous: ent_pen_n += alpha_c * self._aggregate_continuous_logp(c_logp_n)
                 if self.has_discrete: ent_pen_n += alpha_d * self._discrete_neg_entropy(d_logits_n)
@@ -242,8 +242,9 @@ class SAC(nn.Module, Agent):
 
         if is_v:
             a_vec = self._build_action_vector(continuous_actions, discrete_actions)
-            q1 = self.Q1(torch.cat([obs_t, a_vec], dim=-1)).squeeze(-1)
-            q2 = self.Q2(torch.cat([obs_t, a_vec], dim=-1)).squeeze(-1)
+            q_in = torch.cat([obs_t, a_vec], dim=-1)
+            q1 = self.Q1(q_in).squeeze(-1)
+            q2 = self.Q2(q_in).squeeze(-1)
         else:
             in_vec = torch.cat([obs_t, continuous_actions], dim=-1) if self.has_continuous else obs_t
             v1, adv1, _ = self.Q1(in_vec)
@@ -275,8 +276,8 @@ class SAC(nn.Module, Agent):
 
             if is_v:
                 a_vec_s = self._flatten_actions(c_act, d_act)
-                q_pi = torch.minimum(self.Q1(torch.cat([obs_t, a_vec_s], dim=-1)),
-                                     self.Q2(torch.cat([obs_t, a_vec_s], dim=-1))).squeeze(-1)
+                q_in_s = torch.cat([obs_t, a_vec_s], dim=-1)
+                q_pi = torch.minimum(self.Q1(q_in_s), self.Q2(q_in_s)).squeeze(-1)
                 ent_pen = obs_t.new_zeros(obs_t.shape[0])
                 if self.has_continuous: ent_pen += alpha_c * c_lp_agg
                 if self.has_discrete: ent_pen += alpha_d * self._discrete_neg_entropy(d_logits, detach=False)
@@ -290,8 +291,8 @@ class SAC(nn.Module, Agent):
                 actor_loss = (alpha_c * (c_lp_agg if self.has_continuous else 0) - v_soft_min).mean()
                 if self.has_discrete:
                     for i, logit_i in enumerate(d_logits):
-                        pi_i = F.softmax(logit_i, dim=-1)
                         log_pi_i = F.log_softmax(logit_i, dim=-1)
+                        pi_i = log_pi_i.exp()
                         q_min_i = torch.minimum(v1_s + adv1_s[i], v2_s + adv2_s[i])
                         actor_loss += (pi_i * (log_pi_i - F.log_softmax(q_min_i / alpha_d.detach(), dim=-1).detach())).sum(dim=-1).mean()
 
@@ -380,8 +381,8 @@ class SAC(nn.Module, Agent):
         if actions is None:
             return None # Requires actions for Q-values
         a_vec = self._build_action_vector(actions[0], actions[1]) # Assuming [c, d]
-        q = torch.minimum(self.Q1(torch.cat([observations, a_vec], dim=-1)),
-                          self.Q2(torch.cat([observations, a_vec], dim=-1))).squeeze(-1)
+        q_in = torch.cat([observations, a_vec], dim=-1)
+        q = torch.minimum(self.Q1(q_in), self.Q2(q_in)).squeeze(-1)
         return q
 
     def _flatten_actions(self, c_act, d_act):
@@ -427,9 +428,8 @@ class SAC(nn.Module, Agent):
         ent = 0
         for lg in d_logits:
             logits = lg.detach() if detach else lg
-            pi = F.softmax(logits, dim=-1)
             log_pi = F.log_softmax(logits, dim=-1)
-            ent += (pi * log_pi).sum(dim=-1)
+            ent += (log_pi.exp() * log_pi).sum(dim=-1)
         return ent
 
     @staticmethod

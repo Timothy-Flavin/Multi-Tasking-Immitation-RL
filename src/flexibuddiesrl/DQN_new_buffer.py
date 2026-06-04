@@ -90,9 +90,14 @@ class DQN(nn.Module, Agent):
         if self.np_max_actions is not None and self.np_min_actions is not None:
             self.np_action_ranges = self.np_max_actions - self.np_min_actions
             self.np_action_means = (self.np_max_actions + self.np_min_actions) / 2.0
+            # Cached device tensors — avoids re-allocating on every train_actions call
+            self._max_t       = torch.tensor(self.np_max_actions, device=device, dtype=torch.float32)
+            self._min_t       = torch.tensor(self.np_min_actions, device=device, dtype=torch.float32)
+            self._bin_widths  = (self._max_t - self._min_t) / (self.n_c_action_bins - 1)
         else:
             self.np_action_ranges = None
-            self.np_action_means = None
+            self.np_action_means  = None
+            self._max_t = self._min_t = self._bin_widths = None
 
         self._get_torch_params(encoder, hidden_dims, head_hidden_dims, activation, orthogonal)
         # Separate imitation optimizer so IL steps don't corrupt RL momentum
@@ -180,11 +185,8 @@ class DQN(nn.Module, Agent):
                         c_actions_bins.append(head.argmax(dim=-1))
                 c_actions_bins = torch.stack(c_actions_bins, dim=-1) # [B, n_c_dims]
 
-                # Convert bin indices back to continuous values
-                max_actions_t = torch.as_tensor(self.np_max_actions, device=self.device, dtype=torch.float)
-                min_actions_t = torch.as_tensor(self.np_min_actions, device=self.device, dtype=torch.float)
-                bin_widths = (max_actions_t - min_actions_t) / (self.n_c_action_bins - 1)
-                c_actions_cont = min_actions_t + c_actions_bins.float() * bin_widths
+                # Convert bin indices to continuous values using cached tensors
+                c_actions_cont = self._min_t + c_actions_bins.float() * self._bin_widths
 
             # Unflatten results if input was 3D
             if is_3d:
@@ -222,22 +224,21 @@ class DQN(nn.Module, Agent):
         # 1. Current Q-values
         values, d_adv, c_adv = self.q_net(obs)
         
-        # Gather advantages for taken actions
-        q_list = []
+        # Gather advantages for taken actions — pre-allocated to avoid list+cat overhead
+        n_heads = (len(self.discrete_action_dims) if self.discrete_action_dims else 0) + self.continuous_action_dims
+        q_heads = values.new_zeros(obs.shape[0], n_heads)
+        col = 0
         idx = 0
         if self.discrete_action_dims:
             for i in range(len(self.discrete_action_dims)):
-                q_list.append(d_adv[i].gather(1, actions[:, idx:idx+1].long()))
-                idx += 1
+                q_heads[:, col] = d_adv[i].gather(1, actions[:, idx:idx+1].long()).squeeze(-1)
+                idx += 1; col += 1
         if self.continuous_action_dims:
             for i in range(self.continuous_action_dims):
                 val = actions[:, idx]
-                bin_width = (self.np_max_actions[i] - self.np_min_actions[i]) / (self.n_c_action_bins - 1)
-                bin_idx = torch.round((val - self.np_min_actions[i]) / bin_width).long().clamp(0, self.n_c_action_bins-1)
-                q_list.append(c_adv[i].gather(1, bin_idx.unsqueeze(-1)))
-                idx += 1
-        
-        q_heads = torch.cat(q_list, dim=-1) # [B, n_heads]
+                bin_idx = torch.round((val - self._min_t[i]) / self._bin_widths[i]).long().clamp(0, self.n_c_action_bins - 1)
+                q_heads[:, col] = c_adv[i].gather(1, bin_idx.unsqueeze(-1)).squeeze(-1)
+                idx += 1; col += 1
         v = values.squeeze(-1)
         
         importance_raw = None
