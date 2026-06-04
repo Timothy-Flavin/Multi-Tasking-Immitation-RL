@@ -176,14 +176,14 @@ class BaseBuffer(ABC):
 
     @staticmethod
     def swap_and_flatten(tensor: th.Tensor) -> th.Tensor:
-        """Flatten the leading [T, A, E] dimensions into a single batch axis.
+        """Flatten the leading [T, E, A] dimensions into a single batch axis.
 
-        Storage layout is [T, A, E, ...]. This collapses the first three dims
-        into one, returning [T*A*E, ...].  Because the underlying storage is
+        Storage layout is [T, E, A, ...]. This collapses the first three dims
+        into one, returning [T*E*A, ...].  Because the underlying storage is
         C-contiguous, reshape() returns a view — zero allocation, zero copy.
 
-        Input:  [T, A, E, ...]  or  [T, A, E]  (scalars per step)
-        Output: [T*A*E, ...]    or  [T*A*E, 1]
+        Input:  [T, E, A, ...]  or  [T, E, A]  (scalars per step)
+        Output: [T*E*A, ...]    or  [T*E*A, 1]
         """
         shape = tensor.shape
         if len(shape) < 4:
@@ -265,15 +265,17 @@ class ReplayBuffer(BaseBuffer):
         self.optimize_memory_usage = optimize_memory_usage
         self.handle_timeout_termination = handle_timeout_termination
 
-        # Initialize storage
-        self.observations = self._init_storage((self.buffer_size, self.n_agents, self.n_envs, *self.obs_shape), th.float32)
+        # Initialize storage — layout [T, E, A, O] per CLAUDE.md spec.
+        # E before A so that vectorized-env output ([E, A, O]) maps directly to
+        # a buffer row with no transpose on insertion.
+        self.observations = self._init_storage((self.buffer_size, self.n_envs, self.n_agents, *self.obs_shape), th.float32)
         if not optimize_memory_usage:
-            self.next_observations = self._init_storage((self.buffer_size, self.n_agents, self.n_envs, *self.obs_shape), th.float32)
+            self.next_observations = self._init_storage((self.buffer_size, self.n_envs, self.n_agents, *self.obs_shape), th.float32)
 
-        self.actions = self._init_storage((self.buffer_size, self.n_agents, self.n_envs, self.action_dim), self.action_dtype)
-        self.rewards = self._init_storage((self.buffer_size, self.n_agents, self.n_envs), th.float32)
-        self.terms = self._init_storage((self.buffer_size, self.n_agents, self.n_envs), th.float32)
-        self.truncs = self._init_storage((self.buffer_size, self.n_agents, self.n_envs), th.float32)
+        self.actions = self._init_storage((self.buffer_size, self.n_envs, self.n_agents, self.action_dim), self.action_dtype)
+        self.rewards = self._init_storage((self.buffer_size, self.n_envs, self.n_agents), th.float32)
+        self.terms = self._init_storage((self.buffer_size, self.n_envs, self.n_agents), th.float32)
+        self.truncs = self._init_storage((self.buffer_size, self.n_envs, self.n_agents), th.float32)
 
     def add(
         self,
@@ -284,12 +286,13 @@ class ReplayBuffer(BaseBuffer):
         term: np.ndarray | th.Tensor,
         trunc: np.ndarray | th.Tensor,
     ) -> None:
-        # Expect inputs to be shaped [n_agents, n_envs, ...].
+        # Expect inputs to be shaped [n_envs, n_agents, ...] — matches the [E, A, O]
+        # order that vectorized environments naturally produce, so no transpose needed.
         # _prep_src wraps numpy inputs as pinned CPU tensors when full_gpu=True
         # so copy_(non_blocking=True) can use the CUDA DMA engine.
         nb = self.full_gpu
-        obs_shape  = (self.n_agents, self.n_envs, *self.obs_shape)
-        flat_shape = (self.n_agents, self.n_envs)
+        obs_shape  = (self.n_envs, self.n_agents, *self.obs_shape)
+        flat_shape = (self.n_envs, self.n_agents)
 
         self.observations[self.pos].copy_(self._prep_src(obs, th.float32, obs_shape), non_blocking=nb)
         if self.optimize_memory_usage:
@@ -297,7 +300,7 @@ class ReplayBuffer(BaseBuffer):
         else:
             self.next_observations[self.pos].copy_(self._prep_src(next_obs, th.float32, obs_shape), non_blocking=nb)
 
-        self.actions[self.pos].copy_(self._prep_src(action, self.action_dtype, (self.n_agents, self.n_envs, self.action_dim)), non_blocking=nb)
+        self.actions[self.pos].copy_(self._prep_src(action, self.action_dtype, (self.n_envs, self.n_agents, self.action_dim)), non_blocking=nb)
         self.rewards[self.pos].copy_(self._prep_src(reward, th.float32, flat_shape), non_blocking=nb)
         self.terms[self.pos].copy_(self._prep_src(term,   th.float32, flat_shape), non_blocking=nb)
         self.truncs[self.pos].copy_(self._prep_src(trunc,  th.float32, flat_shape), non_blocking=nb)
@@ -318,19 +321,20 @@ class ReplayBuffer(BaseBuffer):
                 s = s.pin_memory()
             return self.to_torch(s)
 
-        agent_indices = th.randint(0, self.n_agents, (len(batch_inds),))
+        # Storage is [T, E, A, ...] — sample E then A for each selected T.
         env_indices   = th.randint(0, self.n_envs,   (len(batch_inds),))
+        agent_indices = th.randint(0, self.n_agents, (len(batch_inds),))
 
-        obs     = _fetch(self.observations, batch_inds, agent_indices, env_indices)
-        actions = _fetch(self.actions,      batch_inds, agent_indices, env_indices)
+        obs     = _fetch(self.observations, batch_inds, env_indices, agent_indices)
+        actions = _fetch(self.actions,      batch_inds, env_indices, agent_indices)
         if self.optimize_memory_usage:
-            next_obs = _fetch(self.observations, (batch_inds + 1) % self.buffer_size, agent_indices, env_indices)
+            next_obs = _fetch(self.observations, (batch_inds + 1) % self.buffer_size, env_indices, agent_indices)
         else:
-            next_obs = _fetch(self.next_observations, batch_inds, agent_indices, env_indices)
+            next_obs = _fetch(self.next_observations, batch_inds, env_indices, agent_indices)
 
-        rewards = _fetch(self.rewards, batch_inds, agent_indices, env_indices).reshape(-1, 1)
-        terms   = _fetch(self.terms,   batch_inds, agent_indices, env_indices).reshape(-1, 1)
-        truncs  = _fetch(self.truncs,  batch_inds, agent_indices, env_indices).reshape(-1, 1)
+        rewards = _fetch(self.rewards, batch_inds, env_indices, agent_indices).reshape(-1, 1)
+        terms   = _fetch(self.terms,   batch_inds, env_indices, agent_indices).reshape(-1, 1)
+        truncs  = _fetch(self.truncs,  batch_inds, env_indices, agent_indices).reshape(-1, 1)
 
         return ReplayBufferSamples(obs, actions, next_obs, terms, truncs, rewards)
 
@@ -364,15 +368,16 @@ class RolloutBuffer(BaseBuffer):
         self.reset()
 
     def reset(self) -> None:
-        self.observations = self._init_storage((self.buffer_size, self.n_agents, self.n_envs, *self.obs_shape), th.float32)
-        self.actions = self._init_storage((self.buffer_size, self.n_agents, self.n_envs, self.action_dim), self.action_dtype)
-        self.rewards = self._init_storage((self.buffer_size, self.n_agents, self.n_envs), th.float32)
-        self.returns = self._init_storage((self.buffer_size, self.n_agents, self.n_envs), th.float32)
-        self.terminations = self._init_storage((self.buffer_size, self.n_agents, self.n_envs), th.float32)
-        self.truncations = self._init_storage((self.buffer_size, self.n_agents, self.n_envs), th.float32)
-        self.values = self._init_storage((self.buffer_size, self.n_agents, self.n_envs), th.float32)
-        self.log_probs = self._init_storage((self.buffer_size, self.n_agents, self.n_envs, self.log_probs_dim), th.float32)
-        self.advantages = self._init_storage((self.buffer_size, self.n_agents, self.n_envs), th.float32)
+        # Layout [T, E, A, ...] — matches env output order, zero-copy insertion.
+        self.observations = self._init_storage((self.buffer_size, self.n_envs, self.n_agents, *self.obs_shape), th.float32)
+        self.actions = self._init_storage((self.buffer_size, self.n_envs, self.n_agents, self.action_dim), self.action_dtype)
+        self.rewards = self._init_storage((self.buffer_size, self.n_envs, self.n_agents), th.float32)
+        self.returns = self._init_storage((self.buffer_size, self.n_envs, self.n_agents), th.float32)
+        self.terminations = self._init_storage((self.buffer_size, self.n_envs, self.n_agents), th.float32)
+        self.truncations = self._init_storage((self.buffer_size, self.n_envs, self.n_agents), th.float32)
+        self.values = self._init_storage((self.buffer_size, self.n_envs, self.n_agents), th.float32)
+        self.log_probs = self._init_storage((self.buffer_size, self.n_envs, self.n_agents, self.log_probs_dim), th.float32)
+        self.advantages = self._init_storage((self.buffer_size, self.n_envs, self.n_agents), th.float32)
         self.final_observations = {} # Key: (pos, agent_idx, env_idx), Val: obs tensor
         self.generator_ready = False
         super().reset()
@@ -401,14 +406,14 @@ class RolloutBuffer(BaseBuffer):
         terms   = self.terminations.to(dev, non_blocking=True)  # [T, A, E]
         truncs  = self.truncations.to(dev, non_blocking=True)   # [T, A, E]
 
-        last_values  = last_values.reshape(self.n_agents, self.n_envs).to(dev)
-        last_gae_lam = th.zeros((self.n_agents, self.n_envs), device=dev)
+        last_values  = last_values.reshape(self.n_envs, self.n_agents).to(dev)
+        last_gae_lam = th.zeros((self.n_envs, self.n_agents), device=dev)
 
-        terms_t  = th.as_tensor(terminations, dtype=th.float32, device=dev).reshape(self.n_agents, self.n_envs)
-        truncs_t = th.as_tensor(truncations,  dtype=th.float32, device=dev).reshape(self.n_agents, self.n_envs)
+        terms_t  = th.as_tensor(terminations, dtype=th.float32, device=dev).reshape(self.n_envs, self.n_agents)
+        truncs_t = th.as_tensor(truncations,  dtype=th.float32, device=dev).reshape(self.n_envs, self.n_agents)
 
-        # Accumulate advantages fully on-device.
-        advantages = th.empty((T, self.n_agents, self.n_envs), device=dev)
+        # Accumulate advantages fully on-device. Layout [T, E, A].
+        advantages = th.empty((T, self.n_envs, self.n_agents), device=dev)
 
         for step in reversed(range(T)):
             if step == T - 1:
@@ -420,13 +425,14 @@ class RolloutBuffer(BaseBuffer):
                 next_episode_continuation = 1.0 - th.clamp(terms[step] + truncs[step], 0.0, 1.0)
                 next_vals = values[step + 1]
 
-            # Truncation bootstrap: override next_vals for specific (agent, env) pairs.
+            # Truncation bootstrap: override next_vals for specific (env, agent) pairs.
+            # Keys are (t_step, e_idx, a_idx) matching the [T, E, A] storage order.
             # Clone first so we never mutate a view into the bulk `values` tensor.
             if get_value_fn is not None and self.final_observations:
-                for (t_step, a_idx, e_idx), final_obs in self.final_observations.items():
+                for (t_step, e_idx, a_idx), final_obs in self.final_observations.items():
                     if t_step == step:
                         next_vals = next_vals.clone()
-                        next_vals[a_idx, e_idx] = get_value_fn(final_obs.to(dev))
+                        next_vals[e_idx, a_idx] = get_value_fn(final_obs.to(dev))
 
             delta = rewards[step] + self.gamma * next_vals * next_non_terminal - values[step]
             last_gae_lam = delta + self.gamma * self.gae_lambda * next_episode_continuation * last_gae_lam
@@ -444,27 +450,30 @@ class RolloutBuffer(BaseBuffer):
             self.returns.copy_(adv_cpu + self.values)
 
     def add(self, obs, action, reward, termination, truncation, value, log_prob, final_obs=None) -> None:
+        # Inputs must be shaped [n_envs, n_agents, ...] — matching [E, A, O] env output.
         # _prep_src wraps numpy inputs as pinned CPU tensors when full_gpu=True so
         # copy_(non_blocking=True) activates the CUDA DMA engine for each field.
         nb         = self.full_gpu
-        flat_shape = (self.n_agents, self.n_envs)
+        flat_shape = (self.n_envs, self.n_agents)
 
-        self.observations[self.pos].copy_(self._prep_src(obs, th.float32, (self.n_agents, self.n_envs, *self.obs_shape)), non_blocking=nb)
-        self.actions[self.pos].copy_(self._prep_src(action, self.action_dtype, (self.n_agents, self.n_envs, self.action_dim)), non_blocking=nb)
+        self.observations[self.pos].copy_(self._prep_src(obs, th.float32, (self.n_envs, self.n_agents, *self.obs_shape)), non_blocking=nb)
+        self.actions[self.pos].copy_(self._prep_src(action, self.action_dtype, (self.n_envs, self.n_agents, self.action_dim)), non_blocking=nb)
         self.rewards[self.pos].copy_(self._prep_src(reward, th.float32, flat_shape), non_blocking=nb)
         self.terminations[self.pos].copy_(self._prep_src(termination, th.float32, flat_shape), non_blocking=nb)
         self.truncations[self.pos].copy_(self._prep_src(truncation,  th.float32, flat_shape), non_blocking=nb)
         self.values[self.pos].copy_(self._prep_src(value, th.float32, flat_shape), non_blocking=nb)
-        self.log_probs[self.pos].copy_(self._prep_src(log_prob, th.float32, (self.n_agents, self.n_envs, self.log_probs_dim)), non_blocking=nb)
+        self.log_probs[self.pos].copy_(self._prep_src(log_prob, th.float32, (self.n_envs, self.n_agents, self.log_probs_dim)), non_blocking=nb)
         
         if final_obs is not None:
             if isinstance(final_obs, dict):
-                for (a_idx, e_idx), f_obs in final_obs.items():
-                    self.final_observations[(self.pos, a_idx, e_idx)] = th.as_tensor(f_obs).clone()
+                for (e_idx, a_idx), f_obs in final_obs.items():
+                    self.final_observations[(self.pos, e_idx, a_idx)] = th.as_tensor(f_obs).clone()
             else:
-                trunc_indices = np.where(truncation.reshape(self.n_agents, self.n_envs))
-                for a_idx, e_idx in zip(*trunc_indices):
-                    self.final_observations[(self.pos, a_idx, e_idx)] = th.as_tensor(final_obs[a_idx, e_idx]).clone()
+                # truncation broadcast to [E, A]; walk in [E, A] order
+                t_np = truncation.cpu().numpy() if th.is_tensor(truncation) else np.array(truncation)
+                trunc_indices = np.where(t_np.reshape(self.n_envs, self.n_agents))
+                for e_idx, a_idx in zip(*trunc_indices):
+                    self.final_observations[(self.pos, e_idx, a_idx)] = th.as_tensor(final_obs[e_idx, a_idx]).clone()
 
         self.pos += 1
         if self.pos == self.buffer_size:

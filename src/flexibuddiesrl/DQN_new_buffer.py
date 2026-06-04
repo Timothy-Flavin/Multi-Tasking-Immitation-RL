@@ -140,20 +140,21 @@ class DQN(nn.Module, Agent):
 
     def train_actions(self, observations, action_mask=None, step=False, epsilon=0.1):
         if step: self.steps += 1
-        
-        if not torch.is_tensor(observations):
+
+        was_tensor = torch.is_tensor(observations)
+        if not was_tensor:
             observations = T(observations, device=self.device)
-        
+
         is_3d = (len(observations.shape) == 3)
         if is_3d:
-            n_agents, n_envs, obs_dim = observations.shape
+            n_envs, n_agents, obs_dim = observations.shape
             obs_flat = observations.reshape(-1, obs_dim)
         else:
             obs_flat = observations
-            
+
         with torch.no_grad():
-            values, d_adv, c_adv = self.q_net(obs_flat)
-            
+            values_flat, d_adv, c_adv = self.q_net(obs_flat)
+
             d_actions = []
             if d_adv is not None:
                 for head in d_adv:
@@ -167,45 +168,43 @@ class DQN(nn.Module, Agent):
             else:
                 d_actions = None
 
-            c_actions = []
+            c_actions_cont = None
             if c_adv is not None:
+                c_actions_bins = []
                 for head in c_adv:
                     if random.random() < epsilon and not self.eval_mode:
-                        c_actions.append(torch.randint(0, head.shape[-1], (obs_flat.shape[0],), device=self.device))
+                        c_actions_bins.append(torch.randint(0, head.shape[-1], (obs_flat.shape[0],), device=self.device))
                     elif self.dqn_type in (dqntype.Soft, dqntype.Munchausen):
-                        c_actions.append(Categorical(logits=head / self.entropy_loss_coef).sample())
+                        c_actions_bins.append(Categorical(logits=head / self.entropy_loss_coef).sample())
                     else:
-                        c_actions.append(head.argmax(dim=-1))
-                c_actions = torch.stack(c_actions, dim=-1)
-                
-                # Unflatten and convert to numpy for continuous processing
-                if is_3d:
-                    c_actions_np = c_actions.reshape(n_agents, n_envs, -1).cpu().numpy()
-                else:
-                    c_actions_np = c_actions.cpu().numpy()
+                        c_actions_bins.append(head.argmax(dim=-1))
+                c_actions_bins = torch.stack(c_actions_bins, dim=-1) # [B, n_c_dims]
 
                 # Convert bin indices back to continuous values
-                c_actions_cont = []
-                for i in range(self.continuous_action_dims):
-                    bin_indices = c_actions_np[..., i]
-                    bin_width = (self.np_max_actions[i] - self.np_min_actions[i]) / (self.n_c_action_bins - 1)
-                    vals = self.np_min_actions[i] + bin_indices * bin_width
-                    c_actions_cont.append(vals)
-                c_actions_cont = np.stack(c_actions_cont, axis=-1)
-            else:
-                c_actions_cont = None
+                max_actions_t = torch.as_tensor(self.np_max_actions, device=self.device, dtype=torch.float)
+                min_actions_t = torch.as_tensor(self.np_min_actions, device=self.device, dtype=torch.float)
+                bin_widths = (max_actions_t - min_actions_t) / (self.n_c_action_bins - 1)
+                c_actions_cont = min_actions_t + c_actions_bins.float() * bin_widths
 
             # Unflatten results if input was 3D
             if is_3d:
                 if d_actions is not None:
-                    d_actions = d_actions.reshape(n_agents, n_envs, -1)
-                if values is not None:
-                    values = values.reshape(n_agents, n_envs, -1)
+                    d_actions = d_actions.reshape(n_envs, n_agents, -1)
+                if c_actions_cont is not None:
+                    c_actions_cont = c_actions_cont.reshape(n_envs, n_agents, -1)
+                values = values_flat.reshape(n_envs, n_agents, -1)
+            else:
+                values = values_flat
+
+        def _maybe_numpy(x):
+            if was_tensor or x is None:
+                return x
+            return x.cpu().numpy()
 
         return {
-            "discrete_actions": d_actions.cpu().numpy() if d_actions is not None else None,
-            "continuous_actions": c_actions_cont if c_actions_cont is not None else None,
-            "values": values.cpu().numpy() if values is not None else None
+            "discrete_actions": _maybe_numpy(d_actions),
+            "continuous_actions": _maybe_numpy(c_actions_cont),
+            "values": _maybe_numpy(values)
         }
 
     def reinforcement_learn(self, samples: ReplayBufferSamples, agent_num=0):

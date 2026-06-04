@@ -191,9 +191,9 @@ class PG(nn.Module, Agent):
     def _add_batch_to_offline_buffer(self, buffer: RolloutBuffer):
         """Copy transitions from an on-policy RolloutBuffer into the offline critic ReplayBuffer.
 
-        RolloutBuffer stores [T, A, E, ...] tensors.  The offline buffer expects
+        RolloutBuffer stores [T, E, A, ...] tensors.  The offline buffer expects
         individual (obs, next_obs, action, reward, term, trunc) tuples shaped
-        [n_agents=1, n_envs=1, ...].  We flatten each (T, A, E) cell to a
+        [n_envs=1, n_agents=1, ...].  We flatten each (T, E, A) cell to a
         separate transition so the offline critic sees a diverse mix of samples.
 
         next_obs uses obs[t+1] for interior steps; for the last step in the
@@ -205,26 +205,26 @@ class PG(nn.Module, Agent):
         if T < 2:
             return
 
-        obs_all     = buffer.observations[:T].cpu().numpy()    # [T, A, E, obs_dim]
-        actions_all = buffer.actions[:T].cpu().numpy()         # [T, A, E, act_dim]
-        rewards_all = buffer.rewards[:T].cpu().numpy()         # [T, A, E]
-        terms_all   = buffer.terminations[:T].cpu().numpy()    # [T, A, E]
-        truncs_all  = buffer.truncations[:T].cpu().numpy()     # [T, A, E]
+        obs_all     = buffer.observations[:T].cpu().numpy()    # [T, E, A, obs_dim]
+        actions_all = buffer.actions[:T].cpu().numpy()         # [T, E, A, act_dim]
+        rewards_all = buffer.rewards[:T].cpu().numpy()         # [T, E, A]
+        terms_all   = buffer.terminations[:T].cpu().numpy()    # [T, E, A]
+        truncs_all  = buffer.truncations[:T].cpu().numpy()     # [T, E, A]
 
         # next_obs: shift by 1; last step reuses its own obs as a placeholder
-        next_obs_all = np.concatenate([obs_all[1:], obs_all[-1:]], axis=0)  # [T, A, E, obs_dim]
+        next_obs_all = np.concatenate([obs_all[1:], obs_all[-1:]], axis=0)  # [T, E, A, obs_dim]
 
-        _, A, E, _ = obs_all.shape
+        _, E, A, _ = obs_all.shape
         for t in range(T - 1):          # skip last step (next_obs is approximate)
-            for a in range(A):
-                for e in range(E):
+            for e in range(E):
+                for a in range(A):
                     self._offline_buffer.add(
-                        obs=obs_all[t, a:a+1, e:e+1],           # [1, 1, obs_dim]
-                        next_obs=next_obs_all[t, a:a+1, e:e+1],
-                        action=actions_all[t, a:a+1, e:e+1],
-                        reward=rewards_all[t, a:a+1, e:e+1],
-                        term=terms_all[t, a:a+1, e:e+1],
-                        trunc=truncs_all[t, a:a+1, e:e+1],
+                        obs=obs_all[t, e:e+1, a:a+1],           # [1, 1, obs_dim]
+                        next_obs=next_obs_all[t, e:e+1, a:a+1],
+                        action=actions_all[t, e:e+1, a:a+1],
+                        reward=rewards_all[t, e:e+1, a:a+1],
+                        term=terms_all[t, e:e+1, a:a+1],
+                        trunc=truncs_all[t, e:e+1, a:a+1],
                     )
 
     def _offline_critic_loss(self) -> torch.Tensor:
@@ -370,14 +370,16 @@ class PG(nn.Module, Agent):
         t = 0
         if self.wall_time:
             t = time.time()
-        if not torch.is_tensor(observations):
+        
+        was_tensor = torch.is_tensor(observations)
+        if not was_tensor:
             observations = T(observations, device=self.device, dtype=torch.float)
         
-        # observations shape: [n_agents, n_envs, obs_dim] or [n_envs, obs_dim]
+        # observations shape: [n_envs, n_agents, obs_dim] per [T,E,A,O] layout, or [B, obs_dim]
         # StochasticActor expects [batch, obs_dim]
         is_3d = (len(observations.shape) == 3)
         if is_3d:
-            n_agents, n_envs, obs_dim = observations.shape
+            n_envs, n_agents, obs_dim = observations.shape
             obs_flat = observations.reshape(-1, obs_dim)
         else:
             obs_flat = observations
@@ -420,32 +422,37 @@ class PG(nn.Module, Agent):
                 self.discrete_action_dims is not None,
             )
 
-            # Unflatten results if input was 3D
+            # Unflatten results if input was 3D — output is [E, A, ...]
             if is_3d:
                 if discrete_actions is not None:
-                    discrete_actions = discrete_actions.reshape(n_agents, n_envs, -1)
+                    discrete_actions = discrete_actions.reshape(n_envs, n_agents, -1)
                 if continuous_actions is not None:
-                    continuous_actions = continuous_actions.reshape(n_agents, n_envs, -1)
+                    continuous_actions = continuous_actions.reshape(n_envs, n_agents, -1)
                 if discrete_log_probs is not None:
-                    discrete_log_probs = discrete_log_probs.reshape(n_agents, n_envs, -1)
+                    discrete_log_probs = discrete_log_probs.reshape(n_envs, n_agents, -1)
                 if continuous_log_probs is not None:
-                    continuous_log_probs = continuous_log_probs.reshape(n_agents, n_envs, -1)
+                    continuous_log_probs = continuous_log_probs.reshape(n_envs, n_agents, -1)
 
         if self.wall_time:
             t = time.time() - t
-            
+
         values_flat = self.expected_V(obs_flat).detach()
         if is_3d:
-            values = values_flat.reshape(n_agents, n_envs)
+            values = values_flat.reshape(n_envs, n_agents)
         else:
             values = values_flat
             
+        def _maybe_numpy(x):
+            if was_tensor:
+                return x
+            return self._to_numpy(x)
+
         act = {
-            "discrete_actions": self._to_numpy(discrete_actions),
-            "continuous_actions": self._to_numpy(continuous_actions),
-            "discrete_log_probs": self._to_numpy(discrete_log_probs),
-            "continuous_log_probs": self._to_numpy(continuous_log_probs),
-            "values": values.cpu().numpy(),
+            "discrete_actions": _maybe_numpy(discrete_actions),
+            "continuous_actions": _maybe_numpy(continuous_actions),
+            "discrete_log_probs": _maybe_numpy(discrete_log_probs),
+            "continuous_log_probs": _maybe_numpy(continuous_log_probs),
+            "values": _maybe_numpy(values),
             "act_time": t,
         }
         return act
@@ -498,7 +505,7 @@ class PG(nn.Module, Agent):
     def expected_V(self, obs, legal_action=None):
         is_3d = (len(obs.shape) == 3)
         if is_3d:
-            n_agents, n_envs, obs_dim = obs.shape
+            n_envs, n_agents, obs_dim = obs.shape
             obs_flat = obs.reshape(-1, obs_dim)
         else:
             obs_flat = obs
@@ -508,9 +515,9 @@ class PG(nn.Module, Agent):
         else:
             values, disc_advantages, cont_advantages = self.critic(obs_flat)
             v_flat = values.squeeze(-1)
-            
+
         if is_3d:
-            return v_flat.reshape(n_agents, n_envs)
+            return v_flat.reshape(n_envs, n_agents)
         return v_flat
 
     def _smooth_clamp_logstd(self):
@@ -764,7 +771,7 @@ class PG(nn.Module, Agent):
         rewards = buffer.rewards[:buffer.pos]
         terminated = buffer.terminations[:buffer.pos]
         truncated = buffer.truncations[:buffer.pos]
-        T_steps, A, E, _ = obs.shape
+        T_steps, E, A, _ = obs.shape
 
         obs_f = obs.reshape(-1, self.obs_dim).to(self.device)
         d_actions_f = actions[:, :, :, :len(self.discrete_action_dims)].reshape(-1, len(self.discrete_action_dims)).long().to(self.device) if self.discrete_action_dims else None
@@ -776,8 +783,8 @@ class PG(nn.Module, Agent):
         adv_f = self._gather_observed_advantages(d_adv_f, c_adv_f, d_actions_f, c_actions_f)
         Q_f = (self.mixer(adv_f, obs_f)[0] + values_f).squeeze(-1)
 
-        V = values_f.detach().reshape(T_steps, A, E)
-        bootstrap_values = last_values.reshape(A, E)
+        V = values_f.detach().reshape(T_steps, E, A)
+        bootstrap_values = last_values.reshape(E, A)
         term_t = torch.as_tensor(terminated, device=self.device)
         trunc_t = torch.as_tensor(truncated, device=self.device)
 
@@ -804,12 +811,12 @@ class PG(nn.Module, Agent):
 
     def _weighted_gae(
         self,
-        rewards: torch.Tensor,           # [T, A, E]
-        values: torch.Tensor,            # [T, A, E]
-        bootstrap_values: torch.Tensor,  # [A, E]
-        terminated: torch.Tensor,        # [T, A, E]
-        truncated: torch.Tensor,         # [T, A, E]
-        advantage_weights: torch.Tensor, # [T, A, E, D]
+        rewards: torch.Tensor,           # [T, E, A]
+        values: torch.Tensor,            # [T, E, A]
+        bootstrap_values: torch.Tensor,  # [E, A]
+        terminated: torch.Tensor,        # [T, E, A]
+        truncated: torch.Tensor,         # [T, E, A]
+        advantage_weights: torch.Tensor, # [T, E, A, D]
         gamma=0.99,
         gae_lambda=0.95,
         final_observations=None,
@@ -818,11 +825,11 @@ class PG(nn.Module, Agent):
         rewards = rewards.to(self.device)
         terminated = terminated.to(self.device)
         truncated = truncated.to(self.device)
-        
-        T_steps, A, E, D = advantage_weights.shape
-        advantages = torch.zeros((T_steps, A, E, D), device=self.device)
-        last_gae_lam = torch.zeros((A, E, D), device=self.device)
-        
+
+        T_steps, E, A, D = advantage_weights.shape
+        advantages = torch.zeros((T_steps, E, A, D), device=self.device)
+        last_gae_lam = torch.zeros((E, A, D), device=self.device)
+
         for step in reversed(range(T_steps)):
             if step == T_steps - 1:
                 next_non_terminal = 1.0 - terminated[step]
@@ -832,22 +839,21 @@ class PG(nn.Module, Agent):
                 next_non_terminal = 1.0 - terminated[step]
                 next_episode_continuation = 1.0 - torch.clamp(terminated[step] + truncated[step], 0.0, 1.0)
                 next_values = values[step + 1].clone()
-            
-            # Handle truncation bootstrapping
+
+            # Handle truncation bootstrapping — keys are (t_step, e_idx, a_idx)
             if get_value_fn is not None and final_observations is not None:
-                # We could optimize this by vectorizing over truncations in the current step
-                for (t_step, agent_idx, env_idx), final_obs in final_observations.items():
+                for (t_step, env_idx, agent_idx), final_obs in final_observations.items():
                     if t_step == step:
-                        next_values[agent_idx, env_idx] = get_value_fn(final_obs.to(self.device))
-            
-            # delta [A, E]
+                        next_values[env_idx, agent_idx] = get_value_fn(final_obs.to(self.device))
+
+            # delta [E, A]
             delta = rewards[step] + gamma * next_values * next_non_terminal - values[step]
-            # weighted_delta [A, E, D]
+            # weighted_delta [E, A, D]
             weighted_delta = delta.unsqueeze(-1) * advantage_weights[step]
-            
+
             last_gae_lam = weighted_delta + gamma * gae_lambda * next_episode_continuation.unsqueeze(-1) * last_gae_lam
             advantages[step] = last_gae_lam
-            
+
         returns = advantages + values.unsqueeze(-1)
         return returns, advantages
 
@@ -867,15 +873,15 @@ class PG(nn.Module, Agent):
         if self.wall_time:
             t = time.time()
 
-        # Pull all data from buffer [T, A, E, ...]
+        # Pull all data from buffer [T, E, A, ...]
         obs = buffer.observations[:buffer.pos]
         actions = buffer.actions[:buffer.pos]
         rewards = buffer.rewards[:buffer.pos]
         terminated = buffer.terminations[:buffer.pos]
         truncated = buffer.truncations[:buffer.pos]
 
-        T_steps, A, E, _ = obs.shape
-        
+        T_steps, E, A, _ = obs.shape
+
         # Pull discrete and continuous actions
         d_actions = None
         c_actions = None
@@ -886,40 +892,40 @@ class PG(nn.Module, Agent):
 
         # Calculate Mixer Gradients for Importance
         with torch.no_grad():
-            # Flatten to [T*A*E, ...] for critic call
+            # Flatten to [T*E*A, ...] for critic call
             obs_f = obs.reshape(-1, self.obs_dim).to(self.device)
             values_f, d_adv_f, c_adv_f = self.critic(obs_f)
-            
+
             if c_adv_f is not None:
                 c_adv_f = torch.transpose(torch.stack(c_adv_f, dim=0), 0, 1)
-            
+
             # Reshape actions for gather
             d_actions_f = d_actions.reshape(-1, len(self.discrete_action_dims)).to(self.device) if d_actions is not None else None
             c_actions_f = c_actions.reshape(-1, self.continuous_action_dim).to(self.device) if c_actions is not None else None
-            
+
             adv_f = self._gather_observed_advantages(d_adv_f, c_adv_f, d_actions_f, c_actions_f)
-        
+
         grad_free_adv = adv_f.detach()
         grad_free_adv.requires_grad = True
         __q, adv_grad = self.mixer(grad_free_adv, obs_f, with_grad=True)
         self.mixer.zero_grad()
 
         with torch.no_grad():
-            V = values_f.reshape(T_steps, A, E)
-            
+            V = values_f.reshape(T_steps, E, A)
+
             # Weighted GAE
             if self.importance_from_grad:
-                scaled_importance = (grad_free_adv * adv_grad).reshape(T_steps, A, E, -1)
+                scaled_importance = (grad_free_adv * adv_grad).reshape(T_steps, E, A, -1)
             else:
                 raw_importance = self._gather_importance(d_adv_f, c_adv_f)
-                scaled_importance = (raw_importance * adv_grad).reshape(T_steps, A, E, -1)
-            
+                scaled_importance = (raw_importance * adv_grad).reshape(T_steps, E, A, -1)
+
             self._update_importance()
             abs_imp = scaled_importance.abs() + 1e-8
             powered = abs_imp**self.importance_alpha
             scaled_importance = powered / powered.sum(dim=-1, keepdim=True)
 
-            bootstrap_values = last_values.reshape(A, E)
+            bootstrap_values = last_values.reshape(E, A)
             term_t = torch.as_tensor(terminated, device=self.device)
             trunc_t = torch.as_tensor(truncated, device=self.device)
             

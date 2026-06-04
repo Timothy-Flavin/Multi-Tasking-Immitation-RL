@@ -106,6 +106,8 @@ def run_vectorized_experiment(config_name, cfg, seed):
         )
 
     obs, _ = env.reset(seed=seed)
+    obs_t = th.as_tensor(obs, device=device).unsqueeze(1).float()
+
     steps_done, ep_num, updates = 0, 0, 0
     episode_rewards = np.zeros(NUM_ENVS)
     reward_curve, importance_history = [], []
@@ -113,16 +115,19 @@ def run_vectorized_experiment(config_name, cfg, seed):
     while steps_done < TOTAL_STEPS:
         agent.eval()
         with th.no_grad():
-            obs_t = th.as_tensor(obs, device=device).unsqueeze(0).float()
             act_dict = agent.train_actions(obs_t)
-            d_actions = act_dict["discrete_actions"]  # [1, NUM_ENVS, 2]
+            d_actions = act_dict["discrete_actions"]  # [NUM_ENVS, 1, 2]
 
             if is_ppo:
-                values = th.as_tensor(act_dict["values"], device=device)
-                log_probs = th.as_tensor(act_dict["discrete_log_probs"], device=device)
+                values = act_dict["values"]
+                log_probs = act_dict["discrete_log_probs"]
 
-        env_actions = d_actions.reshape(NUM_ENVS, 2).astype(int)
+        d_actions_np = d_actions.cpu().numpy() if torch.is_tensor(d_actions) else d_actions
+        env_actions = d_actions_np.reshape(NUM_ENVS, 2).astype(int)
         obs_next, rewards, terminations, truncations, info = env.step(env_actions)
+
+        # Convert ONLY what is needed for the next step or agent inference
+        obs_next_t = th.as_tensor(obs_next, device=device).unsqueeze(1).float()
 
         # Capture context (first element of observation) for importance analysis
         # Using context from the *start* of the transition
@@ -130,8 +135,8 @@ def run_vectorized_experiment(config_name, cfg, seed):
 
         if is_ppo:
             buffer.add(
-                obs=obs[np.newaxis, ...],
-                action=d_actions,
+                obs=obs_t if buffer.full_gpu else obs[np.newaxis, ...],
+                action=d_actions if buffer.full_gpu else d_actions_np,
                 reward=rewards[np.newaxis, ...],
                 termination=terminations[np.newaxis, ...],
                 truncation=truncations[np.newaxis, ...],
@@ -140,9 +145,9 @@ def run_vectorized_experiment(config_name, cfg, seed):
             )
         else:
             buffer.add(
-                obs=obs[np.newaxis, ...],
-                next_obs=obs_next[np.newaxis, ...],
-                action=d_actions,
+                obs=obs_t if buffer.full_gpu else obs[np.newaxis, ...],
+                next_obs=obs_next_t if buffer.full_gpu else obs_next[np.newaxis, ...],
+                action=d_actions if buffer.full_gpu else d_actions_np,
                 reward=rewards[np.newaxis, ...],
                 term=terminations[np.newaxis, ...],
                 trunc=truncations[np.newaxis, ...],
@@ -157,14 +162,14 @@ def run_vectorized_experiment(config_name, cfg, seed):
                 episode_rewards[i] = 0
 
         obs = obs_next
+        obs_t = obs_next_t
         steps_done += NUM_ENVS
 
         # Training
         if is_ppo and buffer.full:
             agent.train()
             with th.no_grad():
-                last_obs_t = th.as_tensor(obs, device=device).unsqueeze(0).float()
-                last_values = agent.expected_V(last_obs_t)
+                last_values = agent.expected_V(obs_t)
             rl = agent.reinforcement_learn(
                 buffer,
                 last_values,

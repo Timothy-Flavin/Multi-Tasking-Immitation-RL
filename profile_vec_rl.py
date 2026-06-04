@@ -177,6 +177,7 @@ def run_profiling_new(
     steps_done = 0
     last_print_step = 0
     obs = raw_env.reset()[0]
+    obs_t = th.as_tensor(obs, device=device).unsqueeze(1)  # [E, A=1, obs_dim]
 
     episode_rewards = np.zeros(num_envs)
     rewards_history = []
@@ -190,31 +191,35 @@ def run_profiling_new(
                 _sync(device)
                 _t = time.perf_counter()
                 with th.no_grad():
-                    obs_t = th.as_tensor(obs, device=device).unsqueeze(0)
+                    # [E, A=1, obs_dim] — [E, A, O] layout per spec
                     act_dict = agent.train_actions(obs_t)
-                    values = th.as_tensor(act_dict["values"], device=device)
+                    values = th.as_tensor(act_dict["values"], device=device)     # [E, A=1]
                     log_probs = th.as_tensor(
                         act_dict["continuous_log_probs" if is_continuous else "discrete_log_probs"],
                         device=device,
-                    )
+                    )  # [E, A=1, lp_dim]
                     raw_actions = act_dict["continuous_actions" if is_continuous else "discrete_actions"]
                 _sync(device)
                 t_take_action += time.perf_counter() - _t
                 n_action_calls += 1
 
                 # Phase 2: env_step
+                raw_actions_np = raw_actions if isinstance(raw_actions, np.ndarray) else raw_actions.cpu().numpy()
                 if is_continuous:
-                    env_actions = raw_actions.reshape(num_envs, 1).astype(np.float32)
+                    env_actions = raw_actions_np.reshape(num_envs, 1).astype(np.float32)
                     _t = time.perf_counter()
                     obs_next, rewards, terminations, truncations, info = raw_env.step(
                         (env_actions > 0).astype(np.int32).flatten()
                     )
                     t_env_step += time.perf_counter() - _t
                 else:
-                    env_actions = raw_actions.flatten()
+                    env_actions = raw_actions_np.flatten()
                     _t = time.perf_counter()
                     obs_next, rewards, terminations, truncations, info = raw_env.step(env_actions)
                     t_env_step += time.perf_counter() - _t
+
+                # Convert ONLY what is needed for the next step or agent inference
+                obs_next_t = th.as_tensor(obs_next, device=device).unsqueeze(1)
 
                 # Truncation bootstrap obs
                 final_obs = None
@@ -231,17 +236,17 @@ def run_profiling_new(
                                 final_obs[i] = f_obs_src[i]
                     else:
                         final_obs = obs_next
-                    final_obs = final_obs[np.newaxis, ...]
+                    final_obs = final_obs[:, np.newaxis, :]   # [E, A=1, obs_dim]
 
-                # Phase 3: buffer_insert
+                # Phase 3: buffer_insert — inputs are [E, A, ...] per [T,E,A,O] spec
                 _sync(device)
                 _t = time.perf_counter()
                 buffer.add(
-                    obs=obs[np.newaxis, ...],
-                    action=raw_actions,
-                    reward=rewards[np.newaxis, ...],
-                    termination=terminations[np.newaxis, ...],
-                    truncation=truncations[np.newaxis, ...],
+                    obs=obs_t if full_gpu else obs[:, np.newaxis, :],
+                    action=raw_actions if full_gpu else raw_actions_np,
+                    reward=rewards[:, np.newaxis],
+                    termination=terminations[:, np.newaxis],
+                    truncation=truncations[:, np.newaxis],
                     value=values,
                     log_prob=log_probs,
                     final_obs=final_obs,
@@ -255,20 +260,20 @@ def run_profiling_new(
                         rewards_history.append(episode_rewards[i])
                         episode_rewards[i] = 0
                 obs = obs_next
+                obs_t = obs_next_t
                 steps_done += num_envs
 
             # Phase 4: network_update (PPO)
             agent.train()
             with th.no_grad():
-                last_obs_t = th.as_tensor(obs, device=device).unsqueeze(0)
-                last_values = agent.expected_V(last_obs_t)
+                last_values = agent.expected_V(obs_t)                   # [E, A=1]
             _sync(device)
             _t = time.perf_counter()
             agent.reinforcement_learn(
                 buffer,
                 last_values,
-                terminations[np.newaxis, ...],
-                truncations[np.newaxis, ...],
+                terminations[:, np.newaxis],   # [E, A=1]
+                truncations[:, np.newaxis],    # [E, A=1]
             )
             _sync(device)
             t_net_update += time.perf_counter() - _t
@@ -281,7 +286,6 @@ def run_profiling_new(
             _sync(device)
             _t = time.perf_counter()
             with th.no_grad():
-                obs_t = th.as_tensor(obs, device=device).unsqueeze(0)
                 act_dict = agent.train_actions(obs_t)
                 raw_actions = act_dict["continuous_actions" if is_continuous else "discrete_actions"]
             _sync(device)
@@ -289,29 +293,33 @@ def run_profiling_new(
             n_action_calls += 1
 
             # Phase 2: env_step
+            raw_actions_np = raw_actions if isinstance(raw_actions, np.ndarray) else raw_actions.cpu().numpy()
             if is_continuous:
-                env_actions = raw_actions.reshape(num_envs, 1).astype(np.float32)
+                env_actions = raw_actions_np.reshape(num_envs, 1).astype(np.float32)
                 _t = time.perf_counter()
                 obs_next, rewards, terminations, truncations, info = raw_env.step(
                     (env_actions > 0).astype(np.int32).flatten()
                 )
                 t_env_step += time.perf_counter() - _t
             else:
-                env_actions = raw_actions.flatten()
+                env_actions = raw_actions_np.flatten()
                 _t = time.perf_counter()
                 obs_next, rewards, terminations, truncations, info = raw_env.step(env_actions)
                 t_env_step += time.perf_counter() - _t
 
-            # Phase 3: buffer_insert
+            # Convert ONLY what is needed for the next step or agent inference
+            obs_next_t = th.as_tensor(obs_next, device=device).unsqueeze(1)
+
+            # Phase 3: buffer_insert — inputs are [E, A, ...] per [T,E,A,O] spec
             _sync(device)
             _t = time.perf_counter()
             buffer.add(
-                obs=obs[np.newaxis, ...],
-                next_obs=obs_next[np.newaxis, ...],
-                action=raw_actions,
-                reward=rewards[np.newaxis, ...],
-                term=terminations[np.newaxis, ...],
-                trunc=truncations[np.newaxis, ...],
+                obs=obs_t if full_gpu else obs[:, np.newaxis, :],
+                next_obs=obs_next_t if full_gpu else obs_next[:, np.newaxis, :],
+                action=raw_actions if full_gpu else raw_actions_np,
+                reward=rewards[:, np.newaxis],
+                term=terminations[:, np.newaxis],
+                trunc=truncations[:, np.newaxis],
             )
             _sync(device)
             t_buf_insert += time.perf_counter() - _t
@@ -322,6 +330,7 @@ def run_profiling_new(
                     rewards_history.append(episode_rewards[i])
                     episode_rewards[i] = 0
             obs = obs_next
+            obs_t = obs_next_t
             steps_done += num_envs
 
             # Phase 4: network_update (off-policy, scaled)

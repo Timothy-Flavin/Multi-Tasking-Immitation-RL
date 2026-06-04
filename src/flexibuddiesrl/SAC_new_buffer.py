@@ -152,12 +152,13 @@ class SAC(nn.Module, Agent):
         self.Q2_target.eval()
 
     def train_actions(self, observations, action_mask=None, step=False, debug=False) -> dict:
-        if not torch.is_tensor(observations):
+        was_tensor = torch.is_tensor(observations)
+        if not was_tensor:
             observations = T(observations, device=self.device)
-            
+
         is_3d = (len(observations.shape) == 3)
         if is_3d:
-            n_agents, n_envs, obs_dim = observations.shape
+            n_envs, n_agents, obs_dim = observations.shape
             obs_flat = observations.reshape(-1, obs_dim)
         else:
             obs_flat = observations
@@ -174,17 +175,22 @@ class SAC(nn.Module, Agent):
                 continuous_means, continuous_log_std_logits, discrete_logits,
                 gumbel=False, log_con=False, log_disc=False,
             )
-            
+
             # Unflatten results if input was 3D
             if is_3d:
                 if discrete_actions is not None:
-                    discrete_actions = discrete_actions.reshape(n_agents, n_envs, -1)
+                    discrete_actions = discrete_actions.reshape(n_envs, n_agents, -1)
                 if continuous_actions is not None:
-                    continuous_actions = continuous_actions.reshape(n_agents, n_envs, -1)
+                    continuous_actions = continuous_actions.reshape(n_envs, n_agents, -1)
+
+        def _maybe_numpy(x):
+            if was_tensor or x is None:
+                return x
+            return x.cpu().numpy()
 
         return {
-            "discrete_actions": discrete_actions.cpu().numpy() if discrete_actions is not None else None,
-            "continuous_actions": continuous_actions.cpu().numpy() if continuous_actions is not None else None,
+            "discrete_actions": _maybe_numpy(discrete_actions),
+            "continuous_actions": _maybe_numpy(continuous_actions),
         }
 
     def reinforcement_learn(self, samples: ReplayBufferSamples, agent_num=0) -> dict:
