@@ -44,6 +44,12 @@ class VectorizedContinuousCartPole:
         return self.env.reset()
 
 
+def _sync(device):
+    """Flush GPU queue before reading the clock so timings capture completed work."""
+    if device.type == "cuda":
+        th.cuda.synchronize(device)
+
+
 def run_profiling_new(
     agent_type, mode, total_steps=200000, num_envs=64, device="auto", full_gpu=False
 ):
@@ -86,7 +92,7 @@ def run_profiling_new(
             min_actions=min_actions,
             device=device,
             hidden_dims=[64, 64],
-            n_epochs=4,  # Rollout buffer size transitions, 4 epochs
+            n_epochs=4,
             mini_batch_size=128,
             lr=3e-4,
         )
@@ -154,6 +160,19 @@ def run_profiling_new(
             full_gpu=full_gpu,
         )
 
+    # -------------------------------------------------------------------------
+    # Per-phase timing accumulators
+    # Each counter measures wall-clock seconds spent in that phase across the
+    # entire run. GPU timing uses cuda.synchronize() before reading the clock so
+    # the kernel queue is drained and the measurement reflects completed work.
+    # -------------------------------------------------------------------------
+    t_take_action = 0.0   # agent.train_actions (inference)
+    t_env_step    = 0.0   # raw_env.step (environment physics)
+    t_buf_insert  = 0.0   # buffer.add (host-side copy + optional H2D)
+    t_net_update  = 0.0   # agent.reinforcement_learn (gradient step)
+    n_action_calls = 0
+    n_update_calls = 0
+
     start_total = time.perf_counter()
     steps_done = 0
     last_print_step = 0
@@ -163,42 +182,41 @@ def run_profiling_new(
     rewards_history = []
 
     while steps_done < total_steps:
-        # 1. Experience Collection
-        agent.eval()
         if agent_type == "PPO":
+            # --- PPO: collect a full rollout, then update ---
+            agent.eval()
             for _ in range(collection_steps):
+                # Phase 1: take_action
+                _sync(device)
+                _t = time.perf_counter()
                 with th.no_grad():
                     obs_t = th.as_tensor(obs, device=device).unsqueeze(0)
                     act_dict = agent.train_actions(obs_t)
                     values = th.as_tensor(act_dict["values"], device=device)
                     log_probs = th.as_tensor(
-                        act_dict[
-                            (
-                                "continuous_log_probs"
-                                if is_continuous
-                                else "discrete_log_probs"
-                            )
-                        ],
+                        act_dict["continuous_log_probs" if is_continuous else "discrete_log_probs"],
                         device=device,
                     )
-                    raw_actions = act_dict[
-                        ("continuous_actions" if is_continuous else "discrete_actions")
-                    ]
+                    raw_actions = act_dict["continuous_actions" if is_continuous else "discrete_actions"]
+                _sync(device)
+                t_take_action += time.perf_counter() - _t
+                n_action_calls += 1
 
-                # Env Step
+                # Phase 2: env_step
                 if is_continuous:
                     env_actions = raw_actions.reshape(num_envs, 1).astype(np.float32)
-                    # Mapping continuous to discrete for CartPole
+                    _t = time.perf_counter()
                     obs_next, rewards, terminations, truncations, info = raw_env.step(
                         (env_actions > 0).astype(np.int32).flatten()
                     )
+                    t_env_step += time.perf_counter() - _t
                 else:
                     env_actions = raw_actions.flatten()
-                    obs_next, rewards, terminations, truncations, info = raw_env.step(
-                        env_actions
-                    )
+                    _t = time.perf_counter()
+                    obs_next, rewards, terminations, truncations, info = raw_env.step(env_actions)
+                    t_env_step += time.perf_counter() - _t
 
-                # Handling Truncation
+                # Truncation bootstrap obs
                 final_obs = None
                 if np.any(truncations):
                     final_obs = np.zeros_like(obs)
@@ -215,6 +233,9 @@ def run_profiling_new(
                         final_obs = obs_next
                     final_obs = final_obs[np.newaxis, ...]
 
+                # Phase 3: buffer_insert
+                _sync(device)
+                _t = time.perf_counter()
                 buffer.add(
                     obs=obs[np.newaxis, ...],
                     action=raw_actions,
@@ -225,6 +246,8 @@ def run_profiling_new(
                     log_prob=log_probs,
                     final_obs=final_obs,
                 )
+                _sync(device)
+                t_buf_insert += time.perf_counter() - _t
 
                 episode_rewards += rewards
                 for i in range(num_envs):
@@ -234,39 +257,54 @@ def run_profiling_new(
                 obs = obs_next
                 steps_done += num_envs
 
-            # PPO Update
+            # Phase 4: network_update (PPO)
             agent.train()
             with th.no_grad():
                 last_obs_t = th.as_tensor(obs, device=device).unsqueeze(0)
                 last_values = agent.expected_V(last_obs_t)
+            _sync(device)
+            _t = time.perf_counter()
             agent.reinforcement_learn(
                 buffer,
                 last_values,
                 terminations[np.newaxis, ...],
                 truncations[np.newaxis, ...],
             )
+            _sync(device)
+            t_net_update += time.perf_counter() - _t
+            n_update_calls += 1
             buffer.reset()
 
         else:
-            # Off-policy (SAC/DQN)
+            # --- Off-policy (SAC / DQN): one parallel step, then optional update ---
+            # Phase 1: take_action
+            _sync(device)
+            _t = time.perf_counter()
             with th.no_grad():
                 obs_t = th.as_tensor(obs, device=device).unsqueeze(0)
                 act_dict = agent.train_actions(obs_t)
-                raw_actions = act_dict[
-                    ("continuous_actions" if is_continuous else "discrete_actions")
-                ]
+                raw_actions = act_dict["continuous_actions" if is_continuous else "discrete_actions"]
+            _sync(device)
+            t_take_action += time.perf_counter() - _t
+            n_action_calls += 1
 
+            # Phase 2: env_step
             if is_continuous:
                 env_actions = raw_actions.reshape(num_envs, 1).astype(np.float32)
+                _t = time.perf_counter()
                 obs_next, rewards, terminations, truncations, info = raw_env.step(
                     (env_actions > 0).astype(np.int32).flatten()
                 )
+                t_env_step += time.perf_counter() - _t
             else:
                 env_actions = raw_actions.flatten()
-                obs_next, rewards, terminations, truncations, info = raw_env.step(
-                    env_actions
-                )
+                _t = time.perf_counter()
+                obs_next, rewards, terminations, truncations, info = raw_env.step(env_actions)
+                t_env_step += time.perf_counter() - _t
 
+            # Phase 3: buffer_insert
+            _sync(device)
+            _t = time.perf_counter()
             buffer.add(
                 obs=obs[np.newaxis, ...],
                 next_obs=obs_next[np.newaxis, ...],
@@ -275,6 +313,8 @@ def run_profiling_new(
                 term=terminations[np.newaxis, ...],
                 trunc=truncations[np.newaxis, ...],
             )
+            _sync(device)
+            t_buf_insert += time.perf_counter() - _t
 
             episode_rewards += rewards
             for i in range(num_envs):
@@ -284,12 +324,17 @@ def run_profiling_new(
             obs = obs_next
             steps_done += num_envs
 
-            # Scaling Off-Policy Updates
+            # Phase 4: network_update (off-policy, scaled)
             if steps_done >= 1000:
                 agent.train()
                 for _ in range(num_updates_per_step):
                     samples = buffer.sample(batch_size)
+                    _sync(device)
+                    _t = time.perf_counter()
                     agent.reinforcement_learn(samples, agent_num=0)
+                    _sync(device)
+                    t_net_update += time.perf_counter() - _t
+                    n_update_calls += 1
 
         if (steps_done - last_print_step) >= 20000:
             last_print_step = steps_done
@@ -300,7 +345,18 @@ def run_profiling_new(
     duration = end_total - start_total
     sps = steps_done / duration
 
-    print(f"Profiling Results: {sps:.2f} SPS | Duration: {duration:.4f}s")
+    avg_action_ms  = 1000.0 * t_take_action / n_action_calls if n_action_calls else 0.0
+    avg_envstep_ms = 1000.0 * t_env_step    / n_action_calls if n_action_calls else 0.0
+    avg_insert_ms  = 1000.0 * t_buf_insert  / n_action_calls if n_action_calls else 0.0
+    avg_update_ms  = 1000.0 * t_net_update  / n_update_calls if n_update_calls else 0.0
+
+    print(f"\nPhase Breakdown ({agent_type} {mode} full_gpu={full_gpu}):")
+    print(f"  take_action  : {t_take_action:8.3f}s total  |  {avg_action_ms:8.4f} ms/call  ({n_action_calls} calls)")
+    print(f"  env_step     : {t_env_step:8.3f}s total  |  {avg_envstep_ms:8.4f} ms/call")
+    print(f"  buffer_insert: {t_buf_insert:8.3f}s total  |  {avg_insert_ms:8.4f} ms/call")
+    print(f"  net_update   : {t_net_update:8.3f}s total  |  {avg_update_ms:8.4f} ms/call  ({n_update_calls} calls)")
+    print(f"  Total SPS: {sps:.2f}  |  Duration: {duration:.4f}s")
+
     os.makedirs("profile_results", exist_ok=True)
     np.save(
         f"profile_results/rewards_{agent_type}_{mode}_{device.type}_fullgpu_{full_gpu}.npy",
@@ -318,11 +374,21 @@ def run_profiling_new(
     plt.close()
 
     return {
-        "agent": agent_type,
-        "mode": mode,
-        "sps": sps,
-        "duration": duration,
-        "full_gpu": full_gpu,
+        "agent":          agent_type,
+        "mode":           mode,
+        "full_gpu":       full_gpu,
+        "sps":            sps,
+        "duration":       duration,
+        "t_take_action":  t_take_action,
+        "t_env_step":     t_env_step,
+        "t_buf_insert":   t_buf_insert,
+        "t_net_update":   t_net_update,
+        "n_action_calls": n_action_calls,
+        "n_update_calls": n_update_calls,
+        "avg_action_ms":  avg_action_ms,
+        "avg_envstep_ms": avg_envstep_ms,
+        "avg_insert_ms":  avg_insert_ms,
+        "avg_update_ms":  avg_update_ms,
     }
 
 
@@ -364,11 +430,19 @@ if __name__ == "__main__":
 
                     traceback.print_exc()
 
-    print("\n" + "=" * 80)
-    print(f"{'Agent':<10} {'Mode':<12} {'FullGPU':<10} {'SPS':<15} {'Duration(s)':<15}")
-    print("-" * 80)
+    print("\n" + "=" * 110)
+    print(
+        f"{'Agent':<6} {'Mode':<10} {'GPU':<6} {'SPS':>8}  "
+        f"{'ActAv(ms)':>10} {'EnvAv(ms)':>10} {'BufAv(ms)':>10} {'UpdAv(ms)':>10}  "
+        f"{'ActTot(s)':>9} {'EnvTot(s)':>9} {'BufTot(s)':>9} {'UpdTot(s)':>9}"
+    )
+    print("-" * 110)
     for r in final_results:
         print(
-            f"{r['agent']:<10} {r['mode']:<12} {str(r['full_gpu']):<10} {r['sps']:<15.2f} {r['duration']:<15.4f}"
+            f"{r['agent']:<6} {r['mode']:<10} {str(r['full_gpu']):<6} {r['sps']:>8.1f}  "
+            f"{r['avg_action_ms']:>10.4f} {r['avg_envstep_ms']:>10.4f} "
+            f"{r['avg_insert_ms']:>10.4f} {r['avg_update_ms']:>10.4f}  "
+            f"{r['t_take_action']:>9.3f} {r['t_env_step']:>9.3f} "
+            f"{r['t_buf_insert']:>9.3f} {r['t_net_update']:>9.3f}"
         )
-    print("=" * 80)
+    print("=" * 110)

@@ -69,6 +69,7 @@ class PG(nn.Module, Agent):
         wall_time=False,
         joint_kl_penalty=0.1,
         target_kl=0.1,
+        use_kl_penalty=False,
         offline_critic_buffer=False,
     ):
         super(PG, self).__init__()
@@ -77,6 +78,7 @@ class PG(nn.Module, Agent):
         config.pop("self")
         self.joint_kl_penalty = joint_kl_penalty
         self.target_kl = target_kl
+        self.use_kl_penalty = use_kl_penalty
         self.config = config
         self.wall_time = wall_time
         self.load_from_checkpoint = load_from_checkpoint
@@ -187,17 +189,43 @@ class PG(nn.Module, Agent):
         )
 
     def _add_batch_to_offline_buffer(self, buffer: RolloutBuffer):
-        """Copy transitions from an on-policy RolloutBuffer into the offline critic replay buffer."""
-        # This requires pulling data out of RolloutBuffer.
-        # We take everything currently in the RolloutBuffer.
-        observations = buffer.observations[:buffer.pos] # [T, A, E, obs_dim]
-        next_observations = buffer.observations[1:buffer.pos+1] # This is tricky if it wraps.
-        # Actually, RolloutBuffer doesn't store next_obs explicitly.
-        # But we have observations[step+1].
-        # For the last step, we need the actual next_obs passed to compute_returns_and_advantage.
-        # This is a bit complex for a side feature. Let's simplify or skip for now if next_obs not available.
-        # However, we can use the current transition data.
-        pass
+        """Copy transitions from an on-policy RolloutBuffer into the offline critic ReplayBuffer.
+
+        RolloutBuffer stores [T, A, E, ...] tensors.  The offline buffer expects
+        individual (obs, next_obs, action, reward, term, trunc) tuples shaped
+        [n_agents=1, n_envs=1, ...].  We flatten each (T, A, E) cell to a
+        separate transition so the offline critic sees a diverse mix of samples.
+
+        next_obs uses obs[t+1] for interior steps; for the last step in the
+        rollout next_obs == obs[T-1] (a repeat) — this introduces a small bias
+        but avoids storing next_obs separately and is consistent with how 1-step
+        TD loss is computed in the legacy offline buffer.
+        """
+        T = buffer.pos  # number of stored steps
+        if T < 2:
+            return
+
+        obs_all     = buffer.observations[:T].cpu().numpy()    # [T, A, E, obs_dim]
+        actions_all = buffer.actions[:T].cpu().numpy()         # [T, A, E, act_dim]
+        rewards_all = buffer.rewards[:T].cpu().numpy()         # [T, A, E]
+        terms_all   = buffer.terminations[:T].cpu().numpy()    # [T, A, E]
+        truncs_all  = buffer.truncations[:T].cpu().numpy()     # [T, A, E]
+
+        # next_obs: shift by 1; last step reuses its own obs as a placeholder
+        next_obs_all = np.concatenate([obs_all[1:], obs_all[-1:]], axis=0)  # [T, A, E, obs_dim]
+
+        _, A, E, _ = obs_all.shape
+        for t in range(T - 1):          # skip last step (next_obs is approximate)
+            for a in range(A):
+                for e in range(E):
+                    self._offline_buffer.add(
+                        obs=obs_all[t, a:a+1, e:e+1],           # [1, 1, obs_dim]
+                        next_obs=next_obs_all[t, a:a+1, e:e+1],
+                        action=actions_all[t, a:a+1, e:e+1],
+                        reward=rewards_all[t, a:a+1, e:e+1],
+                        term=terms_all[t, a:a+1, e:e+1],
+                        trunc=truncs_all[t, a:a+1, e:e+1],
+                    )
 
     def _offline_critic_loss(self) -> torch.Tensor:
         if self._offline_buffer.size() < self.mini_batch_size:
@@ -587,6 +615,7 @@ class PG(nn.Module, Agent):
         last_values: torch.Tensor,
         last_terminations: np.ndarray,
         last_truncations: np.ndarray,
+        critic_only=False,
         debug=False,
     ):
         t = 0
@@ -605,7 +634,7 @@ class PG(nn.Module, Agent):
         }
 
         if self.mix_type == "QMIX" or self.mix_type == "VDN":
-            return self._mix_reinforcement_learn(buffer, last_values, last_terminations, last_truncations, debug)
+            return self._mix_reinforcement_learn(buffer, last_values, last_terminations, last_truncations, critic_only, debug)
 
         # 1. Compute Advantages
         with torch.no_grad():
@@ -632,9 +661,13 @@ class PG(nn.Module, Agent):
                 if self.norm_advantages:
                     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-                # Critic Loss
+                # Critic Loss with optional value clipping
                 values = self.critic(obs).squeeze(-1)
-                critic_loss = 0.5 * F.mse_loss(values, returns)
+                if self.value_clip > 0:
+                    v_clip = old_values + (values - old_values).clamp(-self.value_clip, self.value_clip)
+                    critic_loss = 0.5 * torch.max(F.mse_loss(values, returns), F.mse_loss(v_clip, returns))
+                else:
+                    critic_loss = 0.5 * F.mse_loss(values, returns)
 
                 # Actor Loss
                 actor_loss = torch.zeros(1, device=self.device)
@@ -674,6 +707,99 @@ class PG(nn.Module, Agent):
             self.result_dict["rl_time"] = time.time() - t
         self.result_dict["rl_actor_loss"] = avg_actor_loss
         self.result_dict["rl_critic_loss"] = avg_critic_loss
+        return self.result_dict
+
+    def _get_dists(self, obs):
+        """Return current-policy distributions for KL computation (no grad)."""
+        d_dists, c_dist = None, None
+        continuous_means, continuous_log_std_logits, discrete_logits = self.actor(obs)
+        if self.discrete_action_dims is not None and len(self.discrete_action_dims) > 0:
+            d_dists = []
+            for logits in discrete_logits:
+                d_dists.append(torch.distributions.Categorical(logits=logits))
+        if self.continuous_action_dim > 0:
+            lstd = (self._smooth_clamp_logstd().expand_as(continuous_means)
+                    if self.actor_logstd is not None
+                    else continuous_log_std_logits.expand_as(continuous_means))
+            c_dist = torch.distributions.Normal(loc=continuous_means, scale=torch.exp(lstd))
+        return d_dists, c_dist
+
+    def _mix_actor_loss(self, old_log_probs, new_log_probs, advantages, entropy,
+                        old_d_dists, new_d_dists, old_c_dists, new_c_dists):
+        """PPO clip loss with per-head advantages and joint KL penalty (legacy-equivalent)."""
+        logratio = new_log_probs - old_log_probs
+        ratio = torch.exp(logratio)
+        clip_ratio = torch.clamp(ratio, 1 - self.ppo_clip, 1 + self.ppo_clip)
+        policy_loss = -(torch.min(advantages * ratio, advantages * clip_ratio).sum(-1)).mean()
+
+        ent = 0.0
+        if isinstance(entropy, torch.Tensor): ent = entropy.mean()
+        policy_loss = policy_loss - self.entropy_loss * ent
+
+        # Actual KL divergence using distribution objects
+        kl_div = None
+        if old_d_dists is not None and new_d_dists is not None:
+            for old_d, new_d in zip(old_d_dists, new_d_dists):
+                kl_piece = torch.distributions.kl_divergence(old_d, new_d)
+                kl_div = kl_piece if kl_div is None else kl_div + kl_piece
+        if old_c_dists is not None and new_c_dists is not None:
+            kl_piece = torch.distributions.kl_divergence(old_c_dists, new_c_dists).sum(-1)
+            kl_div = kl_piece if kl_div is None else kl_div + kl_piece
+
+        joint_kl = torch.tensor(0.0, device=self.device)
+        if kl_div is not None:
+            joint_kl = kl_div.mean()
+            policy_loss = policy_loss + self.joint_kl_penalty * joint_kl
+            if joint_kl.item() > self.target_kl:
+                self.joint_kl_penalty = min(self.joint_kl_penalty * 1.5, 100.0)
+            elif joint_kl.item() < self.target_kl / 1.5:
+                self.joint_kl_penalty = max(self.joint_kl_penalty / 1.5, 1e-4)
+
+        return policy_loss, joint_kl
+
+    def _mix_critic_only(self, buffer: RolloutBuffer, last_values: torch.Tensor,
+                         last_terminations: np.ndarray, last_truncations: np.ndarray):
+        obs = buffer.observations[:buffer.pos]
+        actions = buffer.actions[:buffer.pos]
+        rewards = buffer.rewards[:buffer.pos]
+        terminated = buffer.terminations[:buffer.pos]
+        truncated = buffer.truncations[:buffer.pos]
+        T_steps, A, E, _ = obs.shape
+
+        obs_f = obs.reshape(-1, self.obs_dim).to(self.device)
+        d_actions_f = actions[:, :, :, :len(self.discrete_action_dims)].reshape(-1, len(self.discrete_action_dims)).long().to(self.device) if self.discrete_action_dims else None
+        c_actions_f = actions[:, :, :, -self.continuous_action_dim:].reshape(-1, self.continuous_action_dim).to(self.device) if self.continuous_action_dim > 0 else None
+
+        values_f, d_adv_f, c_adv_f = self.critic(obs_f)
+        if c_adv_f is not None:
+            c_adv_f = torch.transpose(torch.stack(c_adv_f, dim=0), 0, 1)
+        adv_f = self._gather_observed_advantages(d_adv_f, c_adv_f, d_actions_f, c_actions_f)
+        Q_f = (self.mixer(adv_f, obs_f)[0] + values_f).squeeze(-1)
+
+        V = values_f.detach().reshape(T_steps, A, E)
+        bootstrap_values = last_values.reshape(A, E)
+        term_t = torch.as_tensor(terminated, device=self.device)
+        trunc_t = torch.as_tensor(truncated, device=self.device)
+
+        with torch.no_grad():
+            G_critic, _ = self._weighted_gae(
+                rewards=rewards, values=V, bootstrap_values=bootstrap_values,
+                terminated=term_t, truncated=trunc_t,
+                advantage_weights=torch.ones_like(V).unsqueeze(-1),
+                gamma=self.gamma, gae_lambda=self.gae_lambda,
+                final_observations=buffer.final_observations,
+                get_value_fn=lambda o: self.expected_V(o),
+            )
+        G_critic_flat = G_critic.squeeze(-1).reshape(-1).to(self.device)
+        critic_loss = F.mse_loss(Q_f, G_critic_flat)
+        self.optimizer.zero_grad()
+        critic_loss.backward()
+        if self.clip_grad:
+            torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
+            if self.mixer is not None and self.mix_type == "QMIX":
+                torch.nn.utils.clip_grad_norm_(self.mixer.parameters(), 0.5)
+        self.optimizer.step()
+        self.result_dict["rl_critic_loss"] = critic_loss.item()
         return self.result_dict
 
     def _weighted_gae(
@@ -731,9 +857,12 @@ class PG(nn.Module, Agent):
         last_values: torch.Tensor,
         last_terminations: np.ndarray,
         last_truncations: np.ndarray,
+        critic_only=False,
         debug=False,
     ):
         assert self.mixer is not None, "Mixer required for QMIX/VDN PPO"
+        if critic_only:
+            return self._mix_critic_only(buffer, last_values, last_terminations, last_truncations)
         t = 0
         if self.wall_time:
             t = time.time()
@@ -820,8 +949,8 @@ class PG(nn.Module, Agent):
                 final_observations=buffer.final_observations,
                 get_value_fn=lambda o: self.expected_V(o)
             )
-            # Take mean return across action dims for critic
-            G_critic = G_critic.mean(dim=-1)
+            # Squeeze the trailing unit dimension produced by uniform-weight GAE
+            G_critic = G_critic.squeeze(-1)
 
         # Mini-batch training over flattened data
         obs_flat = obs.reshape(-1, self.obs_dim)
@@ -833,9 +962,14 @@ class PG(nn.Module, Agent):
         with torch.no_grad():
             old_lp_flat, _, _, _, _, _ = self._log_probs_per_dim(obs_flat.to(self.device), d_actions_f, c_actions_f)
 
+        # Compute importance metrics for analysis
+        importance_per_dim = scaled_importance.mean(dim=0).reshape(-1).detach().cpu().numpy()
+        importance_raw = scaled_importance.detach().cpu().numpy()
+
         indices = np.arange(obs_flat.shape[0])
         avg_actor_loss = 0.0
         avg_critic_loss = 0.0
+        avg_joint_kl = 0.0
         bnum = 0
 
         if self.norm_advantages:
@@ -843,30 +977,42 @@ class PG(nn.Module, Agent):
 
         for epoch in range(self.n_epochs):
             np.random.shuffle(indices)
+
+            # Pre-compute old distributions for this epoch (for actual KL divergence)
+            with torch.no_grad():
+                old_d_dists_epoch = []
+                old_c_dists_epoch = []
+                for start in range(0, len(indices), self.mini_batch_size):
+                    mb_idx = indices[start:start+self.mini_batch_size]
+                    mb_obs_e = obs_flat[mb_idx].to(self.device)
+                    od, oc = self._get_dists(mb_obs_e)
+                    old_d_dists_epoch.append(od)
+                    old_c_dists_epoch.append(oc)
+
+            dist_step = 0
             for start in range(0, len(indices), self.mini_batch_size):
                 bnum += 1
                 mb_idx = indices[start:start+self.mini_batch_size]
-                
+
                 mb_obs = obs_flat[mb_idx].to(self.device)
                 mb_actions = actions_flat[mb_idx].to(self.device)
                 mb_gae = gae_flat[mb_idx].to(self.device)
                 mb_G_critic = G_critic_flat[mb_idx].to(self.device)
                 mb_old_lp = old_lp_flat[mb_idx].to(self.device)
 
+                mb_d_act = mb_actions[:, :len(self.discrete_action_dims)].long() if self.discrete_action_dims else None
+                mb_c_act = mb_actions[:, -self.continuous_action_dim:] if self.continuous_action_dim > 0 else None
+
                 # Critic Loss
                 mb_values, mb_d_adv, mb_c_adv = self.critic(mb_obs)
                 if mb_c_adv is not None:
                     mb_c_adv = torch.transpose(torch.stack(mb_c_adv, dim=0), 0, 1)
-                
-                mb_d_act = mb_actions[:, :len(self.discrete_action_dims)].long() if self.discrete_action_dims else None
-                mb_c_act = mb_actions[:, -self.continuous_action_dim:] if self.continuous_action_dim > 0 else None
-                
                 mb_adv_gathered = self._gather_observed_advantages(mb_d_adv, mb_c_adv, mb_d_act, mb_c_act)
                 mb_mixer_out = self.mixer(mb_adv_gathered, mb_obs)[0]
                 mb_Q = (mb_mixer_out + mb_values).squeeze(-1)
                 critic_loss = F.mse_loss(mb_Q, mb_G_critic)
 
-                # Actor Loss
+                # Actor Loss — uses actual KL via _mix_actor_loss
                 (
                     mb_new_lp,
                     mb_d_entropy,
@@ -875,15 +1021,17 @@ class PG(nn.Module, Agent):
                     mb_d_dist,
                     mb_c_dist,
                 ) = self._log_probs_per_dim(mb_obs, mb_d_act, mb_c_act)
-                
-                # Simplified mix_actor_loss for now
-                logratio = mb_new_lp - mb_old_lp
-                ratio = logratio.exp()
-                pg_loss1 = mb_gae * ratio
-                pg_loss2 = mb_gae * torch.clamp(ratio, 1 - self.ppo_clip, 1 + self.ppo_clip)
-                actor_loss = -torch.min(pg_loss1, pg_loss2).sum(dim=-1).mean()
-                actor_loss -= self.entropy_loss * (mb_d_entropy + mb_c_entropy).mean()
-                actor_loss += mb_logit_reg
+
+                mb_entropy = 0.0
+                if isinstance(mb_d_entropy, torch.Tensor): mb_entropy = mb_entropy + mb_d_entropy
+                if isinstance(mb_c_entropy, torch.Tensor): mb_entropy = mb_entropy + mb_c_entropy
+
+                actor_loss, joint_kl = self._mix_actor_loss(
+                    mb_old_lp, mb_new_lp, mb_gae, mb_entropy,
+                    old_d_dists_epoch[dist_step], mb_d_dist,
+                    old_c_dists_epoch[dist_step], mb_c_dist,
+                )
+                actor_loss = actor_loss + mb_logit_reg
 
                 self.optimizer.zero_grad()
                 loss = self.value_loss_coef * critic_loss + actor_loss
@@ -894,11 +1042,16 @@ class PG(nn.Module, Agent):
 
                 avg_actor_loss += actor_loss.item()
                 avg_critic_loss += critic_loss.item()
+                avg_joint_kl += joint_kl.item() if isinstance(joint_kl, torch.Tensor) else float(joint_kl)
+                dist_step += 1
 
         if self.wall_time:
             self.result_dict["rl_time"] = time.time() - t
         self.result_dict["rl_actor_loss"] = avg_actor_loss / bnum
         self.result_dict["rl_critic_loss"] = avg_critic_loss / bnum
+        self.result_dict["joint_kl"] = avg_joint_kl / bnum
+        self.result_dict["importance_per_dim"] = importance_per_dim
+        self.result_dict["importance_raw"] = importance_raw
         return self.result_dict
 
     def _bin_continuous_actions(self, c_actions):

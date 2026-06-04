@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 import copy
 from .buffers import ReplayBuffer, ReplayBufferSamples
 from .Util import T
@@ -31,7 +31,7 @@ class SAC(nn.Module, Agent):
         actor_ratio=0.5,
         actor_every=1,
         gamma=0.99,
-        sac_tau=0.005,
+        sac_tau=0.05,  # fast target tracking — matches legacy; 0.005 (paper default) causes instability with multi-env batched updates
         initial_temperature=0.2,
         mode="V",  # V or Q
     ):
@@ -119,6 +119,11 @@ class SAC(nn.Module, Agent):
         self.Q2_target = ValueS(**common_kwargs).to(self.device)
         self._hard_update(self.Q1_target, self.Q1)
         self._hard_update(self.Q2_target, self.Q2)
+        # SAC-1: freeze targets — gradients must never flow through target forward passes
+        for p in self.Q1_target.parameters(): p.requires_grad_(False)
+        for p in self.Q2_target.parameters(): p.requires_grad_(False)
+        self.Q1_target.eval()
+        self.Q2_target.eval()
 
     def _get_Q_critics(self):
         common_kwargs = dict(
@@ -140,6 +145,11 @@ class SAC(nn.Module, Agent):
         self.Q2_target = QS(**common_kwargs).to(self.device)
         self._hard_update(self.Q1_target, self.Q1)
         self._hard_update(self.Q2_target, self.Q2)
+        # SAC-1: freeze targets
+        for p in self.Q1_target.parameters(): p.requires_grad_(False)
+        for p in self.Q2_target.parameters(): p.requires_grad_(False)
+        self.Q1_target.eval()
+        self.Q2_target.eval()
 
     def train_actions(self, observations, action_mask=None, step=False, debug=False) -> dict:
         if not torch.is_tensor(observations):
@@ -212,7 +222,7 @@ class SAC(nn.Module, Agent):
                 q_next = torch.minimum(self.Q1_target(torch.cat([obs_next_t, a_next_vec], dim=-1)),
                                        self.Q2_target(torch.cat([obs_next_t, a_next_vec], dim=-1))).squeeze(-1)
                 ent_pen_n = obs_next_t.new_zeros(obs_next_t.shape[0])
-                if self.has_continuous: ent_pen_n += alpha_c * c_logp_n.sum(dim=-1)
+                if self.has_continuous: ent_pen_n += alpha_c * self._aggregate_continuous_logp(c_logp_n)
                 if self.has_discrete: ent_pen_n += alpha_d * self._discrete_neg_entropy(d_logits_n)
                 v_next = q_next - ent_pen_n
             else:
@@ -221,7 +231,7 @@ class SAC(nn.Module, Agent):
                 v1_n, adv1_n, _ = self.Q1_target(in_vec_next)
                 v2_n, adv2_n, _ = self.Q2_target(in_vec_next)
                 v_next = torch.minimum(self._soft_v(v1_n, adv1_n, alpha_d), self._soft_v(v2_n, adv2_n, alpha_d))
-                if self.has_continuous: v_next -= alpha_c * c_logp_n.sum(dim=-1)
+                if self.has_continuous: v_next -= alpha_c * self._aggregate_continuous_logp(c_logp_n)
             y = r_t + (1.0 - d_t) * (self.gamma * v_next)
 
         if is_v:
@@ -238,6 +248,9 @@ class SAC(nn.Module, Agent):
         critic_loss = F.mse_loss(q1, y) + F.mse_loss(q2, y)
         self.Q1_opt.zero_grad(); self.Q2_opt.zero_grad()
         critic_loss.backward()
+        # SAC-2: clip critic gradients to prevent Q-value blow-up
+        torch.nn.utils.clip_grad_norm_(self.Q1.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(self.Q2.parameters(), max_norm=1.0)
         self.Q1_opt.step(); self.Q2_opt.step()
 
         self._soft_update(self.Q1_target, self.Q1, self.sac_tau)
@@ -252,7 +265,7 @@ class SAC(nn.Module, Agent):
                 c_means, c_logstd_logits, d_logits,
                 gumbel=True, log_con=self.has_continuous, log_disc=(is_v and self.has_discrete)
             )
-            c_lp_agg = c_logp.sum(dim=-1) if self.has_continuous else None
+            c_lp_agg = self._aggregate_continuous_logp(c_logp) if self.has_continuous else None
 
             if is_v:
                 a_vec_s = self._flatten_actions(c_act, d_act)
@@ -277,6 +290,8 @@ class SAC(nn.Module, Agent):
                         actor_loss += (pi_i * (log_pi_i - F.log_softmax(q_min_i / alpha_d.detach(), dim=-1).detach())).sum(dim=-1).mean()
 
             self.actor_opt.zero_grad(); actor_loss.backward()
+            # SAC-2: clip actor gradients
+            torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
             self.actor_opt.step()
 
             # Alpha Update
@@ -304,16 +319,47 @@ class SAC(nn.Module, Agent):
         return self.train_actions(observations, action_mask=action_mask)
 
     def expected_V(self, obs, legal_action=None):
+        """Entropy-regularised soft value V(s) = E_a[Q(s,a)] + α·H(π(·|s)).
+
+        SAC-3 fix: previous version returned raw Q(s,a) with no entropy correction,
+        making bootstrap targets too optimistic and inflating Q-values over time.
+        Now uses target networks (for bootstrap stability) and subtracts α·log π,
+        matching the soft Bellman equation used during training.
+        """
         if not torch.is_tensor(obs):
             obs = T(obs, device=self.device)
         with torch.no_grad():
+            alpha_c = self.log_alpha_c.exp()
+            alpha_d = self.log_alpha_d.exp()
             c_means, c_logstd, d_logits = self.actor(obs)
             d_act, c_act, d_logp, c_logp, _ = self.actor.action_from_logits(
-                c_means, c_logstd, d_logits, gumbel=False, log_con=False, log_disc=False
+                c_means, c_logstd, d_logits,
+                gumbel=True,
+                log_con=self.has_continuous,
+                log_disc=(self.critic_mode == "V" and self.has_discrete),
             )
-            a_vec = self._flatten_actions(c_act, d_act)
-            v = torch.minimum(self.Q1(torch.cat([obs, a_vec], dim=-1)),
-                              self.Q2(torch.cat([obs, a_vec], dim=-1))).squeeze(-1)
+            if self.critic_mode == "V":
+                a_vec = self._flatten_actions(c_act, d_act)
+                q_in = torch.cat([obs, a_vec], dim=-1)
+                v = torch.minimum(
+                    self.Q1_target(q_in), self.Q2_target(q_in)
+                ).squeeze(-1)
+                # Subtract entropy cost so V = Q - α·log π = Q + α·H
+                if self.has_continuous and c_logp is not None:
+                    v = v - alpha_c * self._aggregate_continuous_logp(c_logp)
+                if self.has_discrete and d_logits is not None:
+                    v = v - alpha_d * self._discrete_neg_entropy(d_logits)
+            else:
+                c_act_cat = torch.cat(c_act, dim=-1) if isinstance(c_act, list) else c_act
+                in_vec = torch.cat([obs, c_act_cat], dim=-1) if self.has_continuous else obs
+                v1, adv1, _ = self.Q1_target(in_vec)
+                v2, adv2, _ = self.Q2_target(in_vec)
+                v = torch.minimum(
+                    self._soft_v(v1, adv1, alpha_d),
+                    self._soft_v(v2, adv2, alpha_d),
+                )
+                if self.has_continuous and c_logp is not None:
+                    v = v - alpha_c * self._aggregate_continuous_logp(c_logp)
             return v
 
     def stable_greedy(self, obs, legal_action):
@@ -349,11 +395,27 @@ class SAC(nn.Module, Agent):
         return torch.cat(parts, dim=-1)
 
     def _soft_v(self, v, adv_heads, alpha):
+        # SAC-5: pre-compute inv_alpha to avoid repeated division inside the loop
         sv = v.squeeze(-1)
         if adv_heads is not None:
+            inv_alpha = 1.0 / alpha
             for adv in adv_heads:
-                sv = sv + alpha * torch.logsumexp(adv / alpha, dim=-1)
+                sv = sv + alpha * torch.logsumexp(adv * inv_alpha, dim=-1)
         return sv
+
+    def _aggregate_continuous_logp(
+        self, c_logp: Optional[Union[torch.Tensor, List[torch.Tensor]]]
+    ) -> Optional[torch.Tensor]:
+        """Sum per-dimension log-probs from StochasticActor, which may return a Tensor or List[Tensor]."""
+        if c_logp is None:
+            return None
+        if isinstance(c_logp, (list, tuple)):
+            xs = [t if t.ndim == 1 else t.sum(dim=-1) for t in c_logp]
+            out = xs[0]
+            for t in xs[1:]:
+                out = out + t
+            return out
+        return c_logp.sum(dim=-1) if c_logp.ndim > 1 else c_logp
 
     def _discrete_neg_entropy(self, d_logits, detach=True):
         ent = 0
@@ -366,9 +428,10 @@ class SAC(nn.Module, Agent):
 
     @staticmethod
     def _gather_sum_adv(adv_heads, d_idx):
-        res = 0
+        # SAC-4: init as zero tensor, not Python int, so type is always Tensor
+        res = adv_heads[0].new_zeros(adv_heads[0].shape[0])
         for i, adv in enumerate(adv_heads):
-            res += adv.gather(1, d_idx[:, i:i+1].long()).squeeze(-1)
+            res = res + adv.gather(1, d_idx[:, i:i+1].long()).squeeze(-1)
         return res
 
     def _hard_update(self, target, source): target.load_state_dict(source.state_dict())
@@ -376,5 +439,39 @@ class SAC(nn.Module, Agent):
         for t, s in zip(target.parameters(), source.parameters()):
             t.data.lerp_(s.data, tau)
 
-    def save(self, path): torch.save(self.state_dict(), path)
-    def load(self, path): self.load_state_dict(torch.load(path, map_location=self.device))
+    def save(self, checkpoint_path):
+        path = checkpoint_path
+        state = {
+            "actor": self.actor.state_dict(),
+            "Q1": self.Q1.state_dict(),
+            "Q1_target": self.Q1_target.state_dict(),
+            "Q2": self.Q2.state_dict(),
+            "Q2_target": self.Q2_target.state_dict(),
+            "actor_opt": self.actor_opt.state_dict(),
+            "Q1_opt": self.Q1_opt.state_dict(),
+            "Q2_opt": self.Q2_opt.state_dict(),
+            "alpha_opt_c": self.alpha_opt_c.state_dict(),
+            "alpha_opt_d": self.alpha_opt_d.state_dict(),
+            "log_alpha_c": self.log_alpha_c.detach().cpu(),
+            "log_alpha_d": self.log_alpha_d.detach().cpu(),
+        }
+        torch.save(state, path)
+
+    def load(self, checkpoint_path):
+        path = checkpoint_path
+        chkpt = torch.load(path, map_location=self.device)
+        self.actor.load_state_dict(chkpt["actor"])
+        self.Q1.load_state_dict(chkpt["Q1"])
+        self.Q1_target.load_state_dict(chkpt["Q1_target"])
+        self.Q2.load_state_dict(chkpt["Q2"])
+        self.Q2_target.load_state_dict(chkpt["Q2_target"])
+        self.actor_opt.load_state_dict(chkpt["actor_opt"])
+        self.Q1_opt.load_state_dict(chkpt["Q1_opt"])
+        self.Q2_opt.load_state_dict(chkpt["Q2_opt"])
+        if "alpha_opt_c" in chkpt:
+            self.alpha_opt_c.load_state_dict(chkpt["alpha_opt_c"])
+            self.alpha_opt_d.load_state_dict(chkpt["alpha_opt_d"])
+        if "log_alpha_c" in chkpt:
+            with torch.no_grad():
+                self.log_alpha_c.copy_(chkpt["log_alpha_c"].to(self.device).float())
+                self.log_alpha_d.copy_(chkpt["log_alpha_d"].to(self.device).float())

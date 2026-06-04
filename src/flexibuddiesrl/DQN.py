@@ -43,15 +43,12 @@ class DQN(nn.Module, Agent):
         entropy=0.0,  # turns it into soft-dqn
         activation="relu",
         orthogonal=False,
-        init_eps=0.9,
-        eps_decay_half_life=10000,
         device="cpu",
         eval_mode=False,
         name="DQN",
         clip_grad=1.0,
         load_from_checkpoint_path=None,
         encoder=None,
-        conservative=False,
         imitation_type="cross_entropy",  # or "reward"
         mix_type: None | str = "None",  # None, VDN, QMIX
         wall_time=False,
@@ -117,11 +114,6 @@ class DQN(nn.Module, Agent):
 
         self.munchausen = munchausen  # munchausen amount
         self.twin = False  # min(double q) to reduce bias
-        self.init_eps = init_eps  # starting eps_greedy epsilon
-        self.eps = self.init_eps
-        self.eps_decay_half_life = (
-            eps_decay_half_life  # eps cut in half every 'half_life' frames
-        )
         self.step = 0
         self.hidden_dims = hidden_dims
         self.activation = activation
@@ -178,7 +170,6 @@ class DQN(nn.Module, Agent):
             param.requires_grad = False
 
         self.update_num = 0
-        self.conservative = conservative
         # self.optimizer = torch.optim.Adam(self.Q1.parameters(), lr=0.1)
         self.to(device)
         self.optimizer = torch.optim.Adam(self.Q1.parameters(), lr=lr)
@@ -201,8 +192,6 @@ class DQN(nn.Module, Agent):
             "lr",
             "dueling",
             "n_c_action_bins",
-            "init_eps",
-            "eps_decay_half_life",
             "device",
             "eval_mode",
             "hidden_dims",
@@ -273,15 +262,11 @@ class DQN(nn.Module, Agent):
                     ), f"Continuous action {i} shape mismatch (single obs): {cont_act[i].shape} vs {(dim,)}"
 
     def _e_greedy_train_action(
-        self, observations, action_mask=None, step=False, debug=False
+        self, observations, action_mask=None, step=False, debug=False, epsilon=0.1
     ):
         disc_act, cont_act = None, None
-        if self.init_eps > 0.0:
-            self.eps = self.init_eps * (
-                1 - self.step / (self.step + self.eps_decay_half_life)
-            )
         value = 0
-        if self.init_eps > 0.0 and np.random.rand() < self.eps:
+        if np.random.rand() < epsilon:
             if (
                 self.discrete_action_dims is not None
                 and len(self.discrete_action_dims) > 0
@@ -334,13 +319,13 @@ class DQN(nn.Module, Agent):
                 cont_act = self._cont_from_soft_q(cont_act).cpu().numpy()
         return disc_act, cont_act
 
-    def train_actions(self, observations, action_mask=None, step=False, debug=False):
+    def train_actions(self, observations, action_mask=None, step=False, debug=False, epsilon=0.1):
         # print(f"  inside dqn: aranges {self.continuous_action_dims} cards {self.discrete_action_dims}")
         t = 0
         if self.wall_time:
             t = time.time()
         disc_act, cont_act = self._e_greedy_train_action(
-            observations, action_mask, step, debug
+            observations, action_mask, step, debug, epsilon=epsilon
         )
         # print(f"  disc_act: {disc_act} cont act: {cont_act}")
         self.step += int(step)
@@ -487,21 +472,6 @@ class DQN(nn.Module, Agent):
                     for h in cac:
                         evs.append(torch.max(h, dim=-1, keepdim=True)[0])
                 return torch.cat(evs, dim=-1).mean(dim=-1)
-
-    def cql_loss(self, disc_adv, cont_adv, disc_act, cont_act):
-        """Computes the CQL loss for a batch of Q-values and actions."""
-        cql_loss = 0
-        if self.discrete_action_dims is not None:
-            for i in range(len(self.discrete_action_dims)):
-                logsumexp = torch.logsumexp(disc_adv[i], dim=-1, keepdim=True)
-                q_a = disc_adv[i].gather(1, disc_act[:, i].unsqueeze(-1))
-                cql_loss += (logsumexp - q_a).mean()
-        for i in range(self.continuous_action_dims):
-            logsumexp = torch.logsumexp(cont_adv[i], dim=-1, keepdim=True)
-            q_a = cont_adv[i].gather(1, cont_act[:, i].unsqueeze(-1))
-            cql_loss += (logsumexp - q_a).mean()
-
-        return cql_loss
 
     def _discrete_next_q(self, values, advantages, action_dim=None, debug=True):
         assert (
