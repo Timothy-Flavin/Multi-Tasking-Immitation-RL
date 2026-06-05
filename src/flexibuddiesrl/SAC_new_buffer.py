@@ -16,7 +16,7 @@ class SAC(nn.Module, Agent):
         discrete_action_dims=None,
         max_actions=None,
         min_actions=None,
-        hidden_dims=[256, 256],
+        hidden_dims=[32, 32],
         encoder=None,
         device="cpu",
         gumbel_tau=2.0,
@@ -94,12 +94,14 @@ class SAC(nn.Module, Agent):
         self.Q1_opt = torch.optim.Adam(self.Q1.parameters(), lr=self.lr)
         self.Q2_opt = torch.optim.Adam(self.Q2.parameters(), lr=self.lr)
 
+        # Dual temperature: separate α_c (continuous) and α_d (discrete)
         _log_t0 = float(np.log(self.initial_temperature))
         self.log_alpha_c = torch.nn.Parameter(torch.tensor(_log_t0, device=self.device, dtype=torch.float32))
         self.log_alpha_d = torch.nn.Parameter(torch.tensor(_log_t0, device=self.device, dtype=torch.float32))
         self.alpha_opt_c = torch.optim.Adam([self.log_alpha_c], lr=self.lr)
         self.alpha_opt_d = torch.optim.Adam([self.log_alpha_d], lr=self.lr)
 
+        # Separate target entropies (positive values)
         self.target_entropy_c = -float(self.continuous_action_dim) if self.has_continuous else 0.0
         self.target_entropy_d = -float(np.sum(np.log(self.discrete_action_dims))) if self.has_discrete else 0.0
         
@@ -119,7 +121,7 @@ class SAC(nn.Module, Agent):
         self.Q2_target = ValueS(**common_kwargs).to(self.device)
         self._hard_update(self.Q1_target, self.Q1)
         self._hard_update(self.Q2_target, self.Q2)
-        # SAC-1: freeze targets — gradients must never flow through target forward passes
+        # SAC-1: freeze targets
         for p in self.Q1_target.parameters(): p.requires_grad_(False)
         for p in self.Q2_target.parameters(): p.requires_grad_(False)
         self.Q1_target.eval()
@@ -130,7 +132,7 @@ class SAC(nn.Module, Agent):
             obs_dim=self.obs_dim + self.continuous_action_dim,
             continuous_action_dim=0,
             discrete_action_dims=self.discrete_action_dims,
-            hidden_dims=copy.deepcopy(self.hidden_dims),
+            hidden_dims=self.hidden_dims,
             encoder=None,
             activation=self.activation,
             orthogonal=self.orthogonal_init,
@@ -199,17 +201,12 @@ class SAC(nn.Module, Agent):
         r_t = samples.rewards.squeeze(-1)
         d_t = samples.terminations.squeeze(-1)
         
-        # Use the device of the data
-        device = obs_t.device
-
         # Pull discrete and continuous actions from the buffer sample
-        idx = 0
         discrete_actions = None
+        idx = 0
         if self.has_discrete:
-            discrete_actions = obs_t.new_zeros((obs_t.shape[0], len(self.discrete_action_dims)), dtype=torch.long)
-            for i in range(len(self.discrete_action_dims)):
-                discrete_actions[:, i] = samples.actions[:, idx].long()
-                idx += 1
+            idx = len(self.discrete_action_dims)
+            discrete_actions = samples.actions[:, :idx].long()
         continuous_actions = samples.actions[:, idx:] if self.has_continuous else None
 
         alpha_c = self.log_alpha_c.exp()
@@ -253,9 +250,8 @@ class SAC(nn.Module, Agent):
             q2 = v2.squeeze(-1) + self._gather_sum_adv(adv2, discrete_actions)
 
         critic_loss = F.mse_loss(q1, y) + F.mse_loss(q2, y)
-        self.Q1_opt.zero_grad(); self.Q2_opt.zero_grad()
+        self.Q1_opt.zero_grad(set_to_none=True); self.Q2_opt.zero_grad(set_to_none=True)
         critic_loss.backward()
-        # SAC-2: clip critic gradients to prevent Q-value blow-up
         torch.nn.utils.clip_grad_norm_(self.Q1.parameters(), max_norm=1.0)
         torch.nn.utils.clip_grad_norm_(self.Q2.parameters(), max_norm=1.0)
         self.Q1_opt.step(); self.Q2_opt.step()
@@ -296,21 +292,32 @@ class SAC(nn.Module, Agent):
                         q_min_i = torch.minimum(v1_s + adv1_s[i], v2_s + adv2_s[i])
                         actor_loss += (pi_i * (log_pi_i - F.log_softmax(q_min_i / alpha_d.detach(), dim=-1).detach())).sum(dim=-1).mean()
 
-            self.actor_opt.zero_grad(); actor_loss.backward()
-            # SAC-2: clip actor gradients
+            self.actor_opt.zero_grad(set_to_none=True); actor_loss.backward()
             torch.nn.utils.clip_grad_norm_(self.actor.parameters(), max_norm=1.0)
             self.actor_opt.step()
 
             # Alpha Update
             if self.has_continuous:
                 alpha_c_loss = -(self.log_alpha_c * (c_lp_agg.detach().mean() + self.target_entropy_c))
-                self.alpha_opt_c.zero_grad(); alpha_c_loss.backward(); self.alpha_opt_c.step()
+                self.alpha_opt_c.zero_grad(set_to_none=True); alpha_c_loss.backward(); self.alpha_opt_c.step()
             if self.has_discrete:
                 d_neg_ent = self._discrete_neg_entropy(d_logits).mean()
                 alpha_d_loss = -(self.log_alpha_d * (d_neg_ent + self.target_entropy_d))
-                self.alpha_opt_d.zero_grad(); alpha_d_loss.backward(); self.alpha_opt_d.step()
+                self.alpha_opt_d.zero_grad(set_to_none=True); alpha_d_loss.backward(); self.alpha_opt_d.step()
             
-            res.update({"actor_loss": actor_loss.item(), "alpha_c": alpha_c.item(), "alpha_d": alpha_d.item()})
+            # Gumbel temperature decay
+            if self.has_discrete:
+                self.actor.gumbel_tau = max(
+                    self.actor.gumbel_tau_min,
+                    self.actor.gumbel_tau * self.actor.gumbel_tau_decay
+                )
+            
+            res.update({
+                "actor_loss": actor_loss.item(), 
+                "alpha_c": alpha_c.item(), 
+                "alpha_d": alpha_d.item(),
+                "gumbel_tau": self.actor.gumbel_tau
+            })
 
         return res
 
@@ -322,17 +329,36 @@ class SAC(nn.Module, Agent):
         critic_params = sum(p.numel() for p in self.Q1.parameters()) * 2
         return actor_params, actor_params + critic_params
 
-    def ego_actions(self, observations, action_mask=None):
-        return self.train_actions(observations, action_mask=action_mask)
+    def tonumpy(self, x):
+        if isinstance(x, torch.Tensor):
+            x = x.to("cpu").numpy()
+        return x
+
+    def ego_actions(self, observations, action_mask=None) -> dict:
+        # Deterministic/selective policy: argmax over discrete heads and mean for continuous
+        with torch.no_grad():
+            obs_t = T(observations, self.device)
+            if obs_t.ndim == 1: obs_t = obs_t.unsqueeze(0)
+            c_means, c_logstd_logits, d_logits = self.actor(
+                obs_t, action_mask=action_mask, debug=False
+            )
+            # Discrete: argmax per head
+            if d_logits is not None:
+                d_actions_idx = [torch.argmax(logit, dim=-1) for logit in d_logits]
+            else:
+                d_actions_idx = None
+            # Continuous: clamp via tanh to [-1,1], then scale if bounds provided
+            if c_means is not None:
+                c_act = torch.tanh(c_means)
+                if self.max_actions is not None and self.min_actions is not None:
+                    center = (self.max_actions + self.min_actions) / 2.0
+                    half_range = (self.max_actions - self.min_actions) / 2.0
+                    c_act = center + half_range * c_act
+            else:
+                c_act = None
+        return {"discrete_action": d_actions_idx, "continuous_action": c_act}
 
     def expected_V(self, obs, legal_action=None):
-        """Entropy-regularised soft value V(s) = E_a[Q(s,a)] + α·H(π(·|s)).
-
-        SAC-3 fix: previous version returned raw Q(s,a) with no entropy correction,
-        making bootstrap targets too optimistic and inflating Q-values over time.
-        Now uses target networks (for bootstrap stability) and subtracts α·log π,
-        matching the soft Bellman equation used during training.
-        """
         if not torch.is_tensor(obs):
             obs = T(obs, device=self.device)
         with torch.no_grad():
@@ -351,7 +377,6 @@ class SAC(nn.Module, Agent):
                 v = torch.minimum(
                     self.Q1_target(q_in), self.Q2_target(q_in)
                 ).squeeze(-1)
-                # Subtract entropy cost so V = Q - α·log π = Q + α·H
                 if self.has_continuous and c_logp is not None:
                     v = v - alpha_c * self._aggregate_continuous_logp(c_logp)
                 if self.has_discrete and d_logits is not None:
@@ -379,8 +404,8 @@ class SAC(nn.Module, Agent):
         if not torch.is_tensor(observations):
             observations = T(observations, device=self.device)
         if actions is None:
-            return None # Requires actions for Q-values
-        a_vec = self._build_action_vector(actions[0], actions[1]) # Assuming [c, d]
+            return None
+        a_vec = self._build_action_vector(actions[0], actions[1])
         q_in = torch.cat([observations, a_vec], dim=-1)
         q = torch.minimum(self.Q1(q_in), self.Q2(q_in)).squeeze(-1)
         return q
@@ -402,7 +427,6 @@ class SAC(nn.Module, Agent):
         return torch.cat(parts, dim=-1)
 
     def _soft_v(self, v, adv_heads, alpha):
-        # SAC-5: pre-compute inv_alpha to avoid repeated division inside the loop
         sv = v.squeeze(-1)
         if adv_heads is not None:
             inv_alpha = 1.0 / alpha
@@ -410,11 +434,8 @@ class SAC(nn.Module, Agent):
                 sv = sv + alpha * torch.logsumexp(adv * inv_alpha, dim=-1)
         return sv
 
-    def _aggregate_continuous_logp(
-        self, c_logp: Optional[Union[torch.Tensor, List[torch.Tensor]]]
-    ) -> Optional[torch.Tensor]:
-        """Sum per-dimension log-probs from StochasticActor, which may return a Tensor or List[Tensor]."""
-        if c_logp is None:
+    def _aggregate_continuous_logp(self, c_logp):
+        if c_logp is None: 
             return None
         if isinstance(c_logp, (list, tuple)):
             xs = [t if t.ndim == 1 else t.sum(dim=-1) for t in c_logp]
@@ -434,7 +455,6 @@ class SAC(nn.Module, Agent):
 
     @staticmethod
     def _gather_sum_adv(adv_heads, d_idx):
-        # SAC-4: init as zero tensor, not Python int, so type is always Tensor
         res = adv_heads[0].new_zeros(adv_heads[0].shape[0])
         for i, adv in enumerate(adv_heads):
             res = res + adv.gather(1, d_idx[:, i:i+1].long()).squeeze(-1)
@@ -446,7 +466,6 @@ class SAC(nn.Module, Agent):
             t.data.lerp_(s.data, tau)
 
     def save(self, checkpoint_path):
-        path = checkpoint_path
         state = {
             "actor": self.actor.state_dict(),
             "Q1": self.Q1.state_dict(),
@@ -461,11 +480,10 @@ class SAC(nn.Module, Agent):
             "log_alpha_c": self.log_alpha_c.detach().cpu(),
             "log_alpha_d": self.log_alpha_d.detach().cpu(),
         }
-        torch.save(state, path)
+        torch.save(state, checkpoint_path)
 
     def load(self, checkpoint_path):
-        path = checkpoint_path
-        chkpt = torch.load(path, map_location=self.device)
+        chkpt = torch.load(checkpoint_path, map_location=self.device)
         self.actor.load_state_dict(chkpt["actor"])
         self.Q1.load_state_dict(chkpt["Q1"])
         self.Q1_target.load_state_dict(chkpt["Q1_target"])

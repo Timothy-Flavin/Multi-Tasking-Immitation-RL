@@ -697,7 +697,7 @@ class PG(nn.Module, Agent):
                         d_actions, d_old_lp, discrete_logits, advantages
                     )
 
-                self.optimizer.zero_grad()
+                self.optimizer.zero_grad(set_to_none=True)
                 loss = actor_loss + critic_loss * self.critic_loss_coef
                 loss.backward()
 
@@ -799,7 +799,7 @@ class PG(nn.Module, Agent):
             )
         G_critic_flat = G_critic.squeeze(-1).reshape(-1).to(self.device)
         critic_loss = F.mse_loss(Q_f, G_critic_flat)
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
         critic_loss.backward()
         if self.clip_grad:
             torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
@@ -1049,7 +1049,7 @@ class PG(nn.Module, Agent):
                 )
                 actor_loss = actor_loss + mb_logit_reg
 
-                self.optimizer.zero_grad()
+                self.optimizer.zero_grad(set_to_none=True)
                 loss = self.value_loss_coef * critic_loss + actor_loss
                 loss.backward()
                 if self.clip_grad:
@@ -1145,13 +1145,13 @@ class PG(nn.Module, Agent):
         d_dists = None
         if self.discrete_action_dims:
             d_dists = []
-            discrete_lp = torch.zeros(obs.shape[0], len(self.discrete_action_dims), device=self.device)
+            discrete_lp_cols = []
             for i, logits in enumerate(discrete_logits):
                 dist = Categorical(logits=logits)
                 d_dists.append(dist)
-                discrete_lp[:, i] = dist.log_prob(d_actions[:, i])
+                discrete_lp_cols.append(dist.log_prob(d_actions[:, i]))
                 d_entropy += dist.entropy()
-            lp.append(discrete_lp)
+            lp.append(torch.stack(discrete_lp_cols, dim=-1))
             
         lp = torch.cat(lp, dim=-1)
         logit_reg = 0

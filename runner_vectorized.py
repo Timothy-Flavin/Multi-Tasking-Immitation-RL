@@ -4,18 +4,15 @@ Uses the new tensor-based buffer implementations.
 Logs to tensorboard under ./dependence_results/runs/vectorized_<config>_seed<s>/
 """
 
-import sys, os
 import gymnasium as gym
 import numpy as np
-import torch
 import torch as th
-import time
+import torch
+import os
 import json
-import matplotlib.pyplot as plt
+import time
 from torch.utils.tensorboard import SummaryWriter
-
-# Add src to path
-sys.path.insert(0, os.path.join(os.getcwd(), "src"))
+import matplotlib.pyplot as plt
 
 from flexibuddiesrl.PG_new_buffer import PG
 from flexibuddiesrl.SAC_new_buffer import SAC
@@ -26,20 +23,21 @@ from toy_env import ContextualDecouplerEnv
 # -- Hyper-parameters ---------------------------------------------------------
 N_ACTIONS = 5
 OBS_DIM = 3
-TOTAL_STEPS = 50_000
+TOTAL_STEPS = 100_000
 NUM_ENVS = 16
 BATCH_SIZE = 256
 LR = 1e-3
 SEEDS = [0, 1, 2]
 
 CONFIGS = {
-    "PPO_shared_nomix": dict(algo="PPO", mix_type=None),
-    "PPO_VDN": dict(algo="PPO", mix_type="VDN"),
-    "PPO_QMIX": dict(algo="PPO", mix_type="QMIX", mixer_dim=64),
-    "SAC_shared_nomix": dict(algo="SAC"),
-    "DQN_shared_nomix": dict(algo="DQN", mix_type=None),
-    "DQN_VDN": dict(algo="DQN", mix_type="VDN"),
-    "DQN_QMIX": dict(algo="DQN", mix_type="QMIX", mixer_dim=64),
+    # "PPO_shared_nomix": dict(algo="PPO", mix_type=None),
+    # "PPO_VDN": dict(algo="PPO", mix_type="VDN"),
+    # "PPO_QMIX": dict(algo="PPO", mix_type="QMIX", mixer_dim=64),
+    "SAC_Q": dict(algo="SAC", mode="Q"),
+    "SAC_V": dict(algo="SAC", mode="V"),
+    # "DQN_shared_nomix": dict(algo="DQN", mix_type=None),
+    # "DQN_VDN": dict(algo="DQN", mix_type="VDN"),
+    # "DQN_QMIX": dict(algo="DQN", mix_type="QMIX", mixer_dim=64),
 }
 
 
@@ -58,26 +56,27 @@ def _make_model(cfg, device):
         kw.update(dict(n_epochs=4, mini_batch_size=128, mix_type=cfg.get("mix_type")))
         return PG(**kw)
     elif algo == "SAC":
-        return SAC(**common)
+        kw = common.copy()
+        kw.update(dict(mode=cfg.get("mode")))
+        return SAC(**kw)
     elif algo == "DQN":
         kw = common.copy()
         kw["continuous_action_dims"] = kw.pop("continuous_action_dim")
         kw.update(dict(mix_type=cfg.get("mix_type"), n_c_action_bins=5))
         return DQN(**kw)
+    raise ValueError(f"Unknown algo: {algo}")
 
 
-def run_vectorized_experiment(config_name, cfg, seed):
-    tag = f"vectorized_{config_name}_seed{seed}"
-    log_dir = os.path.join("dependence_results", "runs", tag)
-    writer = SummaryWriter(log_dir=log_dir)
+def run_vectorized_experiment(cfg_name, cfg, seed):
+    device = "cuda" if th.cuda.is_available() else "cpu"
+    print(f"Running [{cfg_name}_seed{seed}] on {device}...")
 
-    device = th.device("cuda" if th.cuda.is_available() else "cpu")
-    np.random.seed(seed)
-    th.manual_seed(seed)
+    log_dir = f"./dependence_results/runs/vectorized_{cfg_name}_seed{seed}"
+    writer = SummaryWriter(log_dir)
 
-    # Create vectorized environment
+    # Use a vectorized environment
     env = gym.vector.SyncVectorEnv(
-        [lambda: ContextualDecouplerEnv(n_actions=N_ACTIONS) for _ in range(NUM_ENVS)]
+        [lambda: ContextualDecouplerEnv() for _ in range(NUM_ENVS)]
     )
 
     agent = _make_model(cfg, device)
@@ -85,24 +84,25 @@ def run_vectorized_experiment(config_name, cfg, seed):
 
     # Setup Buffer
     if is_ppo:
-        collection_steps = 1024 // NUM_ENVS
         buffer = RolloutBuffer(
-            buffer_size=collection_steps,
-            n_envs=NUM_ENVS,
-            n_agents=1,
+            buffer_size=2048 // NUM_ENVS,
             obs_shape=(OBS_DIM,),
             action_dim=2,
-            log_probs_dim=2,
             device=device,
+            n_envs=NUM_ENVS,
+            n_agents=1,
+            log_probs_dim=2,  # 2 discrete heads
+            full_gpu=True,
         )
     else:
         buffer = ReplayBuffer(
-            buffer_size=100000,
-            n_envs=NUM_ENVS,
-            n_agents=1,
+            buffer_size=50_000,
             obs_shape=(OBS_DIM,),
             action_dim=2,
             device=device,
+            n_envs=NUM_ENVS,
+            n_agents=1,
+            full_gpu=True,
         )
 
     obs, _ = env.reset(seed=seed)
@@ -122,7 +122,9 @@ def run_vectorized_experiment(config_name, cfg, seed):
                 values = act_dict["values"]
                 log_probs = act_dict["discrete_log_probs"]
 
-        d_actions_np = d_actions.cpu().numpy() if torch.is_tensor(d_actions) else d_actions
+        d_actions_np = (
+            d_actions.cpu().numpy() if torch.is_tensor(d_actions) else d_actions
+        )
         env_actions = d_actions_np.reshape(NUM_ENVS, 2).astype(int)
         obs_next, rewards, terminations, truncations, info = env.step(env_actions)
 
@@ -180,89 +182,61 @@ def run_vectorized_experiment(config_name, cfg, seed):
             updates += 1
             if "importance_raw" in rl:
                 # Use mean context for importance summary in TB if needed,
-                # but better to handle properly like baseline if possible.
-                # For simplicity in vectorized:
-                importance_history.append(
-                    _analyze_importance(rl["importance_raw"], contexts, writer, updates)
-                )
-        elif not is_ppo and steps_done >= 1000:
+                # but results.json will store raw per-step importance for detail.
+                importance_history.append((steps_done, rl["importance_raw"].tolist()))
+
+        elif not is_ppo and steps_done > 1000 and steps_done % 1 == 0:
             agent.train()
-            # 1 update per 8 env steps ratio -> NUM_ENVS // 8 updates
-            for _ in range(NUM_ENVS // 8):
-                samples = buffer.sample(BATCH_SIZE)
-                rl = agent.reinforcement_learn(samples)
-                updates += 1
-                if "importance_raw" in rl:
-                    importance_history.append(
-                        _analyze_importance(
-                            rl["importance_raw"], contexts, writer, updates
-                        )
-                    )
+            samples = buffer.sample(BATCH_SIZE)
+            rl = agent.reinforcement_learn(samples)
+            updates += 1
+            if "importance_raw" in rl:
+                # ReplayBuffer samples are shuffled, so "steps_done" is just an update index here.
+                importance_history.append((steps_done, rl["importance_raw"].tolist()))
 
     env.close()
     writer.close()
-    print(f"  [{tag}] done")
     return {"reward_curve": reward_curve, "importance_history": importance_history}
 
 
-def _analyze_importance(imp_raw, contexts, writer, step):
-    # imp_raw is [B, n_heads]
-    # In vectorized, we might not have a perfect 1-to-1 mapping of contexts to minibatch steps easily
-    # without passing contexts to the buffer.
-    # For now, let's assume we just want to see if correlation is positive.
-    # PPO's importance_raw is already [n_steps, n_heads] for the whole buffer.
-    return {"step": step}  # Simplified for now
-
-
 def main():
-    os.makedirs("dependence_results", exist_ok=True)
-    results = {}
+    os.makedirs("./dependence_results", exist_ok=True)
+    all_results = {}
+
     for cfg_name, cfg in CONFIGS.items():
-        results[cfg_name] = []
+        all_results[cfg_name] = []
         for seed in SEEDS:
             res = run_vectorized_experiment(cfg_name, cfg, seed)
-            results[cfg_name].append(res)
+            all_results[cfg_name].append(res)
 
-    with open("dependence_results/vectorized_results.json", "w") as f:
-        json.dump(_serializable(results), f)
-    # Reuse plot function from baseline if we can, or just plot here.
-    _plot_reward_curves(results, "dependence_results/vectorized_")
+    with open("./dependence_results/vectorized_results.json", "w") as f:
+        json.dump(all_results, f)
 
-
-def _serializable(results):
-    res = {}
-    for k, runs in results.items():
-        res[k] = [
-            {"reward_curve": [[float(s), float(v)] for s, v in r["reward_curve"]]}
-            for r in runs
-        ]
-    return res
-
-
-def _plot_reward_curves(results, prefix):
+    # Plot results
     plt.figure(figsize=(10, 6))
-    for name, runs in results.items():
-        curves = [r["reward_curve"] for r in runs if r["reward_curve"]]
-        if not curves:
-            continue
-        steps = np.linspace(0, TOTAL_STEPS, 100)
-        matrix = np.array(
-            [
-                np.interp(steps, [c[0] for c in curve], [c[1] for c in curve])
-                for curve in curves
-            ]
-        )
-        plt.plot(steps, matrix.mean(0), label=name)
-        plt.fill_between(
-            steps,
-            matrix.mean(0) - matrix.std(0),
-            matrix.mean(0) + matrix.std(0),
-            alpha=0.2,
-        )
+    for cfg_name, runs in all_results.items():
+        all_curves = []
+        for r in runs:
+            curve = np.array(r["reward_curve"])
+            if len(curve) > 0:
+                # Bin to common x-axis
+                x = np.linspace(0, TOTAL_STEPS, 100)
+                y = np.interp(x, curve[:, 0], curve[:, 1])
+                all_curves.append(y)
+
+        if all_curves:
+            matrix = np.stack(all_curves)
+            plt.plot(x, matrix.mean(0), label=cfg_name)
+            plt.fill_between(
+                x,
+                matrix.mean(0) - matrix.std(0),
+                matrix.mean(0) + matrix.std(0),
+                alpha=0.2,
+            )
     plt.legend()
     plt.grid()
-    plt.title(f"{prefix} Reward Curves")
-    plt.savefig(f"{prefix}rewards.png")
+    plt.title(f"Vectorized Reward Curves (100k steps)")
+    plt.savefig("vectorized_rewards.png")
 
 
 if __name__ == "__main__":

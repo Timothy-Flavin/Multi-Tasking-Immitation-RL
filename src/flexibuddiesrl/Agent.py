@@ -1041,7 +1041,8 @@ class QS(nn.Module):
         # set up hidden layer for the adv and V heads
         joint_head_layers = []
         if head_hidden_dims is not None:
-            # print(head_hidden_dims)
+            # Use a local copy to avoid mutating the caller's list or default argument
+            head_hidden_dims = list(head_hidden_dims) 
             head_hidden_dims[-1] = head_hidden_dims[-1] * (
                 2 if dueling else 1  # separate embeddings if dueling
             )  # need independent chunk for value vs advantage

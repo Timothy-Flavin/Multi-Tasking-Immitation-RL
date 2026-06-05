@@ -259,8 +259,9 @@ class DQN(nn.Module, Agent):
         elif self.mix_type == "VDN":
             current_q_tot = q_heads.sum(dim=-1) + v
         else:
-            # Default to summing advantages if no mix_type provided but multiple heads exist
-            current_q_tot = q_heads.sum(dim=-1) + v
+            # Independent heads: each head plus value should match global target
+            # current_q_tot becomes [B, n_heads]
+            current_q_tot = q_heads + v.unsqueeze(-1)
                 
         # 2. Target Q-values
         with torch.no_grad():
@@ -293,9 +294,12 @@ class DQN(nn.Module, Agent):
             elif self.mix_type == "VDN":
                 next_q_tot = nq_heads.sum(dim=-1) + nv
             else:
-                next_q_tot = nq_heads.sum(dim=-1) + nv
+                # Independent: target is global reward plus max of LOCAL head Qs
+                # next_q_tot is [B, n_heads]
+                next_q_tot = nq_heads + nv.unsqueeze(-1)
 
-            target_q = rewards + self.gamma * (1.0 - terms) * next_q_tot
+            # rewards and terms are [B], target_q will be [B] (mix) or [B, n_heads] (nomix)
+            target_q = rewards.unsqueeze(-1) + self.gamma * (1.0 - terms.unsqueeze(-1)) * next_q_tot if self.mix_type is None else rewards + self.gamma * (1.0 - terms) * next_q_tot
 
             # Munchausen reward augmentation: add α·τ·log π(a|s) to targets
             if self.dqn_type == dqntype.Munchausen:
@@ -310,9 +314,8 @@ class DQN(nn.Module, Agent):
                 if self.continuous_action_dims:
                     for i in range(self.continuous_action_dims):
                         c_val = actions[:, idx]
-                        bin_width = (self.np_max_actions[i] - self.np_min_actions[i]) / (self.n_c_action_bins - 1)
                         bin_idx = torch.round(
-                            (c_val - self.np_min_actions[i]) / bin_width
+                            (c_val - self._min_t[i]) / self._bin_widths[i]
                         ).long().clamp(0, self.n_c_action_bins - 1)
                         log_pi = torch.log_softmax(
                             c_adv[i].detach() / self.entropy_loss_coef, dim=-1
@@ -321,14 +324,14 @@ class DQN(nn.Module, Agent):
                         idx += 1
             
         loss = F.mse_loss(current_q_tot, target_q)
-        
-        self.optimizer.zero_grad()
+
+        self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
         self.optimizer.step()
-        
+
         if self.steps % self.target_update_interval == 0:
             for target_param, param in zip(self.target_q_net.parameters(), self.q_net.parameters()):
-                target_param.data.copy_(self.tau * param.data + (1.0 - self.tau) * target_param.data)
+                target_param.data.lerp_(param.data, self.tau)
                 
         res = {"rl_loss": loss.item()}
         if importance_raw is not None:
