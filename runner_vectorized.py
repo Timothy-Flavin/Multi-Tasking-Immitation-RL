@@ -199,6 +199,106 @@ def run_vectorized_experiment(cfg_name, cfg, seed):
     return {"reward_curve": reward_curve, "importance_history": importance_history}
 
 
+def debug_critic_learning(n_steps=50_000, batch_size=256, seed=0, probe_interval=5_000):
+    """
+    Fills a replay buffer with random actions and trains only the SAC V-mode critic.
+    Periodically probes Q(s, a) at hand-picked states to check whether the critic
+    is learning the right value function before the actor is involved at all.
+
+    The key diagnostic is the Q-gap between optimal and wrong actions, which should
+    converge to ~2.0 (the reward difference from a single correct vs. incorrect step).
+    If the gap stays near 0, the critic has a bug. If the gap is ~2.0 but the agent
+    still fails to learn, the problem is in the actor loss.
+    """
+    device = "cuda" if th.cuda.is_available() else "cpu"
+    print(f"\n=== Critic-Only Debug | SAC V mode | device={device} ===")
+
+    rng = np.random.default_rng(seed)
+    env = ContextualDecouplerEnv()
+
+    agent = SAC(
+        obs_dim=OBS_DIM,
+        continuous_action_dim=0,
+        discrete_action_dims=[N_ACTIONS, N_ACTIONS],
+        device=device,
+        hidden_dims=[64, 64],
+        lr=LR,
+        mode="V",
+    )
+
+    buffer = ReplayBuffer(
+        buffer_size=50_000,
+        obs_shape=(OBS_DIM,),
+        action_dim=2,
+        device=device,
+        n_envs=1,
+        n_agents=1,
+        full_gpu=(device == "cuda"),
+    )
+
+    # Hand-picked probe states: [context, target_0, target_1]
+    # Each pair shows optimal vs. wrong action for that context.
+    # Q_gap = Q(optimal) - Q(wrong) should converge to ~2.0 (one-step reward delta).
+    probes = [
+        (np.array([0, 2, 3]), np.array([2, 0]), "ctx=0 t0=2 | a=(2,0) OPTIMAL"),
+        (np.array([0, 2, 3]), np.array([3, 0]), "ctx=0 t0=2 | a=(3,0) WRONG  "),
+        (np.array([1, 2, 3]), np.array([0, 3]), "ctx=1 t1=3 | a=(0,3) OPTIMAL"),
+        (np.array([1, 2, 3]), np.array([0, 2]), "ctx=1 t1=3 | a=(0,2) WRONG  "),
+    ]
+    probe_obs = th.tensor(
+        np.stack([p[0] for p in probes]), dtype=th.float32, device=device
+    )
+    probe_acts = th.tensor(
+        np.stack([p[1] for p in probes]), dtype=th.long, device=device
+    )
+    probe_labels = [p[2] for p in probes]
+
+    obs, _ = env.reset(seed=seed)
+    update_count = 0
+    critic_loss = float("nan")
+
+    for step in range(1, n_steps + 1):
+        action = env.action_space.sample()
+        obs_next, reward, terminated, truncated, _ = env.step(action)
+
+        buffer.add(
+            obs=obs.astype(np.float32).reshape(1, 1, OBS_DIM),
+            next_obs=obs_next.astype(np.float32).reshape(1, 1, OBS_DIM),
+            action=np.array(action, dtype=np.float32).reshape(1, 1, 2),
+            reward=np.array([[reward]], dtype=np.float32),
+            term=np.array([[terminated]], dtype=np.float32),
+            trunc=np.array([[truncated]], dtype=np.float32),
+        )
+
+        if terminated or truncated:
+            obs, _ = env.reset(seed=int(rng.integers(1 << 31)))
+        else:
+            obs = obs_next
+
+        if step > 1000:
+            agent.train()
+            samples = buffer.sample(batch_size)
+            rl = agent.reinforcement_learn(samples, critic_only=True)
+            critic_loss = rl["critic_loss"]
+            update_count += 1
+
+        if step % probe_interval == 0:
+            agent.eval()
+            with th.no_grad():
+                q_vals = agent.utility_function(probe_obs, actions=(probe_acts, None))
+            q_vals = q_vals.cpu().tolist()
+            print(f"\n[step={step:>6d}  updates={update_count:>5d}  critic_loss={critic_loss:.4f}]")
+            for label, q in zip(probe_labels, q_vals):
+                print(f"  Q {label} = {q:+.4f}")
+            gap_ctx0 = q_vals[0] - q_vals[1]
+            gap_ctx1 = q_vals[2] - q_vals[3]
+            print(f"  --> Q_gap ctx=0 (expect ~2.0): {gap_ctx0:+.4f}")
+            print(f"  --> Q_gap ctx=1 (expect ~2.0): {gap_ctx1:+.4f}")
+
+    env.close()
+    print("\n=== Done ===")
+
+
 def main():
     os.makedirs("./dependence_results", exist_ok=True)
     all_results = {}
@@ -240,4 +340,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "debug_critic":
+        debug_critic_learning()
+    else:
+        main()

@@ -487,7 +487,7 @@ class StochasticActor(nn.Module):
                 end = start + dim
                 logits = embedding[:, start:end]
                 discrete_logits.append(logits)
-                # print(logits)
+                start = end
 
         if single_vector:
             continuous_means = (
