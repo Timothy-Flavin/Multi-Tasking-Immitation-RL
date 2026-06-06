@@ -115,7 +115,7 @@ def run_profiling_new(
             full_gpu=full_gpu,
             action_dtype=torch.float32 if is_continuous else torch.int32,
         )
-    elif agent_type == "SAC":
+    elif agent_type == "SACQ":
         agent = SAC(
             obs_dim=obs_dim,
             continuous_action_dim=continuous_action_dim if is_continuous else 0,
@@ -125,6 +125,30 @@ def run_profiling_new(
             device=device,
             hidden_dims=[64, 64],
             lr=1e-3,
+            mode="Q",
+        )
+        buffer = ReplayBuffer(
+            buffer_size=1000000,
+            n_envs=num_envs,
+            n_agents=1,
+            obs_shape=(obs_dim,),
+            action_dim=(
+                continuous_action_dim if is_continuous else len(discrete_action_dims)
+            ),
+            device=device,
+            full_gpu=full_gpu,
+        )
+    elif agent_type == "SACV":
+        agent = SAC(
+            obs_dim=obs_dim,
+            continuous_action_dim=continuous_action_dim if is_continuous else 0,
+            discrete_action_dims=None if is_continuous else discrete_action_dims,
+            max_actions=max_actions,
+            min_actions=min_actions,
+            device=device,
+            hidden_dims=[64, 64],
+            lr=1e-3,
+            mode="V",
         )
         buffer = ReplayBuffer(
             buffer_size=1000000,
@@ -166,10 +190,10 @@ def run_profiling_new(
     # entire run. GPU timing uses cuda.synchronize() before reading the clock so
     # the kernel queue is drained and the measurement reflects completed work.
     # -------------------------------------------------------------------------
-    t_take_action = 0.0   # agent.train_actions (inference)
-    t_env_step    = 0.0   # raw_env.step (environment physics)
-    t_buf_insert  = 0.0   # buffer.add (host-side copy + optional H2D)
-    t_net_update  = 0.0   # agent.reinforcement_learn (gradient step)
+    t_take_action = 0.0  # agent.train_actions (inference)
+    t_env_step = 0.0  # raw_env.step (environment physics)
+    t_buf_insert = 0.0  # buffer.add (host-side copy + optional H2D)
+    t_net_update = 0.0  # agent.reinforcement_learn (gradient step)
     n_action_calls = 0
     n_update_calls = 0
 
@@ -193,18 +217,30 @@ def run_profiling_new(
                 with th.no_grad():
                     # [E, A=1, obs_dim] — [E, A, O] layout per spec
                     act_dict = agent.train_actions(obs_t)
-                    values = th.as_tensor(act_dict["values"], device=device)     # [E, A=1]
+                    values = th.as_tensor(act_dict["values"], device=device)  # [E, A=1]
                     log_probs = th.as_tensor(
-                        act_dict["continuous_log_probs" if is_continuous else "discrete_log_probs"],
+                        act_dict[
+                            (
+                                "continuous_log_probs"
+                                if is_continuous
+                                else "discrete_log_probs"
+                            )
+                        ],
                         device=device,
                     )  # [E, A=1, lp_dim]
-                    raw_actions = act_dict["continuous_actions" if is_continuous else "discrete_actions"]
+                    raw_actions = act_dict[
+                        "continuous_actions" if is_continuous else "discrete_actions"
+                    ]
                 _sync(device)
                 t_take_action += time.perf_counter() - _t
                 n_action_calls += 1
 
                 # Phase 2: env_step
-                raw_actions_np = raw_actions if isinstance(raw_actions, np.ndarray) else raw_actions.cpu().numpy()
+                raw_actions_np = (
+                    raw_actions
+                    if isinstance(raw_actions, np.ndarray)
+                    else raw_actions.cpu().numpy()
+                )
                 if is_continuous:
                     env_actions = raw_actions_np.reshape(num_envs, 1).astype(np.float32)
                     _t = time.perf_counter()
@@ -215,7 +251,9 @@ def run_profiling_new(
                 else:
                     env_actions = raw_actions_np.flatten()
                     _t = time.perf_counter()
-                    obs_next, rewards, terminations, truncations, info = raw_env.step(env_actions)
+                    obs_next, rewards, terminations, truncations, info = raw_env.step(
+                        env_actions
+                    )
                     t_env_step += time.perf_counter() - _t
 
                 # Convert ONLY what is needed for the next step or agent inference
@@ -236,7 +274,7 @@ def run_profiling_new(
                                 final_obs[i] = f_obs_src[i]
                     else:
                         final_obs = obs_next
-                    final_obs = final_obs[:, np.newaxis, :]   # [E, A=1, obs_dim]
+                    final_obs = final_obs[:, np.newaxis, :]  # [E, A=1, obs_dim]
 
                 # Phase 3: buffer_insert — inputs are [E, A, ...] per [T,E,A,O] spec
                 _sync(device)
@@ -266,14 +304,14 @@ def run_profiling_new(
             # Phase 4: network_update (PPO)
             agent.train()
             with th.no_grad():
-                last_values = agent.expected_V(obs_t)                   # [E, A=1]
+                last_values = agent.expected_V(obs_t)  # [E, A=1]
             _sync(device)
             _t = time.perf_counter()
             agent.reinforcement_learn(
                 buffer,
                 last_values,
-                terminations[:, np.newaxis],   # [E, A=1]
-                truncations[:, np.newaxis],    # [E, A=1]
+                terminations[:, np.newaxis],  # [E, A=1]
+                truncations[:, np.newaxis],  # [E, A=1]
             )
             _sync(device)
             t_net_update += time.perf_counter() - _t
@@ -287,13 +325,19 @@ def run_profiling_new(
             _t = time.perf_counter()
             with th.no_grad():
                 act_dict = agent.train_actions(obs_t)
-                raw_actions = act_dict["continuous_actions" if is_continuous else "discrete_actions"]
+                raw_actions = act_dict[
+                    "continuous_actions" if is_continuous else "discrete_actions"
+                ]
             _sync(device)
             t_take_action += time.perf_counter() - _t
             n_action_calls += 1
 
             # Phase 2: env_step
-            raw_actions_np = raw_actions if isinstance(raw_actions, np.ndarray) else raw_actions.cpu().numpy()
+            raw_actions_np = (
+                raw_actions
+                if isinstance(raw_actions, np.ndarray)
+                else raw_actions.cpu().numpy()
+            )
             if is_continuous:
                 env_actions = raw_actions_np.reshape(num_envs, 1).astype(np.float32)
                 _t = time.perf_counter()
@@ -304,7 +348,9 @@ def run_profiling_new(
             else:
                 env_actions = raw_actions_np.flatten()
                 _t = time.perf_counter()
-                obs_next, rewards, terminations, truncations, info = raw_env.step(env_actions)
+                obs_next, rewards, terminations, truncations, info = raw_env.step(
+                    env_actions
+                )
                 t_env_step += time.perf_counter() - _t
 
             # Convert ONLY what is needed for the next step or agent inference
@@ -354,16 +400,24 @@ def run_profiling_new(
     duration = end_total - start_total
     sps = steps_done / duration
 
-    avg_action_ms  = 1000.0 * t_take_action / n_action_calls if n_action_calls else 0.0
-    avg_envstep_ms = 1000.0 * t_env_step    / n_action_calls if n_action_calls else 0.0
-    avg_insert_ms  = 1000.0 * t_buf_insert  / n_action_calls if n_action_calls else 0.0
-    avg_update_ms  = 1000.0 * t_net_update  / n_update_calls if n_update_calls else 0.0
+    avg_action_ms = 1000.0 * t_take_action / n_action_calls if n_action_calls else 0.0
+    avg_envstep_ms = 1000.0 * t_env_step / n_action_calls if n_action_calls else 0.0
+    avg_insert_ms = 1000.0 * t_buf_insert / n_action_calls if n_action_calls else 0.0
+    avg_update_ms = 1000.0 * t_net_update / n_update_calls if n_update_calls else 0.0
 
     print(f"\nPhase Breakdown ({agent_type} {mode} full_gpu={full_gpu}):")
-    print(f"  take_action  : {t_take_action:8.3f}s total  |  {avg_action_ms:8.4f} ms/call  ({n_action_calls} calls)")
-    print(f"  env_step     : {t_env_step:8.3f}s total  |  {avg_envstep_ms:8.4f} ms/call")
-    print(f"  buffer_insert: {t_buf_insert:8.3f}s total  |  {avg_insert_ms:8.4f} ms/call")
-    print(f"  net_update   : {t_net_update:8.3f}s total  |  {avg_update_ms:8.4f} ms/call  ({n_update_calls} calls)")
+    print(
+        f"  take_action  : {t_take_action:8.3f}s total  |  {avg_action_ms:8.4f} ms/call  ({n_action_calls} calls)"
+    )
+    print(
+        f"  env_step     : {t_env_step:8.3f}s total  |  {avg_envstep_ms:8.4f} ms/call"
+    )
+    print(
+        f"  buffer_insert: {t_buf_insert:8.3f}s total  |  {avg_insert_ms:8.4f} ms/call"
+    )
+    print(
+        f"  net_update   : {t_net_update:8.3f}s total  |  {avg_update_ms:8.4f} ms/call  ({n_update_calls} calls)"
+    )
     print(f"  Total SPS: {sps:.2f}  |  Duration: {duration:.4f}s")
 
     os.makedirs("profile_results", exist_ok=True)
@@ -383,21 +437,21 @@ def run_profiling_new(
     plt.close()
 
     return {
-        "agent":          agent_type,
-        "mode":           mode,
-        "full_gpu":       full_gpu,
-        "sps":            sps,
-        "duration":       duration,
-        "t_take_action":  t_take_action,
-        "t_env_step":     t_env_step,
-        "t_buf_insert":   t_buf_insert,
-        "t_net_update":   t_net_update,
+        "agent": agent_type,
+        "mode": mode,
+        "full_gpu": full_gpu,
+        "sps": sps,
+        "duration": duration,
+        "t_take_action": t_take_action,
+        "t_env_step": t_env_step,
+        "t_buf_insert": t_buf_insert,
+        "t_net_update": t_net_update,
         "n_action_calls": n_action_calls,
         "n_update_calls": n_update_calls,
-        "avg_action_ms":  avg_action_ms,
+        "avg_action_ms": avg_action_ms,
         "avg_envstep_ms": avg_envstep_ms,
-        "avg_insert_ms":  avg_insert_ms,
-        "avg_update_ms":  avg_update_ms,
+        "avg_insert_ms": avg_insert_ms,
+        "avg_update_ms": avg_update_ms,
     }
 
 
@@ -410,7 +464,7 @@ if __name__ == "__main__":
 
     final_results = []
 
-    algos = ["PPO", "SAC", "DQN"]
+    algos = ["PPO", "SACV", "SACQ", "DQN"]
     modes = ["discrete", "continuous"]
     gpu_options = [False, True]
 

@@ -128,7 +128,7 @@ class SAC(nn.Module, Agent):
         self.target_entropy_d = 0.0
         if self.has_discrete and self.discrete_action_dims is not None:
             self.target_entropy_d = (
-                0.98 * float(np.sum(np.log(self.discrete_action_dims)))
+                0.1 * float(np.sum(np.log(self.discrete_action_dims)))
                 if self.has_discrete
                 else 0.0
             )
@@ -308,17 +308,22 @@ class SAC(nn.Module, Agent):
                     if self.has_continuous
                     else obs_next_t
                 )
-                _, q1_next_heads, _ = self.Q1_target(in_vec_next)
-                _, q2_next_heads, _ = self.Q2_target(in_vec_next)
+                v1_next, q1_next_heads, _ = self.Q1_target(in_vec_next)
+                v2_next, q2_next_heads, _ = self.Q2_target(in_vec_next)
 
-                v_next = obs_next_t.new_zeros(obs_next_t.shape[0])
+                # Value heads: zeros when dueling=False, V(s') when dueling=True
+                v_next = torch.minimum(v1_next, v2_next).squeeze(-1)
                 if self.has_discrete:
                     for q1_h, q2_h in zip(q1_next_heads, q2_next_heads):
                         q_min_h = torch.minimum(q1_h, q2_h)
-                        # Soft Bellman: alpha * logsumexp(Q/alpha). Reduces to
-                        # hard max as alpha->0, consistent with alpha update.
-                        a_d = alpha_d.clamp(min=1e-8)
-                        v_next += a_d * torch.logsumexp(q_min_h / a_d, dim=-1)
+                        # Soft V = E_pi[A] + alpha*H  (direct form; stable as alpha->0)
+                        logprobs = F.log_softmax(
+                            q_min_h / alpha_d.clamp(min=1e-8), dim=-1
+                        )
+                        probs = logprobs.exp()
+                        v_next += (probs * q_min_h).sum(dim=-1) - alpha_d * (
+                            probs * logprobs
+                        ).sum(dim=-1)
 
                 if self.has_continuous:
                     v_next -= alpha_c * self._aggregate_continuous_logp(c_logp_n)
@@ -336,16 +341,17 @@ class SAC(nn.Module, Agent):
                 if self.has_continuous
                 else obs_t
             )
-            _, q1_heads, _ = self.Q1(in_vec)
-            _, q2_heads, _ = self.Q2(in_vec)
+            v1, q1_heads, _ = self.Q1(in_vec)
+            v2, q2_heads, _ = self.Q2(in_vec)
 
-            q1 = obs_t.new_zeros(obs_t.shape[0])
-            q2 = obs_t.new_zeros(obs_t.shape[0])
+            # Seed with value heads (zeros when dueling=False, V(s) when dueling=True)
+            q1 = v1.squeeze(-1)
+            q2 = v2.squeeze(-1)
             if self.has_discrete:
                 for i, (q1_h, q2_h) in enumerate(zip(q1_heads, q2_heads)):
                     a_d_i = discrete_actions[:, i : i + 1].long()
-                    q1 += q1_h.gather(1, a_d_i).squeeze(-1)
-                    q2 += q2_h.gather(1, a_d_i).squeeze(-1)
+                    q1 = q1 + q1_h.gather(1, a_d_i).squeeze(-1)
+                    q2 = q2 + q2_h.gather(1, a_d_i).squeeze(-1)
 
         critic_loss = F.mse_loss(q1, y) + F.mse_loss(q2, y)
         self.Q1_opt.zero_grad(set_to_none=True)

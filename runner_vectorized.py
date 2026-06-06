@@ -30,14 +30,14 @@ LR = 1e-3
 SEEDS = [0, 1, 2]
 
 CONFIGS = {
-    # "PPO_shared_nomix": dict(algo="PPO", mix_type=None),
-    # "PPO_VDN": dict(algo="PPO", mix_type="VDN"),
-    # "PPO_QMIX": dict(algo="PPO", mix_type="QMIX", mixer_dim=64),
+    "PPO_shared_nomix": dict(algo="PPO", mix_type=None),
+    "PPO_VDN": dict(algo="PPO", mix_type="VDN"),
+    "PPO_QMIX": dict(algo="PPO", mix_type="QMIX", mixer_dim=64),
     "SAC_Q": dict(algo="SAC", mode="Q"),
     "SAC_V": dict(algo="SAC", mode="V"),
-    # "DQN_shared_nomix": dict(algo="DQN", mix_type=None),
-    # "DQN_VDN": dict(algo="DQN", mix_type="VDN"),
-    # "DQN_QMIX": dict(algo="DQN", mix_type="QMIX", mixer_dim=64),
+    "DQN_shared_nomix": dict(algo="DQN", mix_type=None),
+    "DQN_VDN": dict(algo="DQN", mix_type="VDN"),
+    "DQN_QMIX": dict(algo="DQN", mix_type="QMIX", mixer_dim=64),
 }
 
 
@@ -287,7 +287,9 @@ def debug_critic_learning(n_steps=50_000, batch_size=256, seed=0, probe_interval
             with th.no_grad():
                 q_vals = agent.utility_function(probe_obs, actions=(probe_acts, None))
             q_vals = q_vals.cpu().tolist()
-            print(f"\n[step={step:>6d}  updates={update_count:>5d}  critic_loss={critic_loss:.4f}]")
+            print(
+                f"\n[step={step:>6d}  updates={update_count:>5d}  critic_loss={critic_loss:.4f}]"
+            )
             for label, q in zip(probe_labels, q_vals):
                 print(f"  Q {label} = {q:+.4f}")
             gap_ctx0 = q_vals[0] - q_vals[1]
@@ -341,6 +343,7 @@ def main():
 
 if __name__ == "__main__":
     import sys
+
     if len(sys.argv) > 1 and sys.argv[1] == "debug_critic":
         debug_critic_learning()
     else:
