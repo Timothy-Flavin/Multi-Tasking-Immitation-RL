@@ -252,6 +252,7 @@ def run_joint(config_name, cfg, seed, writer):
 
     kw = _make_common_kwargs()
     kw.update(cfg)
+    kw.pop("algo", None)  # algo is a routing key, not a PG param
     kw["name"] = config_name
     if kw.get("mix_type") is not None:
         kw["advantage_type"] = "qmix"

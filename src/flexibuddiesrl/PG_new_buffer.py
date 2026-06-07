@@ -139,8 +139,6 @@ class PG(nn.Module, Agent):
         self.use_offline_critic_buffer = offline_critic_buffer
 
         self._sanitize_params()
-        if self.use_offline_critic_buffer:
-            self._init_offline_critic_buffer()
         self._create_mixer()  # This needs to be before _get_torch_params for Adam to work
         self._get_torch_params(encoder, action_head_hidden_dims)
 
@@ -175,60 +173,45 @@ class PG(nn.Module, Agent):
         if self.continuous_action_dim > 0:
             self.total_action_dims += self.continuous_action_dim
 
-    def _init_offline_critic_buffer(self):
-        buf_size = 5000
-        # In the new setup, we use the ReplayBuffer from buffers.py
-        # We assume n_envs=1 and n_agents=1 for this internal buffer as it's for 1-step TD
+    def _init_offline_critic_buffer(self, n_envs: int = 1, n_agents: int = 1) -> None:
+        # 5000 T-slots × n_envs × n_agents ≈ 5000 * n_envs total transitions.
+        # full_gpu keeps the replay data on CUDA for zero-copy sampling.
         self._offline_buffer = ReplayBuffer(
-            buffer_size=buf_size,
+            buffer_size=5000,
             obs_shape=(self.obs_dim,),
             action_dim=self.total_action_dims,
             device=self.device,
-            n_envs=1,
-            n_agents=1,
+            n_envs=n_envs,
+            n_agents=n_agents,
+            full_gpu=True,
         )
 
-    def _add_batch_to_offline_buffer(self, buffer: RolloutBuffer):
-        """Copy transitions from an on-policy RolloutBuffer into the offline critic ReplayBuffer.
-
-        RolloutBuffer stores [T, E, A, ...] tensors.  The offline buffer expects
-        individual (obs, next_obs, action, reward, term, trunc) tuples shaped
-        [n_envs=1, n_agents=1, ...].  We flatten each (T, E, A) cell to a
-        separate transition so the offline critic sees a diverse mix of samples.
-
-        next_obs uses obs[t+1] for interior steps; for the last step in the
-        rollout next_obs == obs[T-1] (a repeat) — this introduces a small bias
-        but avoids storing next_obs separately and is consistent with how 1-step
-        TD loss is computed in the legacy offline buffer.
-        """
-        T = buffer.pos  # number of stored steps
+    def _add_batch_to_offline_buffer(self, buffer: RolloutBuffer) -> None:
+        T = buffer.pos
         if T < 2:
             return
 
-        obs_all     = buffer.observations[:T].cpu().numpy()    # [T, E, A, obs_dim]
-        actions_all = buffer.actions[:T].cpu().numpy()         # [T, E, A, act_dim]
-        rewards_all = buffer.rewards[:T].cpu().numpy()         # [T, E, A]
-        terms_all   = buffer.terminations[:T].cpu().numpy()    # [T, E, A]
-        truncs_all  = buffer.truncations[:T].cpu().numpy()     # [T, E, A]
+        E, A = buffer.n_envs, buffer.n_agents
+        # Lazy-init (or re-init if env count changed) so we never need n_envs at __init__ time.
+        if not hasattr(self, '_offline_buffer') or self._offline_buffer.n_envs != E:
+            self._init_offline_critic_buffer(n_envs=E, n_agents=A)
 
-        # next_obs: shift by 1; last step reuses its own obs as a placeholder
-        next_obs_all = np.concatenate([obs_all[1:], obs_all[-1:]], axis=0)  # [T, E, A, obs_dim]
+        obs = buffer.observations[:T]                          # [T, E, A, obs_dim]
+        next_obs = torch.cat([obs[1:], obs[-1:]], dim=0)       # [T, E, A, obs_dim]
 
-        _, E, A, _ = obs_all.shape
-        for t in range(T - 1):          # skip last step (next_obs is approximate)
-            for e in range(E):
-                for a in range(A):
-                    self._offline_buffer.add(
-                        obs=obs_all[t, e:e+1, a:a+1],           # [1, 1, obs_dim]
-                        next_obs=next_obs_all[t, e:e+1, a:a+1],
-                        action=actions_all[t, e:e+1, a:a+1],
-                        reward=rewards_all[t, e:e+1, a:a+1],
-                        term=terms_all[t, e:e+1, a:a+1],
-                        trunc=truncs_all[t, e:e+1, a:a+1],
-                    )
+        # T-1 vectorised calls (one per timestep, all envs at once) instead of T×E×A scalar calls.
+        for t in range(T - 1):
+            self._offline_buffer.add(
+                obs=obs[t],                    # [E, A, obs_dim]
+                next_obs=next_obs[t],          # [E, A, obs_dim]
+                action=buffer.actions[t],      # [E, A, act_dim]
+                reward=buffer.rewards[t],      # [E, A]
+                term=buffer.terminations[t],   # [E, A]
+                trunc=buffer.truncations[t],   # [E, A]
+            )
 
     def _offline_critic_loss(self) -> torch.Tensor:
-        if self._offline_buffer.size() < self.mini_batch_size:
+        if not hasattr(self, '_offline_buffer') or self._offline_buffer.size() < self.mini_batch_size:
             return torch.zeros(1, device=self.device)
 
         samples = self._offline_buffer.sample(self.mini_batch_size)
@@ -873,6 +856,9 @@ class PG(nn.Module, Agent):
         if self.wall_time:
             t = time.time()
 
+        if self.use_offline_critic_buffer:
+            self._add_batch_to_offline_buffer(buffer)
+
         # Pull all data from buffer [T, E, A, ...]
         obs = buffer.observations[:buffer.pos]
         actions = buffer.actions[:buffer.pos]
@@ -1018,13 +1004,19 @@ class PG(nn.Module, Agent):
                 mb_d_act = mb_actions[:, :len(self.discrete_action_dims)].long() if self.discrete_action_dims else None
                 mb_c_act = mb_actions[:, -self.continuous_action_dim:] if self.continuous_action_dim > 0 else None
 
-                # Critic Loss — per head: (V + A_h) regresses against G_h
-                mb_values, mb_d_adv, mb_c_adv = self.critic(mb_obs)
-                if mb_c_adv is not None:
-                    mb_c_adv = torch.transpose(torch.stack(mb_c_adv, dim=0), 0, 1)
-                mb_adv_gathered = self._gather_observed_advantages(mb_d_adv, mb_c_adv, mb_d_act, mb_c_act)
-                mb_per_head_Q = mb_adv_gathered + mb_values  # [B, D]: V broadcast over D heads
-                critic_loss = F.mse_loss(mb_per_head_Q, mb_G_critic)  # [B, D] vs [B, D]
+                # Critic Loss
+                if self.use_offline_critic_buffer:
+                    # 1-step TD from the internal replay buffer; QMIX stays in the loop
+                    # so its hypernetwork parameters receive gradient signal.
+                    critic_loss = self._offline_critic_loss()
+                else:
+                    # Per-head on-policy: (V + A_h) regresses against importance-weighted G_h
+                    mb_values, mb_d_adv, mb_c_adv = self.critic(mb_obs)
+                    if mb_c_adv is not None:
+                        mb_c_adv = torch.transpose(torch.stack(mb_c_adv, dim=0), 0, 1)
+                    mb_adv_gathered = self._gather_observed_advantages(mb_d_adv, mb_c_adv, mb_d_act, mb_c_act)
+                    mb_per_head_Q = mb_adv_gathered + mb_values  # [B, D]
+                    critic_loss = F.mse_loss(mb_per_head_Q, mb_G_critic)  # [B, D] vs [B, D]
 
                 # Actor Loss — uses actual KL via _mix_actor_loss
                 (

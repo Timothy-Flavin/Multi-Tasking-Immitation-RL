@@ -55,6 +55,8 @@ CONFIGS = {
     "PPO_shared_nomix": dict(algo="PPO", mix_type=None),
     "PPO_VDN": dict(algo="PPO", mix_type="VDN"),
     "PPO_QMIX": dict(algo="PPO", mix_type="QMIX", mixer_dim=64),
+    "PPO_VDN_offline": dict(algo="PPO", mix_type="VDN", offline_critic=True),
+    "PPO_QMIX_offline": dict(algo="PPO", mix_type="QMIX", mixer_dim=64, offline_critic=True),
     "SAC_Q": dict(algo="SAC", mode="Q"),
     "SAC_V": dict(algo="SAC", mode="V"),
     "DQN_shared_nomix": dict(algo="DQN", mix_type=None),
@@ -81,6 +83,7 @@ def _make_model(cfg, device):
             mini_batch_size=256,
             mix_type=cfg.get("mix_type"),
             mixer_dim=cfg.get("mixer_dim", 64),
+            offline_critic_buffer=cfg.get("offline_critic", False),
         )
     if algo == "SAC":
         return SAC(
@@ -252,6 +255,14 @@ def run_lander_experiment(cfg_name, cfg, seed):
     return {"reward_curve": reward_curve}
 
 
+def _ema(y: np.ndarray, alpha: float = 0.5) -> np.ndarray:
+    out = np.empty_like(y)
+    out[0] = y[0]
+    for i in range(1, len(y)):
+        out[i] = alpha * y[i] + (1.0 - alpha) * out[i - 1]
+    return out
+
+
 def main():
     os.makedirs("./lander_results", exist_ok=True)
     all_results = {}
@@ -274,7 +285,7 @@ def main():
             curve = np.array(r["reward_curve"])
             if len(curve) > 0:
                 x = np.linspace(0, total_steps, 200)
-                y = np.interp(x, curve[:, 0], curve[:, 1])
+                y = _ema(np.interp(x, curve[:, 0], curve[:, 1]))
                 all_curves.append(y)
         if all_curves:
             matrix = np.stack(all_curves)
