@@ -243,19 +243,18 @@ class DQN(nn.Module, Agent):
         
         importance_raw = None
         if self.mix_type == "QMIX":
-            # Compute actual Q_tot attached to graph for training
-            current_q_tot, _ = self.q_net.factorize_Q(q_heads, obs, with_grad=False)
-            current_q_tot = current_q_tot.squeeze(-1) + v
-            
-            # Compute gradients for importance without affecting main graph training
-            q_heads_detached = q_heads.detach().clone()
-            q_heads_detached.requires_grad = True
-            _, q_grads = self.q_net.factorize_Q(q_heads_detached, obs, with_grad=True)
-            self.q_net.zero_grad() # Clear any hypernetwork grads from the detached backward
+            full_q_heads = q_heads + v.unsqueeze(-1)
+            current_q_tot, _ = self.q_net.factorize_Q(full_q_heads, obs, with_grad=False)
+            current_q_tot = current_q_tot.squeeze(-1)
+
+            full_q_detached = full_q_heads.detach().clone()
+            full_q_detached.requires_grad = True
+            _, q_grads = self.q_net.factorize_Q(full_q_detached, obs, with_grad=True)
+            self.q_net.zero_grad()
             if q_grads is not None:
-                importance_raw = (q_heads.detach() * q_grads).cpu().numpy()
+                importance_raw = (full_q_detached.detach() * q_grads).cpu().numpy()
             else:
-                importance_raw = np.zeros_like(q_heads.detach().cpu().numpy())
+                importance_raw = np.zeros_like(full_q_detached.detach().cpu().numpy())
         elif self.mix_type == "VDN":
             current_q_tot = q_heads.sum(dim=-1) + v
         else:
@@ -289,8 +288,9 @@ class DQN(nn.Module, Agent):
             nv = next_values.squeeze(-1)
 
             if self.mix_type == "QMIX":
-                next_q_tot, _ = self.target_q_net.factorize_Q(nq_heads, next_obs)
-                next_q_tot = next_q_tot.squeeze(-1) + nv
+                next_full_q_heads = nq_heads + nv.unsqueeze(-1)
+                next_q_tot, _ = self.target_q_net.factorize_Q(next_full_q_heads, next_obs)
+                next_q_tot = next_q_tot.squeeze(-1)
             elif self.mix_type == "VDN":
                 next_q_tot = nq_heads.sum(dim=-1) + nv
             else:

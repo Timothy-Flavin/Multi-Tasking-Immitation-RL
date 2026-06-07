@@ -35,6 +35,7 @@ class SAC(nn.Module, Agent):
         sac_tau=0.05,
         initial_temperature=0.2,
         mode="V",  # V or Q
+        target_discrete_entropy_percentage=0.5,
     ):
         super(SAC, self).__init__()
         assert mode in [
@@ -44,6 +45,7 @@ class SAC(nn.Module, Agent):
         if discrete_action_dims is None:
             mode = "V"
         self.critic_mode = mode
+        self.target_discrete_entropy_percentage = target_discrete_entropy_percentage
         self.log_std_clamp_range = log_std_clamp_range
         self.actor_every = actor_every
         self.actor_ratio = actor_ratio
@@ -128,7 +130,8 @@ class SAC(nn.Module, Agent):
         self.target_entropy_d = 0.0
         if self.has_discrete and self.discrete_action_dims is not None:
             self.target_entropy_d = (
-                0.1 * float(np.sum(np.log(self.discrete_action_dims)))
+                self.target_discrete_entropy_percentage
+                * float(np.sum(np.log(self.discrete_action_dims)))
                 if self.has_discrete
                 else 0.0
             )
@@ -409,19 +412,20 @@ class SAC(nn.Module, Agent):
                         if self.has_continuous
                         else obs_t
                     )
-                    _, q1_heads_s, _ = self.Q1(in_vec_s)
-                    _, q2_heads_s, _ = self.Q2(in_vec_s)
+                    v1_s, q1_heads_s, _ = self.Q1(in_vec_s)
+                    v2_s, q2_heads_s, _ = self.Q2(in_vec_s)
 
-                    q_s_tot = obs_t.new_zeros(obs_t.shape[0])
+                    # Start from V(s, a_c); add E_pi_d[A] per head
+                    q_s_tot = torch.minimum(v1_s, v2_s).squeeze(-1)
                     if self.has_discrete:
                         for q1_h, q2_h in zip(q1_heads_s, q2_heads_s):
                             q_min_h = torch.minimum(q1_h, q2_h)
-                            q_s_tot += q_min_h.max(dim=-1)[0]
                             probs = F.softmax(
                                 q_min_h.detach() / alpha_d.detach(), dim=-1
                             )
                             log_probs = torch.log(probs + 1e-8)
                             d_neg_ent_q_mode += (probs * log_probs).sum(dim=-1)
+                            q_s_tot += (probs * q_min_h).sum(dim=-1)
 
                     actor_loss = (
                         alpha_c * (c_lp_agg if self.has_continuous else 0) - q_s_tot

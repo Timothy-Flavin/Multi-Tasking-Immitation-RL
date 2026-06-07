@@ -942,7 +942,7 @@ class PG(nn.Module, Agent):
                 get_value_fn=lambda o: self.expected_V(o)
             )
             
-            # Global returns for critic
+            # Global returns for critic — same D as scaled_importance; each head gets its own G
             G_critic, _ = self._weighted_gae(
                 rewards=rewards,
                 values=V,
@@ -955,14 +955,13 @@ class PG(nn.Module, Agent):
                 final_observations=buffer.final_observations,
                 get_value_fn=lambda o: self.expected_V(o)
             )
-            # Squeeze the trailing unit dimension produced by uniform-weight GAE
-            G_critic = G_critic.squeeze(-1)
+            # G_critic shape: [T, E, A, D]
 
         # Move all flat training arrays to device once — avoids per-mini-batch H2D transfers
         obs_flat      = obs.reshape(-1, self.obs_dim).to(self.device)
         actions_flat  = actions.reshape(-1, self.total_action_dims).to(self.device)
         gae_flat      = gae.reshape(-1, self.total_action_dims).to(self.device)
-        G_critic_flat = G_critic.reshape(-1).to(self.device)
+        G_critic_flat = G_critic.reshape(-1, self.total_action_dims).to(self.device)
 
         # Get old log probs for PPO clip (d/c_actions_f already on device from above)
         with torch.no_grad():
@@ -1019,14 +1018,13 @@ class PG(nn.Module, Agent):
                 mb_d_act = mb_actions[:, :len(self.discrete_action_dims)].long() if self.discrete_action_dims else None
                 mb_c_act = mb_actions[:, -self.continuous_action_dim:] if self.continuous_action_dim > 0 else None
 
-                # Critic Loss
+                # Critic Loss — per head: (V + A_h) regresses against G_h
                 mb_values, mb_d_adv, mb_c_adv = self.critic(mb_obs)
                 if mb_c_adv is not None:
                     mb_c_adv = torch.transpose(torch.stack(mb_c_adv, dim=0), 0, 1)
                 mb_adv_gathered = self._gather_observed_advantages(mb_d_adv, mb_c_adv, mb_d_act, mb_c_act)
-                mb_mixer_out = self.mixer(mb_adv_gathered, mb_obs)[0]
-                mb_Q = (mb_mixer_out + mb_values).squeeze(-1)
-                critic_loss = F.mse_loss(mb_Q, mb_G_critic)
+                mb_per_head_Q = mb_adv_gathered + mb_values  # [B, D]: V broadcast over D heads
+                critic_loss = F.mse_loss(mb_per_head_Q, mb_G_critic)  # [B, D] vs [B, D]
 
                 # Actor Loss — uses actual KL via _mix_actor_loss
                 (
@@ -1084,35 +1082,36 @@ class PG(nn.Module, Agent):
         n_d = len(d_adv) if d_adv is not None else 0
         n_c = c_adv.shape[1] if c_adv is not None else 0
         ref = d_adv[0] if d_adv is not None else c_adv
-        out = ref.new_zeros(ref.shape[0], n_d + n_c)
-        for h in range(n_d):
-            out[:, h] = d_adv[h].gather(dim=-1, index=d_actions[:, h].unsqueeze(-1)).squeeze(-1)
+        out = ref.new_zeros(ref.shape[0], n_c + n_d)
+        # Continuous first — must match [cont, disc] ordering of _log_probs_per_dim
         if c_adv is not None:
             c_indices = self._bin_continuous_actions(c_actions)
-            out[:, n_d:] = c_adv.gather(dim=-1, index=c_indices.unsqueeze(-1)).squeeze(-1)
+            out[:, :n_c] = c_adv.gather(dim=-1, index=c_indices.unsqueeze(-1)).squeeze(-1)
+        for h in range(n_d):
+            out[:, n_c + h] = d_adv[h].gather(dim=-1, index=d_actions[:, h].unsqueeze(-1)).squeeze(-1)
         return out
 
     def _max_advantages(self, d_adv, c_adv):
         n_d = len(d_adv) if d_adv is not None else 0
         n_c = c_adv.shape[1] if c_adv is not None else 0
         ref = d_adv[0] if d_adv is not None else c_adv
-        out = ref.new_zeros(ref.shape[0], n_d + n_c)
-        for h in range(n_d):
-            out[:, h] = d_adv[h].max(dim=-1).values
+        out = ref.new_zeros(ref.shape[0], n_c + n_d)
         if c_adv is not None:
-            out[:, n_d:] = c_adv.max(dim=-1).values
+            out[:, :n_c] = c_adv.max(dim=-1).values
+        for h in range(n_d):
+            out[:, n_c + h] = d_adv[h].max(dim=-1).values
         return out
 
     def _gather_importance(self, d_adv, c_adv):
         n_d = len(d_adv) if d_adv is not None else 0
         n_c = c_adv.shape[1] if c_adv is not None else 0
         ref = d_adv[0] if d_adv is not None else c_adv
-        out = ref.new_zeros(ref.shape[0], n_d + n_c)
+        out = ref.new_zeros(ref.shape[0], n_c + n_d)
+        if c_adv is not None:
+            out[:, :n_c] = c_adv.max(dim=-1).values - c_adv.min(dim=-1).values
         for h in range(n_d):
             adv_h = d_adv[h].detach()
-            out[:, h] = adv_h.max(dim=-1).values - adv_h.min(dim=-1).values
-        if c_adv is not None:
-            out[:, n_d:] = c_adv.max(dim=-1).values - c_adv.min(dim=-1).values
+            out[:, n_c + h] = adv_h.max(dim=-1).values - adv_h.min(dim=-1).values
         return out
 
     def _update_importance(self):
