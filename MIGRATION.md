@@ -61,16 +61,19 @@ buffer = ReplayBuffer(
 )
 ```
 
-**Adding transitions** — inputs must be shaped `[n_agents, n_envs, ...]`:
+**Adding transitions** — inputs must be shaped `[n_envs, n_agents, ...]`,
+matching the `[E, A, O]` order that vectorized environments naturally produce.
+For single-agent scenarios add the agent dimension in position 1:
 
 ```python
+# obs from envpool/gym-vec is [n_envs, obs_dim]
 buffer.add(
-    obs=obs[np.newaxis, ...],            # [1, 64, obs_dim]
-    next_obs=next_obs[np.newaxis, ...],  # [1, 64, obs_dim]
-    action=actions,                      # [1, 64, action_dim]
-    reward=rewards[np.newaxis, ...],     # [1, 64]
-    term=terminations[np.newaxis, ...],  # [1, 64]
-    trunc=truncations[np.newaxis, ...],  # [1, 64]
+    obs=obs[:, np.newaxis, :],           # [64, 1, obs_dim]
+    next_obs=next_obs[:, np.newaxis, :], # [64, 1, obs_dim]
+    action=actions,                      # [64, 1, action_dim]
+    reward=rewards[:, np.newaxis],       # [64, 1]
+    term=terminations[:, np.newaxis],    # [64, 1]
+    trunc=truncations[:, np.newaxis],    # [64, 1]
 )
 ```
 
@@ -214,12 +217,12 @@ The new `train_actions` also accepts **3D observations** directly:
 # Single env — shape [obs_dim]  or  [B, obs_dim]
 act = agent.train_actions(obs)
 
-# Multi-env — shape [n_agents, n_envs, obs_dim]; results are also 3D
-obs_t = torch.as_tensor(obs).unsqueeze(0)   # [1, n_envs, obs_dim]
+# Multi-env — shape [n_envs, n_agents, obs_dim] per [T,E,A,O] spec; results are also [E,A,...]
+obs_t = torch.as_tensor(obs).unsqueeze(1)   # [n_envs, 1, obs_dim]  ← agent dim at position 1
 act = agent.train_actions(obs_t)
-# act["discrete_actions"]  shape: [1, n_envs, n_heads]
-# act["continuous_actions"] shape: [1, n_envs, n_cont_dims] or None
-# act["values"]             shape: [1, n_envs, 1]
+# act["discrete_actions"]  shape: [n_envs, 1, n_heads]
+# act["continuous_actions"] shape: [n_envs, 1, n_cont_dims] or None
+# act["values"]             shape: [n_envs, 1]
 ```
 
 ### `reinforcement_learn` changes

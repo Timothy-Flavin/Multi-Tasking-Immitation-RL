@@ -57,7 +57,7 @@ def _make_model(cfg, device):
         return PG(**kw)
     elif algo == "SAC":
         kw = common.copy()
-        kw.update(dict(mode=cfg.get("mode")))
+        kw.update(dict(mode=cfg.get("mode"), target_discrete_entropy_percentage=0.1))
         return SAC(**kw)
     elif algo == "DQN":
         kw = common.copy()

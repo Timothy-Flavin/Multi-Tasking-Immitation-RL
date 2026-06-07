@@ -8,6 +8,8 @@ __pycache__/
 *.png
 old_results
 profile_results
+lander_results
+dependence_results
 # C extensions
 *.so
 
