@@ -52,13 +52,13 @@ STEPS_ON_POLICY = 600_000  # PPO
 UPDATES_PER_STEP = NUM_ENVS // 8
 
 CONFIGS = {
-    "PPO_shared_nomix": dict(algo="PPO", mix_type=None),
-    "PPO_VDN": dict(algo="PPO", mix_type="VDN"),
-    "PPO_QMIX": dict(algo="PPO", mix_type="QMIX", mixer_dim=64),
-    "PPO_VDN_offline": dict(algo="PPO", mix_type="VDN", offline_critic=True),
-    "PPO_QMIX_offline": dict(algo="PPO", mix_type="QMIX", mixer_dim=64, offline_critic=True),
-    "SAC_Q": dict(algo="SAC", mode="Q"),
-    "SAC_V": dict(algo="SAC", mode="V"),
+    #"PPO_shared_nomix": dict(algo="PPO", mix_type=None),
+    #"PPO_VDN": dict(algo="PPO", mix_type="VDN"),
+    #"PPO_QMIX": dict(algo="PPO", mix_type="QMIX", mixer_dim=64),
+    #"PPO_VDN_offline": dict(algo="PPO", mix_type="VDN", offline_critic=True),
+    #"PPO_QMIX_offline": dict(algo="PPO", mix_type="QMIX", mixer_dim=64, offline_critic=True),
+    #"SAC_Q": dict(algo="SAC", mode="Q"),
+    #"SAC_V": dict(algo="SAC", mode="V"),
     "DQN_shared_nomix": dict(algo="DQN", mix_type=None),
     "DQN_VDN": dict(algo="DQN", mix_type="VDN"),
     "DQN_QMIX": dict(algo="DQN", mix_type="QMIX", mixer_dim=64),

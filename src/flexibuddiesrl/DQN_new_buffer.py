@@ -243,18 +243,17 @@ class DQN(nn.Module, Agent):
         
         importance_raw = None
         if self.mix_type == "QMIX":
-            full_q_heads = q_heads + v.unsqueeze(-1)
-            current_q_tot, _ = self.q_net.factorize_Q(full_q_heads, obs, with_grad=False)
-            current_q_tot = current_q_tot.squeeze(-1)
+            current_q_tot, _ = self.q_net.factorize_Q(q_heads, obs, with_grad=False)
+            current_q_tot = current_q_tot.squeeze(-1) + v
 
-            full_q_detached = full_q_heads.detach().clone()
-            full_q_detached.requires_grad = True
-            _, q_grads = self.q_net.factorize_Q(full_q_detached, obs, with_grad=True)
+            q_heads_detached = q_heads.detach().clone()
+            q_heads_detached.requires_grad = True
+            _, q_grads = self.q_net.factorize_Q(q_heads_detached, obs, with_grad=True)
             self.q_net.zero_grad()
             if q_grads is not None:
-                importance_raw = (full_q_detached.detach() * q_grads).cpu().numpy()
+                importance_raw = (q_heads_detached.detach() * q_grads).cpu().numpy()
             else:
-                importance_raw = np.zeros_like(full_q_detached.detach().cpu().numpy())
+                importance_raw = np.zeros_like(q_heads_detached.detach().cpu().numpy())
         elif self.mix_type == "VDN":
             current_q_tot = q_heads.sum(dim=-1) + v
         else:
@@ -288,9 +287,8 @@ class DQN(nn.Module, Agent):
             nv = next_values.squeeze(-1)
 
             if self.mix_type == "QMIX":
-                next_full_q_heads = nq_heads + nv.unsqueeze(-1)
-                next_q_tot, _ = self.target_q_net.factorize_Q(next_full_q_heads, next_obs)
-                next_q_tot = next_q_tot.squeeze(-1)
+                next_q_tot, _ = self.target_q_net.factorize_Q(nq_heads, next_obs)
+                next_q_tot = next_q_tot.squeeze(-1) + nv
             elif self.mix_type == "VDN":
                 next_q_tot = nq_heads.sum(dim=-1) + nv
             else:
@@ -309,7 +307,12 @@ class DQN(nn.Module, Agent):
                         log_pi = Categorical(
                             logits=d_adv[i].detach() / self.entropy_loss_coef
                         ).log_prob(actions[:, idx].long())
-                        target_q = target_q + self.entropy_loss_coef * self.munchausen * log_pi
+                        
+                        inc = self.entropy_loss_coef * self.munchausen * log_pi
+                        if self.mix_type is None:
+                            target_q[:, i] = target_q[:, i] + inc
+                        else:
+                            target_q = target_q + inc
                         idx += 1
                 if self.continuous_action_dims:
                     for i in range(self.continuous_action_dims):
@@ -320,7 +323,12 @@ class DQN(nn.Module, Agent):
                         log_pi = torch.log_softmax(
                             c_adv[i].detach() / self.entropy_loss_coef, dim=-1
                         ).gather(dim=-1, index=bin_idx.unsqueeze(-1)).squeeze(-1)
-                        target_q = target_q + self.entropy_loss_coef * self.munchausen * log_pi
+                        
+                        inc = self.entropy_loss_coef * self.munchausen * log_pi
+                        if self.mix_type is None:
+                            target_q[:, len(self.discrete_action_dims or []) + i] = target_q[:, len(self.discrete_action_dims or []) + i] + inc
+                        else:
+                            target_q = target_q + inc
                         idx += 1
             
         loss = F.mse_loss(current_q_tot, target_q)
@@ -422,16 +430,32 @@ class DQN(nn.Module, Agent):
             obs = T(obs, device=self.device)
         with torch.no_grad():
             values, d_adv, c_adv = self.q_net(obs)
-            # For DQN, V is usually mean of Q or max Q. Original Agent.py often does this.
-            # Let's use max Q as V.
             v = values.squeeze(-1)
+
+            nq_list = []
             if d_adv:
                 for head in d_adv:
-                    v = v + head.max(dim=-1).values
+                    nq_list.append(head.max(dim=-1).values.unsqueeze(-1))
             if c_adv:
                 for head in c_adv:
-                    v = v + head.max(dim=-1).values
-            return v
+                    nq_list.append(head.max(dim=-1).values.unsqueeze(-1))
+            
+            if not nq_list:
+                return v
+
+            nq_heads = torch.cat(nq_list, dim=-1)
+
+            if self.mix_type == "QMIX":
+                v_mix, _ = self.q_net.factorize_Q(nq_heads, obs)
+                return v + v_mix.squeeze(-1)
+            elif self.mix_type == "VDN":
+                return v + nq_heads.sum(dim=-1)
+            else:
+                # For independent DQN, V is usually max(Q) of a single head or mean of max(Q)s.
+                # Let's use the sum of max advantages + V for consistency with the nomix case in RL.
+                # Actually, nomix in RL trains each head independently. 
+                # Returning the mean max Q across heads is a reasonable estimate of V.
+                return v + nq_heads.mean(dim=-1)
 
     def stable_greedy(self, obs, legal_action):
         acts = self.train_actions(obs, action_mask=legal_action, epsilon=0.0)
