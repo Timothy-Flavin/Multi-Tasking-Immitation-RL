@@ -1214,7 +1214,7 @@ class QS(nn.Module):
                     else:
                         disc_advantages[-1] = disc_advantages[-1] - disc_advantages[
                             -1
-                        ].mean(dim=-1, keepdim=True)
+                        ].max(dim=-1, keepdim=True).values
                 if single_dim:
                     disc_advantages[-1] = disc_advantages[-1].squeeze(0)
                 start = end
@@ -1231,7 +1231,7 @@ class QS(nn.Module):
                         weighted_mean = (pi * adv).sum(dim=-1, keepdim=True)
                         adv = adv - weighted_mean
                     else:
-                        adv = adv - adv.mean(dim=-1, keepdim=True)
+                        adv = adv - adv.max(dim=-1, keepdim=True).values
                 if single_dim:
                     adv = adv.squeeze(0)
                 cont_advantages.append(adv)
