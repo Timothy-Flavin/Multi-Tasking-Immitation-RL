@@ -43,12 +43,15 @@ class DQN(nn.Module, Agent):
         head_hidden_dims=[128],
         encoder=None,
         mix_type=None,
-        QMIX_hidden_dim=64,
+        QMIX_hidden_dim=128,
         orthogonal=True,
         entropy=0.0,
         munchausen=0.0,
         imitation_type="cross_entropy",
         imitation_lr=1e-5,
+        grad_clip=10.0,
+        detach_mixer_state=True,
+        merge_v_into_heads=False,
     ):
         super(DQN, self).__init__()
         self.config = locals()
@@ -63,6 +66,9 @@ class DQN(nn.Module, Agent):
         self.gamma = gamma
         self.device = device
         self.tau = tau
+        self.grad_clip = grad_clip
+        self.detach_mixer_state = detach_mixer_state
+        self.merge_v_into_heads = merge_v_into_heads
         self.dueling = dueling
         self.target_update_interval = target_update_interval
         self.batch_size = batch_size
@@ -140,6 +146,10 @@ class DQN(nn.Module, Agent):
         ).to(self.device)
         
         self.target_q_net.load_state_dict(self.q_net.state_dict())
+        # Canonical-QMIX gradient structure: don't let TD loss flow into the
+        # agent trunk through the mixer's state-conditioning path.
+        self.q_net.detach_mixer_state = self.detach_mixer_state
+        self.target_q_net.detach_mixer_state = self.detach_mixer_state
         self.optimizer = torch.optim.Adam(self.q_net.parameters(), lr=self.lr)
         self.steps = 0
 
@@ -250,9 +260,15 @@ class DQN(nn.Module, Agent):
             # mixer) and feeds the mixer symmetric-around-0 inputs that the
             # asymmetric leaky_relu cannot represent on the negative side, which
             # drives the bootstrapped-target divergence (see report H3).
-            q_heads_full = q_heads + v.unsqueeze(-1)
-            current_q_tot, _ = self.q_net.factorize_Q(q_heads_full, obs, with_grad=False)
-            current_q_tot = current_q_tot.squeeze(-1)  # value already inside Q_h
+            if self.merge_v_into_heads:
+                q_heads_full = q_heads + v.unsqueeze(-1)
+                current_q_tot, _ = self.q_net.factorize_Q(q_heads_full, obs, with_grad=False)
+                current_q_tot = current_q_tot.squeeze(-1)  # value already inside Q_h
+            else:
+                # Original formulation: mix bare (mean-centred) advantages, add V outside.
+                q_heads_full = q_heads
+                current_q_tot, _ = self.q_net.factorize_Q(q_heads_full, obs, with_grad=False)
+                current_q_tot = current_q_tot.squeeze(-1) + v
 
             q_heads_detached = q_heads_full.detach().clone()
             q_heads_detached.requires_grad = True
@@ -297,9 +313,13 @@ class DQN(nn.Module, Agent):
             if self.mix_type == "QMIX":
                 # Merge V and A on the target side too: max_a Q_h = V(s') + max_a A_h
                 # (V is constant across actions), then mix the per-head Q-values.
-                nq_heads_full = nq_heads + nv.unsqueeze(-1)
-                next_q_tot, _ = self.target_q_net.factorize_Q(nq_heads_full, next_obs)
-                next_q_tot = next_q_tot.squeeze(-1)
+                if self.merge_v_into_heads:
+                    nq_heads_full = nq_heads + nv.unsqueeze(-1)
+                    next_q_tot, _ = self.target_q_net.factorize_Q(nq_heads_full, next_obs)
+                    next_q_tot = next_q_tot.squeeze(-1)
+                else:
+                    next_q_tot, _ = self.target_q_net.factorize_Q(nq_heads, next_obs)
+                    next_q_tot = next_q_tot.squeeze(-1) + nv
             elif self.mix_type == "VDN":
                 next_q_tot = nq_heads.sum(dim=-1) + nv
             else:
@@ -346,13 +366,23 @@ class DQN(nn.Module, Agent):
 
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
+        # Gradient-norm clipping. The PG path already clips (0.5); the DQN path
+        # did not.  VDN's *linear* mixing tolerates the missing clip, but the
+        # QMIX hypernetwork produces large, state-coupled gradients that, under
+        # bootstrapping, ratchet the weights up (deadly triad) and diverge.
+        # This is the standard QMIX safeguard (pymarl clips at 10), not a value
+        # clamp on the Q targets.
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            self.q_net.parameters(),
+            self.grad_clip if self.grad_clip and self.grad_clip > 0 else float("inf"),
+        )
         self.optimizer.step()
 
         if self.steps % self.target_update_interval == 0:
             for target_param, param in zip(self.target_q_net.parameters(), self.q_net.parameters()):
                 target_param.data.lerp_(param.data, self.tau)
                 
-        res = {"rl_loss": loss.item()}
+        res = {"rl_loss": loss.item(), "grad_norm": float(grad_norm)}
         if importance_raw is not None:
             res["importance_raw"] = importance_raw
         return res

@@ -1121,6 +1121,16 @@ class QS(nn.Module):
         assert (
             self.mixing_network is not None
         ), "Cant qmix factorize q values if the mixing network has not been initialized"
+        # Canonical QMIX feeds the mixing hypernetwork a *fixed external state*,
+        # so no TD-loss gradient flows from the mixer back into the agent trunk
+        # via the state path.  Here the "state" is the agent's own co-adapting
+        # head_embedding, which opens a feedback loop: the net can cut TD loss by
+        # jointly inflating features AND the state-conditioned mixer gain, which
+        # diverges under bootstrapping.  Detaching the hypernetwork's state input
+        # restores the canonical gradient structure (mixer weights still learn;
+        # the trunk learns only through the agent-Q inputs).
+        if getattr(self, "detach_mixer_state", False):
+            state = state.detach()
         return self.mixing_network(qs, state, with_grad=with_grad)
 
     def forward(self, x, action_mask=None, policy_weights=None):
