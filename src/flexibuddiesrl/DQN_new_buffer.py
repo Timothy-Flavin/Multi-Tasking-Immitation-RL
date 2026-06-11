@@ -243,10 +243,18 @@ class DQN(nn.Module, Agent):
         
         importance_raw = None
         if self.mix_type == "QMIX":
-            current_q_tot, _ = self.q_net.factorize_Q(q_heads, obs, with_grad=False)
-            current_q_tot = current_q_tot.squeeze(-1) + v
+            # Merge V and A: feed per-head action-values Q_h = V(s) + A_h(s,a_h)
+            # into the monotone mixer (standard QMIX over Q-values) instead of
+            # mixing bare mean-centred advantages and adding a separate V.  The
+            # latter is non-identifiable (a constant floats between V and the
+            # mixer) and feeds the mixer symmetric-around-0 inputs that the
+            # asymmetric leaky_relu cannot represent on the negative side, which
+            # drives the bootstrapped-target divergence (see report H3).
+            q_heads_full = q_heads + v.unsqueeze(-1)
+            current_q_tot, _ = self.q_net.factorize_Q(q_heads_full, obs, with_grad=False)
+            current_q_tot = current_q_tot.squeeze(-1)  # value already inside Q_h
 
-            q_heads_detached = q_heads.detach().clone()
+            q_heads_detached = q_heads_full.detach().clone()
             q_heads_detached.requires_grad = True
             _, q_grads = self.q_net.factorize_Q(q_heads_detached, obs, with_grad=True)
             self.q_net.zero_grad()
@@ -287,8 +295,11 @@ class DQN(nn.Module, Agent):
             nv = next_values.squeeze(-1)
 
             if self.mix_type == "QMIX":
-                next_q_tot, _ = self.target_q_net.factorize_Q(nq_heads, next_obs)
-                next_q_tot = next_q_tot.squeeze(-1) + nv
+                # Merge V and A on the target side too: max_a Q_h = V(s') + max_a A_h
+                # (V is constant across actions), then mix the per-head Q-values.
+                nq_heads_full = nq_heads + nv.unsqueeze(-1)
+                next_q_tot, _ = self.target_q_net.factorize_Q(nq_heads_full, next_obs)
+                next_q_tot = next_q_tot.squeeze(-1)
             elif self.mix_type == "VDN":
                 next_q_tot = nq_heads.sum(dim=-1) + nv
             else:
@@ -446,8 +457,9 @@ class DQN(nn.Module, Agent):
             nq_heads = torch.cat(nq_list, dim=-1)
 
             if self.mix_type == "QMIX":
-                v_mix, _ = self.q_net.factorize_Q(nq_heads, obs)
-                return v + v_mix.squeeze(-1)
+                # Merge V and A: mix per-head Q_h = V + max_a A_h (value already inside)
+                q_mix, _ = self.q_net.factorize_Q(nq_heads + v.unsqueeze(-1), obs)
+                return q_mix.squeeze(-1)
             elif self.mix_type == "VDN":
                 return v + nq_heads.sum(dim=-1)
             else:

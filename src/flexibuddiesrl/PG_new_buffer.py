@@ -229,14 +229,14 @@ class PG(nn.Module, Agent):
         if self.continuous_action_dim > 0:
             c_actions = actions[:, -self.continuous_action_dim:]
 
-        values, d_adv, c_adv = self.critic(obs)
+        values, d_adv, c_adv = self.critic(obs, policy_weights=self._critic_policy_weights(obs))
         if c_adv is not None:
             c_adv = torch.transpose(torch.stack(c_adv, dim=0), 0, 1)
         adv = self._gather_observed_advantages(d_adv, c_adv, d_actions, c_actions)
         Q = (self.mixer(adv, obs)[0] + values).squeeze(-1)
 
         with torch.no_grad():
-            next_values, next_d_adv, next_c_adv = self.critic(obs_)
+            next_values, next_d_adv, next_c_adv = self.critic(obs_, policy_weights=self._critic_policy_weights(obs_))
             if self.on_policy_mixer:
                 next_Q = next_values.squeeze(-1)
             else:
@@ -278,8 +278,14 @@ class PG(nn.Module, Agent):
                 QMIX_hidden_dim=0,
             ).to(self.device)
         elif self.mix_type == "QMIX":
+            # QPLEX-style separation: the dueling V head is the *only* state-value
+            # term, so the mixer must satisfy Mixer(0; s) = 0.  Disabling both the
+            # internal bias b1 and the final bias b2 guarantees this (b2 alone is a
+            # second V(s); b1 leaks through leaky_relu as leaky_relu(b1)*w2 != 0).
+            # Mirrors the QS internal mixer (use_b1/b2 = not dueling).
             self.mixer = QMixer(
-                self.total_action_dims, self.obs_dim, mixing_embed_dim=self.mixer_dim
+                self.total_action_dims, self.obs_dim, mixing_embed_dim=self.mixer_dim,
+                use_b1=False, use_b2=False,
             ).to(self.device)
             self.critic = QS(
                 obs_dim=self.obs_dim,
@@ -749,6 +755,20 @@ class PG(nn.Module, Agent):
 
     def _mix_critic_only(self, buffer: RolloutBuffer, last_values: torch.Tensor,
                          last_terminations: np.ndarray, last_truncations: np.ndarray):
+        if self.use_offline_critic_buffer:
+            # Offline TD critic update — mixer stays in the loss so it is trained too.
+            self._add_batch_to_offline_buffer(buffer)
+            critic_loss = self._offline_critic_loss()
+            self.optimizer.zero_grad(set_to_none=True)
+            critic_loss.backward()
+            if self.clip_grad:
+                torch.nn.utils.clip_grad_norm_(self.critic.parameters(), 0.5)
+                if self.mixer is not None and self.mix_type == "QMIX":
+                    torch.nn.utils.clip_grad_norm_(self.mixer.parameters(), 0.5)
+            self.optimizer.step()
+            self.result_dict["rl_critic_loss"] = critic_loss.item()
+            return self.result_dict
+
         obs = buffer.observations[:buffer.pos]
         actions = buffer.actions[:buffer.pos]
         rewards = buffer.rewards[:buffer.pos]
@@ -760,7 +780,7 @@ class PG(nn.Module, Agent):
         d_actions_f = actions[:, :, :, :len(self.discrete_action_dims)].reshape(-1, len(self.discrete_action_dims)).long().to(self.device) if self.discrete_action_dims else None
         c_actions_f = actions[:, :, :, -self.continuous_action_dim:].reshape(-1, self.continuous_action_dim).to(self.device) if self.continuous_action_dim > 0 else None
 
-        values_f, d_adv_f, c_adv_f = self.critic(obs_f)
+        values_f, d_adv_f, c_adv_f = self.critic(obs_f, policy_weights=self._critic_policy_weights(obs_f))
         if c_adv_f is not None:
             c_adv_f = torch.transpose(torch.stack(c_adv_f, dim=0), 0, 1)
         adv_f = self._gather_observed_advantages(d_adv_f, c_adv_f, d_actions_f, c_actions_f)
@@ -878,9 +898,10 @@ class PG(nn.Module, Agent):
 
         # Calculate Mixer Gradients for Importance
         with torch.no_grad():
-            # Flatten to [T*E*A, ...] for critic call
+            # Flatten to [T*E*A, ...] for critic call. Centre advantages by the
+            # current policy (E_pi[A_h]=0) so V targets V^pi (AppendixA Asm. 2).
             obs_f = obs.reshape(-1, self.obs_dim).to(self.device)
-            values_f, d_adv_f, c_adv_f = self.critic(obs_f)
+            values_f, d_adv_f, c_adv_f = self.critic(obs_f, policy_weights=self._critic_policy_weights(obs_f))
 
             if c_adv_f is not None:
                 c_adv_f = torch.transpose(torch.stack(c_adv_f, dim=0), 0, 1)
@@ -1004,19 +1025,22 @@ class PG(nn.Module, Agent):
                 mb_d_act = mb_actions[:, :len(self.discrete_action_dims)].long() if self.discrete_action_dims else None
                 mb_c_act = mb_actions[:, -self.continuous_action_dim:] if self.continuous_action_dim > 0 else None
 
-                # Critic Loss
+                # Critic Loss — both branches route through the mixer so the
+                # critic AND mixer parameters receive gradient signal.
                 if self.use_offline_critic_buffer:
-                    # 1-step TD from the internal replay buffer; QMIX stays in the loop
-                    # so its hypernetwork parameters receive gradient signal.
+                    # 1-step TD from the internal replay buffer; QMIX stays in the
+                    # loop so its hypernetwork parameters are trained.
                     critic_loss = self._offline_critic_loss()
                 else:
-                    # Per-head on-policy: (V + A_h) regresses against importance-weighted G_h
-                    mb_values, mb_d_adv, mb_c_adv = self.critic(mb_obs)
+                    # On-policy: Q_tot = mixer(observed per-head advantages; s) + V(s)
+                    # regresses against the global GAE return (G_critic uses ones
+                    # weights, so every head holds the same scalar return).
+                    mb_values, mb_d_adv, mb_c_adv = self.critic(mb_obs, policy_weights=self._critic_policy_weights(mb_obs))
                     if mb_c_adv is not None:
                         mb_c_adv = torch.transpose(torch.stack(mb_c_adv, dim=0), 0, 1)
                     mb_adv_gathered = self._gather_observed_advantages(mb_d_adv, mb_c_adv, mb_d_act, mb_c_act)
-                    mb_per_head_Q = mb_adv_gathered + mb_values  # [B, D]
-                    critic_loss = F.mse_loss(mb_per_head_Q, mb_G_critic)  # [B, D] vs [B, D]
+                    mb_Q_tot = (self.mixer(mb_adv_gathered, mb_obs)[0] + mb_values).squeeze(-1)  # [B]
+                    critic_loss = F.mse_loss(mb_Q_tot, mb_G_critic[:, 0])  # [B] vs [B]
 
                 # Actor Loss — uses actual KL via _mix_actor_loss
                 (
@@ -1069,6 +1093,56 @@ class PG(nn.Module, Agent):
         bin_indices = torch.round((c_actions - min_actions) / bin_width)
         bin_indices = bin_indices.clamp(0, n_bins - 1)
         return bin_indices.long()
+
+    def _critic_policy_weights(self, obs):
+        """Current-policy probabilities over each head's bins, used to centre the
+        dueling critic's advantages by E_pi[A_h] = 0 instead of the uniform mean.
+
+        This enforces AppendixA Assumption 2 (on-policy advantage normalisation),
+        which is what lets the dueling V head target the true on-policy value
+        V^pi(s) (QPLEX-style: value held separate, mixer acts on advantages).
+        The weights are stop-gradient (constants w.r.t. the policy parameters).
+        """
+        with torch.no_grad():
+            c_means, c_lstd_logits, d_logits = self.actor(obs)
+            disc = None
+            if self.discrete_action_dims is not None:
+                disc = [torch.softmax(lg, dim=-1) for lg in d_logits]
+            cont = None
+            if self.continuous_action_dim > 0:
+                cont = self._continuous_bin_probs(c_means, c_lstd_logits)
+        return {"discrete": disc, "continuous": cont}
+
+    def _continuous_bin_probs(self, c_means, c_lstd_logits):
+        """Probability mass the (squashed) Gaussian policy assigns to each
+        advantage bin, per continuous dim — mirrors QS's binning so the centering
+        weight matches the head it centres."""
+        if self.actor_logstd is not None:
+            lstd = self._smooth_clamp_logstd().expand_as(c_means)
+        else:
+            lstd = c_lstd_logits.expand_as(c_means)
+        std = torch.exp(lstd)
+        bins = self.critic.c_action_bins  # one entry per continuous dim
+        B = c_means.shape[0]
+        probs = []
+        for i in range(self.continuous_action_dim):
+            n_bins = bins[i]
+            mn = self.min_actions[i]
+            mx = self.max_actions[i]
+            bw = (mx - mn) / (n_bins - 1)
+            centers = mn + torch.arange(n_bins, device=self.device, dtype=c_means.dtype) * bw
+            edges = (centers[:-1] + centers[1:]) * 0.5  # interior edges, action space
+            if self.action_clamp_type == "tanh":
+                z = torch.atanh(torch.clamp(minmaxnorm(edges, mn, mx), -(1 - 1e-6), 1 - 1e-6))
+            else:
+                z = edges
+            dist = torch.distributions.Normal(loc=c_means[:, i:i + 1], scale=std[:, i:i + 1])
+            cdf = dist.cdf(z.unsqueeze(0))  # [B, n_bins-1]
+            lo = torch.zeros(B, 1, device=self.device, dtype=cdf.dtype)
+            hi = torch.ones(B, 1, device=self.device, dtype=cdf.dtype)
+            cdf_full = torch.cat([lo, cdf, hi], dim=-1)  # [B, n_bins+1]
+            probs.append(cdf_full[:, 1:] - cdf_full[:, :-1])  # [B, n_bins]
+        return probs
 
     def _gather_observed_advantages(self, d_adv, c_adv, d_actions, c_actions):
         n_d = len(d_adv) if d_adv is not None else 0

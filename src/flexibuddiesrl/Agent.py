@@ -845,7 +845,7 @@ class QMixer(nn.Module):
     Monotonicity is enforced by constraining these weights to be non-negative.
     """
 
-    def __init__(self, n_agents: int, state_dim: int, mixing_embed_dim: int = 64, use_biases: bool = True):
+    def __init__(self, n_agents: int, state_dim: int, mixing_embed_dim: int = 64, use_b1: bool = True, use_b2: bool = True):
         """
         Initializes the QMixer network.
 
@@ -853,14 +853,16 @@ class QMixer(nn.Module):
             n_agents (int): The number of agents in the team.
             state_dim (int): The dimension of the global state.
             mixing_embed_dim (int): The dimension of the mixing network's hidden layer.
-            use_biases (bool): Whether to use state-dependent biases (b1, b2).
+            use_b1 (bool): Whether to use the internal state-dependent bias (b1).
+            use_b2 (bool): Whether to use the final state-dependent bias (b2, V(s) term).
         """
         super(QMixer, self).__init__()
 
         self.n_agents = n_agents
         self.state_dim = state_dim
         self.embed_dim = mixing_embed_dim
-        self.use_biases = use_biases
+        self.use_b1 = use_b1
+        self.use_b2 = use_b2
 
         # Hypernetwork for the first mixing layer's weights
         # It generates a weight matrix of shape (n_agents, mixing_embed_dim)
@@ -868,7 +870,7 @@ class QMixer(nn.Module):
 
         # Hypernetwork for the first mixing layer's bias
         self.hyper_b1 = None
-        if self.use_biases:
+        if self.use_b1:
             self.hyper_b1 = nn.Linear(self.state_dim, self.embed_dim)
 
         # Hypernetwork for the second mixing layer's weights
@@ -877,7 +879,7 @@ class QMixer(nn.Module):
 
         # State-dependent bias for the final output (V(s) term)
         self.hyper_b2 = None
-        if self.use_biases:
+        if self.use_b2:
             self.hyper_b2 = nn.Sequential(
                 nn.Linear(self.state_dim, self.embed_dim),
                 nn.ReLU(),
@@ -905,26 +907,22 @@ class QMixer(nn.Module):
         # --- Generate weights and biases from the state using hypernetworks ---
 
         # First layer weights and biases
-        # Enforce non-negativity on weights for monotonicity.
-        # softplus allows weights to approach 0 much more easily than abs(),
-        # which helps the mixer learn to *ignore* an agent when the state
-        # indicates its action is irrelevant (e.g. context-dependent credit).
-        w1 = F.softplus(self.hyper_w1(state))
+        w1 = torch.abs(self.hyper_w1(state))
         b1 = self.hyper_b1(state) if self.hyper_b1 is not None else 0
 
         # Second layer weights and the final bias (V(s))
-        w2 = F.softplus(self.hyper_w2(state))
+        w2 = torch.abs(self.hyper_w2(state))
         b2 = self.hyper_b2(state) if self.hyper_b2 is not None else 0
 
         # --- Reshape for batch matrix multiplication ---
 
         # Reshape weights and biases to match linear layer dimensions
         w1 = w1.view(batch_size, self.n_agents, self.embed_dim)
-        if self.use_biases:
+        if self.use_b1:
             b1 = b1.view(batch_size, 1, self.embed_dim)
 
         w2 = w2.view(batch_size, self.embed_dim, 1)
-        if self.use_biases:
+        if self.use_b2:
             b2 = b2.view(batch_size, 1, 1)
 
         # Reshape agent Q-values for mixing
@@ -945,7 +943,6 @@ class QMixer(nn.Module):
             q_grads = agent_qs.grad
 
         return q_total.view(batch_size, -1), q_grads
-
 
 class VDNMixer(nn.Module):
     def __init__(self, n_agents: int, state_dim: int, mixing_embed_dim: int = 32):
@@ -998,7 +995,6 @@ class QS(nn.Module):
                  self.last_hidden_dim = encoder.out_features
             else:
                 # Fallback: assume the supplied obs_dim is actually the encoder's output dim
-                # if the user was being careful, but this is a bit fragile.
                 self.last_hidden_dim = obs_dim
         elif hidden_dims is not None:
             self.encoder = ffEncoder(
@@ -1017,14 +1013,6 @@ class QS(nn.Module):
                 ValueError(
                     "discrete_action_dims should not contain values less than 1, use [x] for a single discrete action with cardonality 'x'"
                 )
-
-        self.mixing_network = None
-        if self.QMIX:
-            qdim = (
-                len(discrete_action_dims) if discrete_action_dims is not None else 0
-            ) + continuous_action_dim
-            # If dueling is active, the value is added separately, so we disable the mixer bias
-            self.mixing_network = QMixer(qdim, self.last_hidden_dim, QMIX_hidden_dim, use_biases=not dueling)
 
         # setting needed self variables
         self.disc_action_dims = discrete_action_dims
@@ -1070,15 +1058,22 @@ class QS(nn.Module):
                 )
                 if orthogonal:
                     _orthogonal_init(joint_head_layers[-1])
-            # self.last_hidden_dim is NOT updated here anymore so it remains the input to joint_head_layers
-            # actually, advantage_heads needs the dimension AFTER joint_head_layers
-            # but we need the dimension BEFORE joint_head_layers for the mixer hypernets (or we fix mixer)
-            # Let's keep a separate variable for the head embedding dimension
             self.head_embedding_dim = head_hidden_dims[-1]
             self.joint_head_layers = nn.ModuleList(joint_head_layers)
         else:
             self.head_embedding_dim = self.last_hidden_dim
             self.joint_head_layers = None
+
+        self.mixing_network = None
+        if self.QMIX:
+            qdim = (
+                len(discrete_action_dims) if discrete_action_dims is not None else 0
+            ) + continuous_action_dim
+            # If dueling is active, the state value V(s) is added after the mixer.
+            # To ensure a clean decomposition Q_tot = V(s) + Mixer(A_1, ..., A_n),
+            # we disable all state-dependent biases in the mixer. 
+            # This ensures Mixer(0, ..., 0; s) = 0 and keeps advantages grounded.
+            self.mixing_network = QMixer(qdim, self.head_embedding_dim, QMIX_hidden_dim, use_b1=not dueling, use_b2=not dueling)
 
         # set up the adv heads if this isn't just a V network
         if self.cont_action_dim > 0 or self.disc_action_dims is not None:
@@ -1116,6 +1111,13 @@ class QS(nn.Module):
         if self.joint_head_layers is not None:
             for li in self.joint_head_layers:
                 state = torch.tanh(li(state))
+        
+        # Ensure 2D
+        if len(qs.shape) == 1:
+            qs = qs.unsqueeze(0)
+        if len(state.shape) == 1:
+            state = state.unsqueeze(0)
+
         assert (
             self.mixing_network is not None
         ), "Cant qmix factorize q values if the mixing network has not been initialized"
@@ -1157,7 +1159,7 @@ class QS(nn.Module):
             for li in self.joint_head_layers:
                 x = torch.tanh(li(x))
         if self.dueling and self.value_head is not None:
-            values = self.value_head(x[:, : self.last_hidden_dim // 2])
+            values = self.value_head(x[:, : self.head_embedding_dim // 2])
         
         if single_dim:
             values = values.squeeze(0)
@@ -1165,7 +1167,7 @@ class QS(nn.Module):
         # half the embedding belongs to the value head if dueling
         advantages = None
         if self.dueling and self.advantage_heads is not None:
-            advantages = self.advantage_heads(x[:, -self.last_hidden_dim // 2 :])
+            advantages = self.advantage_heads(x[:, -self.head_embedding_dim // 2 :])
         elif self.advantage_heads is not None:
             advantages = self.advantage_heads(x)
 
@@ -1187,8 +1189,12 @@ class QS(nn.Module):
                 end = start + dim
                 disc_advantages.append(advantages[:, start:end])
                 if self.dueling:
-                    # Centre advantages: policy-weighted mean if weights
-                    # are supplied, uniform mean otherwise.
+                    # Centre advantages: policy-weighted mean if weights are
+                    # supplied (adv -= sum(pi * adv)), uniform mean otherwise
+                    # (adv -= mean(adv)). Mean-centering is more stable than
+                    # max-centering: it grounds V(s) to E_a Q(s,a) under the
+                    # (assumed) policy rather than max_a Q(s,a), avoiding the
+                    # value/mixer drift that the noisier max estimate induces.
                     if disc_policy is not None and i < len(disc_policy):
                         pi = disc_policy[i].detach()  # (batch, cardinality_i)
                         weighted_mean = (pi * disc_advantages[-1]).sum(
@@ -1255,7 +1261,7 @@ class DuelingQSCA(nn.Module):
         xu = torch.cat([x, u], dim=-1)
         for i, head in enumerate(self.advantage_heads):
             Adv = head(xu)
-            Adv = Adv - Adv.mean(dim=-1, keepdim=True)
+            Adv = Adv - Adv.max(dim=-1, keepdim=True).values
             advantages.append(Adv)
         return values, advantages
 
