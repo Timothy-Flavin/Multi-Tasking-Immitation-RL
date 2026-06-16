@@ -561,6 +561,7 @@ class PG(nn.Module, Agent):
 
         if self.ppo_clip > 0:
             logratio = cont_log_probs - old_log_probs
+            logratio = torch.clamp(logratio, max=20.0)  # avoid exp overflow -> 0*inf NaN
             ratio = logratio.exp()
             pg_loss1 = advantages * ratio
             pg_loss2 = advantages * torch.clamp(
@@ -589,6 +590,7 @@ class PG(nn.Module, Agent):
             if self.ppo_clip > 0:
                 old_lp = log_probs[:, head]
                 logratio = selected_log_probs - old_lp
+                logratio = torch.clamp(logratio, max=20.0)  # avoid exp overflow -> 0*inf NaN
                 ratio = logratio.exp()
                 pg_loss1 = advantages.squeeze(-1) * ratio
                 pg_loss2 = advantages.squeeze(-1) * torch.clamp(
@@ -724,6 +726,9 @@ class PG(nn.Module, Agent):
                         old_d_dists, new_d_dists, old_c_dists, new_c_dists):
         """PPO clip loss with per-head advantages and joint KL penalty (legacy-equivalent)."""
         logratio = new_log_probs - old_log_probs
+        # Clamp before exp: a large logratio (policy moved far in one update) would
+        # overflow to +inf in fp32
+        logratio = torch.clamp(logratio, max=20.0)
         ratio = torch.exp(logratio)
         clip_ratio = torch.clamp(ratio, 1 - self.ppo_clip, 1 + self.ppo_clip)
         policy_loss = -(torch.min(advantages * ratio, advantages * clip_ratio).sum(-1)).mean()
