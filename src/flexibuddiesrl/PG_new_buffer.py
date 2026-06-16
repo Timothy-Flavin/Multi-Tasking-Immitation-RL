@@ -574,9 +574,9 @@ class PG(nn.Module, Agent):
             -self.policy_loss * continuous_policy_gradient.mean()
             - self.entropy_loss * cont_entropy
         )
-        al = self.logit_reg * (action_means[torch.abs(action_means) > 4.0] ** 2).mean()
-        if not torch.isnan(al):
-            actor_loss += al
+        large_means = action_means[torch.abs(action_means) > 4.0]
+        if large_means.numel() > 0:
+            actor_loss += self.logit_reg * (large_means ** 2).mean()
         self.result_dict["c_entropy"] += cont_entropy.item()
         return actor_loss
 
@@ -1219,9 +1219,11 @@ class PG(nn.Module, Agent):
             lp.append(torch.stack(discrete_lp_cols, dim=-1))
             
         lp = torch.cat(lp, dim=-1)
-        logit_reg = 0
+        logit_reg = torch.tensor(0.0, device=self.device)
         if self.continuous_action_dim > 0:
-            logit_reg = (continuous_means[torch.abs(continuous_means) > 4.0] ** 2).mean()
+            large_means = continuous_means[torch.abs(continuous_means) > 4.0]
+            if large_means.numel() > 0:
+                logit_reg = self.logit_reg * (large_means ** 2).mean()
         
         return lp, d_entropy, c_entropy, logit_reg, d_dists, c_dist
 

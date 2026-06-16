@@ -29,7 +29,14 @@ def get_multi_discrete_one_hot(x, discrete_action_dims, debug=False):
 
 
 def minmaxnorm(data, mins, maxes):
-    data_0_to_1 = (data - mins) / (maxes - mins)
+    diff = maxes - mins
+    # Handle the case where maxes == mins to avoid division by zero
+    if torch.is_tensor(diff):
+        diff = torch.where(diff == 0, torch.ones_like(diff), diff)
+    elif diff == 0:
+        diff = 1.0
+    
+    data_0_to_1 = (data - mins) / diff
     return data_0_to_1 * 2 - 1
 
 
