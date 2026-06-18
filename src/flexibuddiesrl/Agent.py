@@ -89,181 +89,10 @@ class Agent(ABC):
     def param_count(self) -> tuple[int, int]:
         return 0, 0  # train and execute param count
 
-
 def _orthogonal_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
     torch.nn.init.constant_(layer.bias, bias_const)
     return layer
-
-
-class ffEncoder(nn.Module):
-    def __init__(
-        self,
-        obs_dim,
-        hidden_dims,
-        activation="relu",
-        device="cpu",
-        orthogonal_init=False,
-        dropout=0.6,
-    ):
-        super(ffEncoder, self).__init__()
-        activations = {
-            "relu": F.relu,
-            "tanh": torch.tanh,
-            "sigmoid": torch.sigmoid,
-            "none": lambda x: x,
-        }
-        assert activation in activations, "Invalid activation function"
-        self.activation = activations[activation]
-        self.drop = dropout
-        self.dropout = nn.Dropout(p=dropout)
-        self.encoder = nn.ModuleList()
-        # print(obs_dim, hidden_dims)
-        for i in range(len(hidden_dims)):
-            if i == 0:
-                self.encoder.append(nn.Linear(obs_dim, hidden_dims[i]))
-            else:
-                self.encoder.append(nn.Linear(hidden_dims[i - 1], hidden_dims[i]))
-            if orthogonal_init:
-                _orthogonal_init(self.encoder[-1])
-        self.float()
-        self.to(device)
-        self.device = device
-        # self.optimizer = torch.optim.Adam(self.parameters())
-
-    def forward(self, x, debug=False):
-        if debug:
-            print(f"ffEncoder: x {x}")
-        x = T(x, self.device).float()
-        if debug:
-            print(f"ffEncoder after T: x {x}")
-            interlist = []
-            interlist.append(x)
-        for layer in self.encoder:
-            if layer == self.encoder[0] and self.drop > 0:
-                x = self.activation(self.dropout(layer(x)))
-            else:
-                x = self.activation(layer(x))
-            if debug:
-                interlist.append(x)  # type: ignore
-        # if x contains nan, print the intermediate list and encoder weights
-        if torch.isnan(x).any():
-            if debug:
-                print(f"Intermediate list: {interlist}")  # type: ignore
-            for layer in self.encoder:
-                print(f"Layer {layer.weight}")  # type: ignore
-        return x
-
-
-class MixedActor(nn.Module):
-    def __init__(
-        self,
-        obs_dim,
-        continuous_action_dim=None,  # number of continuouis action dimensions =5
-        discrete_action_dims=None,  # list of discrete action dimensions =[2, 3, 4]
-        max_actions: np.ndarray = np.array([1.0], dtype=np.float32),
-        min_actions: np.ndarray = np.array([-1.0], dtype=np.float32),
-        hidden_dims: np.ndarray = np.array([256, 256], dtype=np.int32),
-        encoder=None,  # ffEncoder if hidden dims are provided and encoder is not provided
-        device="cpu",
-        tau=1.0,
-        hard=False,
-        orthogonal_init=False,
-        activation="relu",
-    ):
-        super(MixedActor, self).__init__()
-        self.device = device
-
-        self.tau = tau
-        self.hard = hard
-        # print(hidden_dims)
-        if encoder is None and hidden_dims is not None and len(hidden_dims) > 0:
-            self.encoder = ffEncoder(
-                obs_dim, hidden_dims, device=device, activation=activation, dropout=0
-            )
-
-        assert not (
-            continuous_action_dim is None and discrete_action_dims is None
-        ), "At least one action dim should be provided"
-        if continuous_action_dim is not None and continuous_action_dim > 0:
-            assert (
-                len(max_actions) == continuous_action_dim
-                and len(min_actions) == continuous_action_dim
-            ), f"max_actions should be provided for each continuous action dim {len(max_actions)},{continuous_action_dim}"
-
-        # print(
-        #    f"Min actions: {min_actions}, max actions: {max_actions}, torch {torch.from_numpy(max_actions - min_actions)}"
-        # )
-        if max_actions is not None and min_actions is not None:
-            self.action_scales = (
-                torch.from_numpy(max_actions - min_actions).float().to(device) / 2
-            )
-            # doesn't track grad by default in from_numpy
-            self.action_biases = (
-                torch.from_numpy(max_actions + min_actions).float().to(device) / 2
-            )
-            self.max_actions = max_actions
-            self.min_actions = min_actions
-
-        self.continuous_actions_head = None
-        if continuous_action_dim is not None and continuous_action_dim > 0:
-            self.continuous_actions_head = nn.Linear(
-                hidden_dims[-1], continuous_action_dim
-            )
-            if orthogonal_init:
-                _orthogonal_init(self.continuous_actions_head)
-
-        self.discrete_action_heads = nn.ModuleList()
-        if discrete_action_dims is not None and len(discrete_action_dims) > 0:
-            for dim in discrete_action_dims:
-                self.discrete_action_heads.append(nn.Linear(hidden_dims[-1], dim))
-                if orthogonal_init:
-                    _orthogonal_init(self.discrete_action_heads[-1])
-        self.to(device)
-
-    def forward(self, x, action_mask=None, gumbel=False, debug=False):
-        ogx = x
-        if debug:
-            print(f"MixedActor: x {x}, action_mask {action_mask}, gumbel {gumbel}")
-        if self.encoder is not None:
-            x = self.encoder(x=x, debug=debug)
-        else:
-            x = T(a=x, device=self.device, debug=debug)
-
-        continuous_actions = None
-        discrete_actions = None
-        if self.continuous_actions_head is not None:
-            continuous_actions = (
-                F.tanh(self.continuous_actions_head(x)) * self.action_scales
-                + self.action_biases
-            )
-            # If continuous action contains nan, print x and the continuous actions
-            if torch.isnan(continuous_actions).any():
-                print(f"Continuous actions: {continuous_actions}")
-                print(f"X: {x}, ogx: {ogx}")
-                # raise ValueError("Continuous actions contain nan")
-
-        # TODO: Put this into it's own function and implement the ppo way of sampling
-        if self.discrete_action_heads is not None:
-            discrete_actions = []
-            for i, head in enumerate(self.discrete_action_heads):
-                logits = head(x)
-
-                if gumbel:
-                    if action_mask is not None:
-                        logits[action_mask == 0] = -1e8
-                    probs = F.gumbel_softmax(
-                        logits, dim=-1, tau=self.tau, hard=self.hard
-                    )
-                    # activations = activations / activations.sum(dim=-1, keepdim=True)
-                    discrete_actions.append(probs)
-                else:
-                    if action_mask is not None:
-                        logits[action_mask == 0] = -1e8
-                    discrete_actions.append(F.softmax(logits, dim=-1))
-
-        return continuous_actions, discrete_actions
-
 
 class StochasticActor(nn.Module):
     def __init__(
@@ -710,33 +539,6 @@ class StochasticActor(nn.Module):
             continuous_activations,
         )
 
-
-class ValueSA(nn.Module):
-    def __init__(
-        self, obs_dim, action_dim, hidden_dim=256, device="cpu", activation="relu"
-    ):
-        super(ValueSA, self).__init__()
-        self.device = device
-        if activation not in ["relu", "tanh", "sigmoid"]:
-            raise ValueError(
-                "Invalid activation function, should be: relu, tanh, sigmoid"
-            )
-        activations = {"relu": F.relu, "tanh": torch.tanh, "sigmoid": torch.sigmoid}
-        self.activation = activations[activation]
-        self.l1 = nn.Linear(obs_dim + action_dim, hidden_dim)
-        self.l2 = nn.Linear(hidden_dim, hidden_dim)
-        self.l3 = nn.Linear(hidden_dim, 1)
-        self.to(device)
-
-    def forward(self, x, u, debug=False):
-        if debug:
-            print(f"ValueSA: x {x}, u {u}")
-        x = self.activation(self.l1(torch.cat([x, u], -1)))
-        x = self.activation(self.l2(x))
-        x = self.l3(x)
-        return x
-
-
 class ValueS(nn.Module):
     def __init__(
         self,
@@ -770,70 +572,6 @@ class ValueS(nn.Module):
         x = self.activation(self.l2(x))
         x = self.l3(x)
         return x
-
-
-class QSCA(nn.Module):
-    def __init__(
-        self,
-        obs_dim,
-        continuous_action_dim=0,
-        discrete_action_dims=[1],
-        hidden_dim=256,
-        device="cpu",
-    ):
-        super(QSCA, self).__init__()
-        self.device = device
-        self.l1 = nn.Linear(obs_dim + continuous_action_dim, hidden_dim)
-        self.l2 = nn.Linear(hidden_dim, hidden_dim)
-        self.discrete_Q_heads = nn.ModuleList()
-        if discrete_action_dims is not None and len(discrete_action_dims) > 0:
-            for dim in discrete_action_dims:
-                self.discrete_Q_heads.append(nn.Linear(hidden_dim, dim))
-        self.to(device)
-
-    def forward(self, x):
-        x = T(x, self.device)
-        x = F.relu(self.l1(x))
-        x = F.relu(self.l2(x))
-        Qs = []
-        for i, head in enumerate(self.discrete_Q_heads):
-            Qi = head(x)
-            Qs.append(Qi)
-        if len(Qs) == 1:
-            Qs = Qs[0]
-        return Qs
-
-
-class QSAA(nn.Module):
-    def __init__(
-        self,
-        obs_dim,
-        continuous_action_dim=0,
-        discrete_action_dims=[1],
-        hidden_dim=256,
-        device="cpu",
-    ):
-        super(QSAA, self).__init__()
-        self.device = device
-        total_discrete_dims = sum(discrete_action_dims)
-        input_dim = obs_dim + continuous_action_dim + total_discrete_dims
-        self.l1 = nn.Linear(input_dim, hidden_dim)
-        self.l2 = nn.Linear(hidden_dim, hidden_dim)
-        self.l3 = nn.Linear(hidden_dim, 1)
-        self.to(device)
-
-    def forward(self, s, a_c=None, a_d=None):
-        if a_c is None:
-            a_c = torch.tensor([]).to(self.device)
-        if a_d is None:
-            a_d = torch.tensor([]).to(self.device)
-        x = torch.cat([s, a_c, a_d], dim=-1)
-        x = T(x, self.device)
-        x = F.relu(self.l1(x))
-        x = F.relu(self.l2(x))
-        x = self.l3(x)
-        return x
-
 
 class QMixer(nn.Module):
     """
@@ -952,7 +690,6 @@ class VDNMixer(nn.Module):
         self, agent_qs: torch.Tensor, state: torch.Tensor, with_grad: bool = False
     ) -> tuple[torch.Tensor, None | torch.Tensor]:
         return agent_qs.sum(dim=-1, keepdim=True), torch.ones_like(agent_qs)
-
 
 class QS(nn.Module):
     def __init__(
@@ -1240,83 +977,201 @@ class QS(nn.Module):
         return values, disc_advantages, cont_advantages
 
 
-class DuelingQSCA(nn.Module):
+
+
+
+
+class MixedActor(nn.Module):
     def __init__(
         self,
         obs_dim,
-        continuous_action_dim=0,
-        discrete_action_dims=[1],
-        hidden_dim=256,
+        continuous_action_dim=None,  # number of continuouis action dimensions =5
+        discrete_action_dims=None,  # list of discrete action dimensions =[2, 3, 4]
+        max_actions: np.ndarray = np.array([1.0], dtype=np.float32),
+        min_actions: np.ndarray = np.array([-1.0], dtype=np.float32),
+        hidden_dims: np.ndarray = np.array([256, 256], dtype=np.int32),
+        encoder=None,  # ffEncoder if hidden dims are provided and encoder is not provided
         device="cpu",
+        tau=1.0,
+        hard=False,
+        orthogonal_init=False,
+        activation="relu",
     ):
-        super(DuelingQSCA, self).__init__()
+        super(MixedActor, self).__init__()
         self.device = device
-        self.l1 = nn.Linear(obs_dim, hidden_dim)
-        self.l2 = nn.Linear(hidden_dim, hidden_dim)
-        self.value_head = nn.Linear(hidden_dim, 1)
-        self.advantage_heads = nn.ModuleList()
+
+        self.tau = tau
+        self.hard = hard
+        # print(hidden_dims)
+        if encoder is None and hidden_dims is not None and len(hidden_dims) > 0:
+            self.encoder = ffEncoder(
+                obs_dim, hidden_dims, device=device, activation=activation, dropout=0
+            )
+
+        assert not (
+            continuous_action_dim is None and discrete_action_dims is None
+        ), "At least one action dim should be provided"
+        if continuous_action_dim is not None and continuous_action_dim > 0:
+            assert (
+                len(max_actions) == continuous_action_dim
+                and len(min_actions) == continuous_action_dim
+            ), f"max_actions should be provided for each continuous action dim {len(max_actions)},{continuous_action_dim}"
+
+        # print(
+        #    f"Min actions: {min_actions}, max actions: {max_actions}, torch {torch.from_numpy(max_actions - min_actions)}"
+        # )
+        if max_actions is not None and min_actions is not None:
+            self.action_scales = (
+                torch.from_numpy(max_actions - min_actions).float().to(device) / 2
+            )
+            # doesn't track grad by default in from_numpy
+            self.action_biases = (
+                torch.from_numpy(max_actions + min_actions).float().to(device) / 2
+            )
+            self.max_actions = max_actions
+            self.min_actions = min_actions
+
+        self.continuous_actions_head = None
+        if continuous_action_dim is not None and continuous_action_dim > 0:
+            self.continuous_actions_head = nn.Linear(
+                hidden_dims[-1], continuous_action_dim
+            )
+            if orthogonal_init:
+                _orthogonal_init(self.continuous_actions_head)
+
+        self.discrete_action_heads = nn.ModuleList()
         if discrete_action_dims is not None and len(discrete_action_dims) > 0:
             for dim in discrete_action_dims:
-                self.advantage_heads.append(
-                    nn.Linear(hidden_dim + continuous_action_dim, dim)
-                )
+                self.discrete_action_heads.append(nn.Linear(hidden_dims[-1], dim))
+                if orthogonal_init:
+                    _orthogonal_init(self.discrete_action_heads[-1])
         self.to(device)
 
-    def forward(self, x, u):
-        x = T(x, self.device)
-        x = F.relu(self.l1(x))
-        x = F.relu(self.l2(x))
-        values = self.value_head(x)
-        advantages = []
-        xu = torch.cat([x, u], dim=-1)
-        for i, head in enumerate(self.advantage_heads):
-            Adv = head(xu)
-            Adv = Adv - Adv.max(dim=-1, keepdim=True).values
-            advantages.append(Adv)
-        return values, advantages
+    def forward(self, x, action_mask=None, gumbel=False, debug=False):
+        ogx = x
+        if debug:
+            print(f"MixedActor: x {x}, action_mask {action_mask}, gumbel {gumbel}")
+        if self.encoder is not None:
+            x = self.encoder(x=x, debug=debug)
+        else:
+            x = T(a=x, device=self.device, debug=debug)
 
+        continuous_actions = None
+        discrete_actions = None
+        if self.continuous_actions_head is not None:
+            continuous_actions = (
+                F.tanh(self.continuous_actions_head(x)) * self.action_scales
+                + self.action_biases
+            )
+            # If continuous action contains nan, print x and the continuous actions
+            if torch.isnan(continuous_actions).any():
+                print(f"Continuous actions: {continuous_actions}")
+                print(f"X: {x}, ogx: {ogx}")
+                # raise ValueError("Continuous actions contain nan")
 
-class DuelingQSAA(nn.Module):
+        # TODO: Put this into it's own function and implement the ppo way of sampling
+        if self.discrete_action_heads is not None:
+            discrete_actions = []
+            for i, head in enumerate(self.discrete_action_heads):
+                logits = head(x)
+
+                if gumbel:
+                    if action_mask is not None:
+                        logits[action_mask == 0] = -1e8
+                    probs = F.gumbel_softmax(
+                        logits, dim=-1, tau=self.tau, hard=self.hard
+                    )
+                    # activations = activations / activations.sum(dim=-1, keepdim=True)
+                    discrete_actions.append(probs)
+                else:
+                    if action_mask is not None:
+                        logits[action_mask == 0] = -1e8
+                    discrete_actions.append(F.softmax(logits, dim=-1))
+
+        return continuous_actions, discrete_actions
+
+class ffEncoder(nn.Module):
     def __init__(
         self,
         obs_dim,
-        continuous_action_dim=0,
-        discrete_action_dims=[1],
-        hidden_dim=256,
+        hidden_dims,
+        activation="relu",
         device="cpu",
+        orthogonal_init=False,
+        dropout=0.6,
     ):
-        super(DuelingQSAA, self).__init__()
+        super(ffEncoder, self).__init__()
+        activations = {
+            "relu": F.relu,
+            "tanh": torch.tanh,
+            "sigmoid": torch.sigmoid,
+            "none": lambda x: x,
+        }
+        assert activation in activations, "Invalid activation function"
+        self.activation = activations[activation]
+        self.drop = dropout
+        self.dropout = nn.Dropout(p=dropout)
+        self.encoder = nn.ModuleList()
+        # print(obs_dim, hidden_dims)
+        for i in range(len(hidden_dims)):
+            if i == 0:
+                self.encoder.append(nn.Linear(obs_dim, hidden_dims[i]))
+            else:
+                self.encoder.append(nn.Linear(hidden_dims[i - 1], hidden_dims[i]))
+            if orthogonal_init:
+                _orthogonal_init(self.encoder[-1])
+        self.float()
+        self.to(device)
         self.device = device
-        total_discrete_dims = sum(discrete_action_dims)
-        input_dim = obs_dim
-        self.l1 = nn.Linear(input_dim, hidden_dim)
-        self.l2 = nn.Linear(hidden_dim, hidden_dim)
-        self.value_head = nn.Linear(hidden_dim, 1)
-        self.advantage_heads = [
-            nn.Linear(hidden_dim + continuous_action_dim + total_discrete_dims, 1)
-        ]
+        # self.optimizer = torch.optim.Adam(self.parameters())
 
+    def forward(self, x, debug=False):
+        if debug:
+            print(f"ffEncoder: x {x}")
+        x = T(x, self.device).float()
+        if debug:
+            print(f"ffEncoder after T: x {x}")
+            interlist = []
+            interlist.append(x)
+        for layer in self.encoder:
+            if layer == self.encoder[0] and self.drop > 0:
+                x = self.activation(self.dropout(layer(x)))
+            else:
+                x = self.activation(layer(x))
+            if debug:
+                interlist.append(x)  # type: ignore
+        # if x contains nan, print the intermediate list and encoder weights
+        if torch.isnan(x).any():
+            if debug:
+                print(f"Intermediate list: {interlist}")  # type: ignore
+            for layer in self.encoder:
+                print(f"Layer {layer.weight}")  # type: ignore
+        return x
+
+class ValueSA(nn.Module):
+    def __init__(
+        self, obs_dim, action_dim, hidden_dim=256, device="cpu", activation="relu"
+    ):
+        super(ValueSA, self).__init__()
+        self.device = device
+        if activation not in ["relu", "tanh", "sigmoid"]:
+            raise ValueError(
+                "Invalid activation function, should be: relu, tanh, sigmoid"
+            )
+        activations = {"relu": F.relu, "tanh": torch.tanh, "sigmoid": torch.sigmoid}
+        self.activation = activations[activation]
+        self.l1 = nn.Linear(obs_dim + action_dim, hidden_dim)
+        self.l2 = nn.Linear(hidden_dim, hidden_dim)
+        self.l3 = nn.Linear(hidden_dim, 1)
         self.to(device)
 
-    def forward(self, x, a_c=None, a_d=None):
-        if a_c is None:
-            a_c = torch.tensor([]).to(self.device)
-        if a_d is None:
-            a_d = torch.tensor([]).to(self.device)
-
-        x = T(x, self.device)
-        x = F.relu(self.l1(x))
-        x = F.relu(self.l2(x))
-        values = self.value_head(x)
-        advantages = []
-        xu = torch.cat([x, a_c, a_d], dim=-1)
-        for i, head in enumerate(self.advantage_heads):
-            Adv = head(xu)
-            # Adv = Adv - Adv.mean(dim=-1, keepdim=True)
-            # Sample some kind of action space and then calculate the advantage
-            advantages.append(Adv)
-        return values, advantages
-
+    def forward(self, x, u, debug=False):
+        if debug:
+            print(f"ValueSA: x {x}, u {u}")
+        x = self.activation(self.l1(torch.cat([x, u], -1)))
+        x = self.activation(self.l2(x))
+        x = self.l3(x)
+        return x
 
 # Q(s) -> R^n
 # Q(s,a) -> R
